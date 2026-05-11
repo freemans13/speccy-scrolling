@@ -1,0 +1,5 @@
+build/
+tools/sjasmplus/
+.DS_Store
+# z80dasm scratch dumps
+0x*
