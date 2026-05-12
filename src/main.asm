@@ -24,6 +24,7 @@ FLAP_VY     EQU $FC00                   ; signed -1024 (4 px/frame upward)
 
 ATTRS           EQU $5800
 BG_BUFFER       EQU $C000
+BACKUP_ATTRS    EQU $D800               ; mirror of ATTRS without pipe overlay (768 B)
 
 ATTR_SKY        EQU $28                 ; paper cyan + ink black
 ATTR_CITY       EQU $38                 ; paper white + ink black (skyscraper windows)
@@ -43,17 +44,24 @@ start:
         ld      sp, $8000
         ld      a, 5
         out     ($fe), a
-        call    paint_attrs
+        call    paint_attrs             ; initial base attrs (rows 16..19 all city)
         call    init_background
-        call    init_pipes
+        call    refill_base_attrs       ; convert row 16..19 to sky + per-cell city
+        call    backup_base_attrs       ; snapshot ATTRS → BACKUP_ATTRS (no pipes)
+        call    init_pipes              ; draws pipes (pixels) — attrs still base
         call    init_bird
+        call    apply_pipe_attrs        ; overlay ATTR_PIPE at initial pipe positions
         im      1
         ei
 
 main_loop:
         halt
         di
+        ld      a, 2                    ; PROFILE: RED = pre-frame_update overhead (tiny)
+        out     ($fe), a
         call    frame_update
+        ld      a, 5                    ; PROFILE: CYAN = end of frame (idle until next halt)
+        out     ($fe), a
         ei
         jr      main_loop
 
@@ -61,6 +69,7 @@ main_loop:
 phase:      db 0
 saved_sp:   dw 0
 ground_iy_save: dw 0
+paint_LMMR_start_line: db 0             ; scratch — start line saved across SP-hijack
 
 pipe_state:
         db 30, 24                       ; gap_y values are multiples of 8 so cap
@@ -98,6 +107,19 @@ pipe_bitmap_b:
         db $1D, $40, $15, $60           ; phase 5
         db $3A, $80, $2A, $C0           ; phase 6
         db $75, $00, $55, $80           ; phase 7
+
+; Outside-the-pipe pixel masks per phase. The 24-px pipe sits at pixels
+; phase..phase+23 within the 32-px LMMR window, so:
+;   L_out_mask(phase) selects bits 7..8-phase of L cell (the padding left
+;   of the pipe — $FF for phase 0 grows toward $80 for phase 7).
+;   R_out_mask(phase) selects bits phase-1..0 of R cell (the padding right
+;   of the pipe — $00 for phase 0 grows toward $7F for phase 7).
+; Used by paint_LMMR_city to mask the bg_buffer byte so cityscape pattern
+; appears only in pixels outside the pipe shape, never inside it.
+l_out_masks:
+        db $FF, $FE, $FC, $F8, $F0, $E0, $C0, $80
+r_out_masks:
+        db $00, $01, $03, $07, $0F, $1F, $3F, $7F
 
 ; Cap design: body pattern for most rows + 1 rim line at the gap-facing edge.
 ; The rim is pattern $7F $FF $FE — 24-px solid black bar with 1-px chamfered
@@ -289,29 +311,48 @@ init_pipes:
 
 ;----------------------------------------------------------------
 frame_update:
+        ld      a, 1                    ; PROFILE: BLUE = bird ops
+        out     ($fe), a
         call    restore_bird_bg         ; clear OLD bird position to bg
         call    read_input              ; SPACE key → flap
         call    update_bird             ; gravity + position update
         call    draw_bird               ; draw bird EARLY (before raster reaches Y)
 
-        ; Phase advance only every 8th frame (debug: slow scroll for inspection)
         ld      a, (frame_skip)
         inc     a
         ld      (frame_skip), a
-        and     7
-        jr      nz, .skip_phase
+        and     1
+        jr      nz, .skip_phase_work    ; non-phase-change frame → skip SMC + wrap + attrs
         ld      a, (phase)
         inc     a
         and     7
         ld      (phase), a
         or      a
-        call    z, wrap_byte_x
-.skip_phase:
+        jr      nz, .no_wrap
+        ; Wrap frame: byte_x is about to change for all pipes. Use incremental
+        ; attrs: restore base at OLD positions, advance, set ATTR_PIPE at NEW.
+        ld      a, 2                    ; PROFILE: RED = restore_pipe_attrs (old positions)
+        out     ($fe), a
+        call    restore_pipe_attrs
+        ld      a, 7                    ; PROFILE: WHITE = wrap_byte_x (clear trailing cols)
+        out     ($fe), a
+        call    wrap_byte_x
+        ld      a, 2                    ; PROFILE: RED = apply_pipe_attrs (new positions)
+        out     ($fe), a
+        call    apply_pipe_attrs
+.no_wrap:
+        ; Phase changed — update pre-shifted bitmap SMC slots.
+        ld      a, 6                    ; PROFILE: YELLOW = update_smc + update_cap_smc
+        out     ($fe), a
         call    update_smc
         call    update_cap_smc
+.skip_phase_work:
+        ld      a, 3                    ; PROFILE: MAGENTA = redraw_all_pipes
+        out     ($fe), a
         call    redraw_all_pipes        ; body + caps inlined per pipe in line order
-        call    draw_ground             ; scrolling diagonal-stripe ground
-        call    update_pipe_attrs       ; per-cell paper=green/ink=black where pipes live
+        ld      a, 4                    ; PROFILE: GREEN = draw_ground
+        out     ($fe), a
+        call    draw_ground
         ret
 
 ;----------------------------------------------------------------
@@ -398,33 +439,68 @@ update_cap_smc:
         ld      b, 0
         ld      hl, cap_rounded_bitmap
         add     hl, bc
-        ; byte 0 → all *_l slots
+        ; byte 0 → all *_l slots (normal + city)
         ld      a, (hl)
         ld      (paint_cap_rounded_L.smc_l + 1), a
         ld      (paint_cap_rounded_LM.smc_l + 1), a
         ld      (paint_cap_rounded_LMM.smc_l + 1), a
         ld      (paint_cap_rounded_LMMR.smc_l + 1), a
+        ld      (paint_cap_rounded_LMMR_city.smc_l + 1), a
+        ld      (paint_cap_rounded_LMM_city.smc_l + 1), a
+        ld      (paint_cap_rounded_LM_city.smc_l + 1), a
+        ld      (paint_cap_rounded_L_city.smc_l + 1), a
         inc     hl
-        ; byte 1 → smc_m of LM, smc_m1 of LMM/LMMR/MMR
+        ; byte 1 → smc_m of LM/LM_city, smc_m1 of LMM/LMMR/MMR (+ city)
         ld      a, (hl)
         ld      (paint_cap_rounded_LM.smc_m + 1), a
+        ld      (paint_cap_rounded_LM_city.smc_m + 1), a
         ld      (paint_cap_rounded_LMM.smc_m1 + 1), a
+        ld      (paint_cap_rounded_LMM_city.smc_m1 + 1), a
         ld      (paint_cap_rounded_LMMR.smc_m1 + 1), a
+        ld      (paint_cap_rounded_LMMR_city.smc_m1 + 1), a
         ld      (paint_cap_rounded_MMR.smc_m1 + 1), a
+        ld      (paint_cap_rounded_MMR_city.smc_m1 + 1), a
         inc     hl
-        ; byte 2 → smc_m2 of LMM/LMMR/MMR, smc_m of MR
+        ; byte 2 → smc_m2 of LMM/LMMR/MMR (+ city), smc_m of MR (+ city)
         ld      a, (hl)
         ld      (paint_cap_rounded_LMM.smc_m2 + 1), a
+        ld      (paint_cap_rounded_LMM_city.smc_m2 + 1), a
         ld      (paint_cap_rounded_LMMR.smc_m2 + 1), a
+        ld      (paint_cap_rounded_LMMR_city.smc_m2 + 1), a
         ld      (paint_cap_rounded_MMR.smc_m2 + 1), a
+        ld      (paint_cap_rounded_MMR_city.smc_m2 + 1), a
         ld      (paint_cap_rounded_MR.smc_m + 1), a
+        ld      (paint_cap_rounded_MR_city.smc_m + 1), a
         inc     hl
-        ; byte 3 → smc_r of LMMR/MMR/MR/R
+        ; byte 3 → smc_r of LMMR/MMR/MR/R (+ city)
         ld      a, (hl)
         ld      (paint_cap_rounded_LMMR.smc_r + 1), a
+        ld      (paint_cap_rounded_LMMR_city.smc_r + 1), a
         ld      (paint_cap_rounded_MMR.smc_r + 1), a
+        ld      (paint_cap_rounded_MMR_city.smc_r + 1), a
         ld      (paint_cap_rounded_MR.smc_r + 1), a
+        ld      (paint_cap_rounded_MR_city.smc_r + 1), a
         ld      (paint_cap_rounded_R.smc_r + 1), a
+        ld      (paint_cap_rounded_R_city.smc_r + 1), a
+
+        ; Phase-indexed outside-pixel masks for cap city variants.
+        ld      a, (phase)
+        ld      c, a
+        ld      b, 0
+        ld      hl, l_out_masks
+        add     hl, bc
+        ld      a, (hl)
+        ld      (paint_cap_rounded_LMMR_city.smc_l_outmask + 1), a
+        ld      (paint_cap_rounded_LMM_city.smc_l_outmask + 1), a
+        ld      (paint_cap_rounded_LM_city.smc_l_outmask + 1), a
+        ld      (paint_cap_rounded_L_city.smc_l_outmask + 1), a
+        ld      hl, r_out_masks
+        add     hl, bc
+        ld      a, (hl)
+        ld      (paint_cap_rounded_LMMR_city.smc_r_outmask + 1), a
+        ld      (paint_cap_rounded_MMR_city.smc_r_outmask + 1), a
+        ld      (paint_cap_rounded_MR_city.smc_r_outmask + 1), a
+        ld      (paint_cap_rounded_R_city.smc_r_outmask + 1), a
         ret
 
 frame_skip: db 0
@@ -489,25 +565,64 @@ update_smc:
         ld      (paint_L.smc_l + 1), a
         ld      (paint_LM.smc_l + 1), a
         ld      (paint_LMM.smc_l + 1), a
+        ld      (paint_LMM.smc_pre_l + 1), a    ; unrolled preamble L
+        ld      (paint_LMM.smc_pair_b_l + 1), a ; unrolled pair-B L (same as A)
+        ld      (paint_LMM.smc_tail_l + 1), a   ; unrolled tail L
         ld      (paint_LMMR.smc_l + 1), a
+        ld      (paint_LMMR.smc_tail_l + 1), a
+        ld      (paint_LMMR_city.smc_l + 1), a
+        ld      (paint_LMMR_city.smc_tail_l + 1), a
+        ld      (paint_LMM_city.smc_l + 1), a
+        ld      (paint_LM_city.smc_l + 1), a
+        ld      (paint_L_city.smc_l + 1), a
         inc     hl
         ld      a, (hl)
         ld      (paint_LM.smc_m + 1), a
         ld      (paint_LMM.smc_m1 + 1), a
+        ld      (paint_LMM.smc_pre_m1 + 1), a
+        ld      (paint_LMM.smc_pair_b_m1 + 1), a
+        ld      (paint_LMM.smc_tail_m1 + 1), a
         ld      (paint_LMMR.smc_m1 + 1), a
+        ld      (paint_LMMR.smc_tail_m1 + 1), a
+        ld      (paint_LMMR_city.smc_m1 + 1), a
+        ld      (paint_LMMR_city.smc_tail_m1 + 1), a
+        ld      (paint_LMM_city.smc_m1 + 1), a
+        ld      (paint_LM_city.smc_m + 1), a
         ld      (paint_MMR.smc_m1 + 1), a
+        ld      (paint_MMR.smc_pre_m1 + 1), a
+        ld      (paint_MMR.smc_pair_b_m1 + 1), a
+        ld      (paint_MMR.smc_tail_m1 + 1), a
+        ld      (paint_MMR_city.smc_m1 + 1), a
         inc     hl
         ld      a, (hl)
-        ld      (paint_LMM.smc_m2 + 1), a
+        ld      (paint_LMM.smc_m2 + 1), a       ; A pattern M2 (pair_A and tail)
+        ld      (paint_LMM.smc_tail_m2 + 1), a
         ld      (paint_LMMR.smc_m2 + 1), a
+        ld      (paint_LMMR.smc_tail_m2 + 1), a
+        ld      (paint_LMMR_city.smc_m2 + 1), a
+        ld      (paint_LMMR_city.smc_tail_m2 + 1), a
+        ld      (paint_LMM_city.smc_m2 + 1), a
         ld      (paint_MMR.smc_m2 + 1), a
+        ld      (paint_MMR.smc_tail_m2 + 1), a
+        ld      (paint_MMR_city.smc_m2 + 1), a
         ld      (paint_MR.smc_m + 1), a
+        ld      (paint_MR.smc_tail_m + 1), a
+        ld      (paint_MR_city.smc_m + 1), a
         inc     hl
         ld      a, (hl)
         ld      (paint_LMMR.smc_r + 1), a
+        ld      (paint_LMMR.smc_tail_r + 1), a
+        ld      (paint_LMMR_city.smc_r + 1), a
+        ld      (paint_LMMR_city.smc_tail_r + 1), a
         ld      (paint_MMR.smc_r + 1), a
+        ld      (paint_MMR.smc_tail_r + 1), a
+        ld      (paint_MMR_city.smc_r + 1), a
         ld      (paint_MR.smc_r + 1), a
+        ld      (paint_MR.smc_tail_r + 1), a
+        ld      (paint_MR_city.smc_r + 1), a
         ld      (paint_R.smc_r + 1), a
+        ld      (paint_R.smc_tail_r + 1), a
+        ld      (paint_R_city.smc_r + 1), a
 
         ; Pattern B — bytes 0/1 identical to A (LEFT zone), so only bytes 2/3
         ; (RIGHT zone) need separate B slots. byte 0 and 1 of B still load into
@@ -516,21 +631,73 @@ update_smc:
         add     hl, bc
         ld      a, (hl)
         ld      (paint_LMMR.smc_b_l + 1), a
+        ld      (paint_LMMR.smc_pre_b_l + 1), a  ; unrolled B preamble
+        ld      (paint_LMMR_city.smc_b_l + 1), a
+        ld      (paint_LMMR_city.smc_pre_b_l + 1), a
         inc     hl
         ld      a, (hl)
         ld      (paint_LMMR.smc_b_m1 + 1), a
+        ld      (paint_LMMR.smc_pre_b_m1 + 1), a
+        ld      (paint_LMMR_city.smc_b_m1 + 1), a
+        ld      (paint_LMMR_city.smc_pre_b_m1 + 1), a
         inc     hl
         ld      a, (hl)
         ld      (paint_LMMR.smc_b_m2 + 1), a
+        ld      (paint_LMMR.smc_pre_b_m2 + 1), a
+        ld      (paint_LMMR_city.smc_b_m2 + 1), a
+        ld      (paint_LMMR_city.smc_pre_b_m2 + 1), a
         ld      (paint_LMM.smc_b_m2 + 1), a
+        ld      (paint_LMM.smc_pre_b_m2 + 1), a
+        ld      (paint_LMM_city.smc_b_m2 + 1), a
         ld      (paint_MMR.smc_b_m2 + 1), a
+        ld      (paint_MMR.smc_pre_b_m2 + 1), a
+        ld      (paint_MMR_city.smc_b_m2 + 1), a
         ld      (paint_MR.smc_b_m + 1), a
+        ld      (paint_MR.smc_pre_b_m + 1), a
+        ld      (paint_MR_city.smc_b_m + 1), a
         inc     hl
         ld      a, (hl)
         ld      (paint_LMMR.smc_b_r + 1), a
+        ld      (paint_LMMR.smc_pre_b_r + 1), a
+        ld      (paint_LMMR_city.smc_b_r + 1), a
+        ld      (paint_LMMR_city.smc_pre_b_r + 1), a
         ld      (paint_MMR.smc_b_r + 1), a
+        ld      (paint_MMR.smc_pre_b_r + 1), a
+        ld      (paint_MMR_city.smc_b_r + 1), a
         ld      (paint_MR.smc_b_r + 1), a
+        ld      (paint_MR.smc_pre_b_r + 1), a
+        ld      (paint_MR_city.smc_b_r + 1), a
         ld      (paint_R.smc_b_r + 1), a
+        ld      (paint_R.smc_pre_b_r + 1), a
+        ld      (paint_R_city.smc_b_r + 1), a
+
+        ; Phase-indexed outside-pixel masks for masked-OR in city variants.
+        ld      a, (phase)
+        ld      c, a
+        ld      b, 0
+        ld      hl, l_out_masks
+        add     hl, bc
+        ld      a, (hl)
+        ld      (paint_LMMR_city.smc_l_outmask + 1), a
+        ld      (paint_LMMR_city.smc_b_l_outmask + 1), a
+        ld      (paint_LMMR_city.smc_pre_b_l_outmask + 1), a
+        ld      (paint_LMMR_city.smc_tail_l_outmask + 1), a
+        ld      (paint_LMM_city.smc_l_outmask + 1), a
+        ld      (paint_LM_city.smc_l_outmask + 1), a
+        ld      (paint_L_city.smc_l_outmask + 1), a
+        ld      hl, r_out_masks
+        add     hl, bc
+        ld      a, (hl)
+        ld      (paint_LMMR_city.smc_r_outmask + 1), a
+        ld      (paint_LMMR_city.smc_b_r_outmask + 1), a
+        ld      (paint_LMMR_city.smc_pre_b_r_outmask + 1), a
+        ld      (paint_LMMR_city.smc_tail_r_outmask + 1), a
+        ld      (paint_MMR_city.smc_r_outmask + 1), a
+        ld      (paint_MMR_city.smc_b_r_outmask + 1), a
+        ld      (paint_MR_city.smc_r_outmask + 1), a
+        ld      (paint_MR_city.smc_b_r_outmask + 1), a
+        ld      (paint_R_city.smc_r_outmask + 1), a
+        ld      (paint_R_city.smc_b_r_outmask + 1), a
         ret
 
 ;----------------------------------------------------------------
@@ -568,42 +735,80 @@ draw_pipe:
         push    de                      ; save gap_y across HL/DE reuse for dispatch
         ld      a, c
         cp      33
-        jr      nc, .check_neg
+        jp      nc, .check_neg
         cp      30
-        jr      nc, .right_edge
+        jp      nc, .right_edge
         or      a
-        jr      z, .case_MMR
+        jp      z, .case_MMR
+        ; LMMR (byte_x in 1..29)
+        ld      hl, paint_LMMR_city
+        ld      (.smc_body_bot_city + 1), hl
+        ld      hl, paint_cap_rounded_LMMR_city
+        ld      (.smc_cap_top_city + 1), hl
+        ld      (.smc_cap_bot_city + 1), hl
         ld      hl, paint_LMMR
         ld      de, paint_cap_rounded_LMMR
-        jr      .install
+        jp      .install
 .case_MMR:
+        ld      hl, paint_MMR_city
+        ld      (.smc_body_bot_city + 1), hl
+        ld      hl, paint_cap_rounded_MMR_city
+        ld      (.smc_cap_top_city + 1), hl
+        ld      (.smc_cap_bot_city + 1), hl
         ld      hl, paint_MMR
         ld      de, paint_cap_rounded_MMR
-        jr      .install
+        jp      .install
 .right_edge:
         cp      32
         jr      z, .case_L
         cp      31
         jr      z, .case_LM
+        ; byte_x = 30: LMM
+        ld      hl, paint_LMM_city
+        ld      (.smc_body_bot_city + 1), hl
+        ld      hl, paint_cap_rounded_LMM_city
+        ld      (.smc_cap_top_city + 1), hl
+        ld      (.smc_cap_bot_city + 1), hl
         ld      hl, paint_LMM
         ld      de, paint_cap_rounded_LMM
-        jr      .install
+        jp      .install
 .case_LM:
+        ld      hl, paint_LM_city
+        ld      (.smc_body_bot_city + 1), hl
+        ld      hl, paint_cap_rounded_LM_city
+        ld      (.smc_cap_top_city + 1), hl
+        ld      (.smc_cap_bot_city + 1), hl
         ld      hl, paint_LM
         ld      de, paint_cap_rounded_LM
-        jr      .install
+        jp      .install
 .case_L:
+        ld      hl, paint_L_city
+        ld      (.smc_body_bot_city + 1), hl
+        ld      hl, paint_cap_rounded_L_city
+        ld      (.smc_cap_top_city + 1), hl
+        ld      (.smc_cap_bot_city + 1), hl
         ld      hl, paint_L
         ld      de, paint_cap_rounded_L
-        jr      .install
+        jp      .install
 .check_neg:
         cp      254
-        jp      c, .ret_done            ; jp — .ret_done is beyond jr range
+        jp      c, .ret_done             ; jp — .ret_done is beyond jr range
         jr      z, .case_R
+        ; byte_x = 255: MR
+        ld      hl, paint_MR_city
+        ld      (.smc_body_bot_city + 1), hl
+        ld      hl, paint_cap_rounded_MR_city
+        ld      (.smc_cap_top_city + 1), hl
+        ld      (.smc_cap_bot_city + 1), hl
         ld      hl, paint_MR
         ld      de, paint_cap_rounded_MR
-        jr      .install
+        jp      .install
 .case_R:
+        ld      hl, paint_R_city
+        ld      (.smc_body_bot_city + 1), hl
+        ld      hl, paint_cap_rounded_R_city
+        ld      (.smc_cap_top_city + 1), hl
+        ld      (.smc_cap_bot_city + 1), hl
         ld      hl, paint_R
         ld      de, paint_cap_rounded_R
 
@@ -626,55 +831,102 @@ draw_pipe:
         call    paint_LMMR
         pop     de
 .skip_body_top:
-        ; Cap top rim — 1 line at gap_y-1 (variant dispatched in .install)
+        ; Cap top rim — 1 line at gap_y-1. City variant if in city band.
         ld      a, e
         or      a
         jr      z, .skip_cap_top
         push    de
-        dec     a
+        dec     a                       ; A = gap_y - 1
         ld      b, 1
+        cp      CITY_TOP
+        jr      c, .cap_top_normal
+        cp      CITY_BOTTOM
+        jr      nc, .cap_top_normal
+.smc_cap_top_city:
+        call    paint_cap_rounded_LMMR_city
+        jr      .cap_top_done
+.cap_top_normal:
 .smc_cap_top:
         call    paint_cap_rounded_LMMR
+.cap_top_done:
         pop     de
 .skip_cap_top:
-        ; Cap bot rim — 1 line at gap_y+GAP (variant dispatched)
+        ; Cap bot rim — 1 line at gap_y+GAP. City variant if in city band.
         ld      a, e
         add     a, PIPE_GAP
         cp      GROUND_TOP
         jr      nc, .skip_cap_bot
         push    de
         ld      b, 1
+        cp      CITY_TOP
+        jr      c, .cap_bot_normal
+        cp      CITY_BOTTOM
+        jr      nc, .cap_bot_normal
+.smc_cap_bot_city:
+        call    paint_cap_rounded_LMMR_city
+        jr      .cap_bot_done
+.cap_bot_normal:
 .smc_cap_bot:
         call    paint_cap_rounded_LMMR
+.cap_bot_done:
         pop     de
 .skip_cap_bot:
-        ; Body bot starts immediately after cap bot rim — line gap_y+GAP+1
+        ; Body bot: split at CITY_TOP. When sky+city both fire, the city
+        ; portion is always GROUND_TOP-CITY_TOP=32 lines (since body_bot
+        ; ends at GROUND_TOP-1=CITY_BOTTOM-1), so no push/pop needed.
         ld      a, e
-        add     a, PIPE_GAP
-        inc     a
+        add     a, PIPE_GAP + 1         ; A = gap_y + 49 = body_bot start
         cp      GROUND_TOP
-        ret     nc                       ; no body bot above ground
-        ld      d, a                     ; D = body bot start line
+        ret     nc
+        ld      d, a                    ; D = start
+        cp      CITY_TOP
+        jr      nc, .body_bot_city_only ; start >= CITY_TOP → no sky portion
+        ; Sky portion: start=D, count=CITY_TOP-D
+        ld      a, CITY_TOP
+        sub     d                       ; A = sky_count
+        ld      b, a
+        ld      a, d                    ; A = sky start
+.smc_body_bot:
+        call    paint_LMMR
+        ; City portion: start=CITY_TOP, count=32 (constant)
+        ld      b, CITY_BOTTOM - CITY_TOP
+        ld      a, CITY_TOP
+        jp      .city_dispatch
+.body_bot_city_only:
+        ; D >= CITY_TOP. count = GROUND_TOP - D.
         ld      a, GROUND_TOP
-        sub     d                        ; A = lines available
+        sub     d
         ld      b, a
         ld      a, d
-.smc_body_bot:
-        jp      paint_LMMR
+.city_dispatch:
+.smc_body_bot_city:
+        jp      paint_LMMR_city
 
 .ret_done:
         pop     de
         ret
+
 
 ;----------------------------------------------------------------
 ; Paint variants — each writes 1..4 SMC'd bytes per scan line.
 ; Body and cap share structure; only the SMC slot names differ so
 ; update_smc / update_cap_smc each target their own routines.
 ;----------------------------------------------------------------
-; paint_LMMR: alternates between pattern A (even rows) and pattern B (odd rows)
-; using line N parity (H bit 0 from line_table address). Produces a true
-; chessboard / checker dither in the body's edge zones.
+; paint_LMMR (Joffa-style unrolled A/B-pair version):
+; Draws 2 scanlines per loop iteration with A pattern on the (even-Y) first
+; line and B pattern on the (odd-Y) second line, eliminating the per-line
+; bit-parity test that the bitmap-shift dither would otherwise need.
+;
+; in: A = start_line, B = count (≥1), C = byte_x
+;
+; Dispatch: if start_line is odd, draw 1 B preamble first; if count is odd,
+; draw 1 A tail at the end. The middle is B/2 AB pairs.
+;
+; ~85 cyc/line vs ~118 for the bit-parity loop. Critical path for body_top
+; and body_bot sky portion across all 3 pipes.
 paint_LMMR:
+        ld      (paint_LMMR_start_line), a
+        ; SP-hijack to line_table[start_line]
         ld      h, 0
         ld      l, a
         add     hl, hl
@@ -682,15 +934,48 @@ paint_LMMR:
         add     hl, de
         ld      (saved_sp), sp
         ld      sp, hl
-.lp:
+        ; Start parity check
+        ld      a, (paint_LMMR_start_line)
+        bit     0, a
+        jr      z, .start_was_even
+        ; Preamble: draw 1 B line so we enter pair loop at an even Y.
         pop     hl
         ld      a, c
         add     a, l
         ld      l, a
         dec     l
-        bit     0, h                    ; line N parity (H bit 0 = N bit 0)
-        jr      nz, .odd
-.even:
+.smc_pre_b_l:
+        ld      (hl), 0
+        inc     l
+.smc_pre_b_m1:
+        ld      (hl), 0
+        inc     l
+.smc_pre_b_m2:
+        ld      (hl), 0
+        inc     l
+.smc_pre_b_r:
+        ld      (hl), 0
+        dec     b
+        jp      z, .done
+.start_was_even:
+        ; Now B is the count of lines remaining after any preamble.
+        ; Trim B to even, save odd-tail flag.
+        xor     a
+        bit     0, b
+        jr      z, .count_was_even
+        inc     a
+        dec     b
+.count_was_even:
+        ld      (.smc_count_odd + 1), a
+        srl     b                        ; B = pair count
+        jp      z, .check_tail
+.pair_loop:
+        ; A line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
 .smc_l:
         ld      (hl), 0
         inc     l
@@ -702,8 +987,12 @@ paint_LMMR:
         inc     l
 .smc_r:
         ld      (hl), 0
-        jr      .next
-.odd:
+        ; B line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
 .smc_b_l:
         ld      (hl), 0
         inc     l
@@ -715,12 +1004,51 @@ paint_LMMR:
         inc     l
 .smc_b_r:
         ld      (hl), 0
-.next:
-        djnz    .lp
+        djnz    .pair_loop
+.check_tail:
+.smc_count_odd:
+        ld      a, 0                     ; SMC: 0 or 1
+        or      a
+        jr      z, .done
+        ; Tail: 1 A line at the end.
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+.smc_tail_l:
+        ld      (hl), 0
+        inc     l
+.smc_tail_m1:
+        ld      (hl), 0
+        inc     l
+.smc_tail_m2:
+        ld      (hl), 0
+        inc     l
+.smc_tail_r:
+        ld      (hl), 0
+.done:
         ld      sp, (saved_sp)
         ret
 
-paint_LMM:
+; paint_LMMR_city: like paint_LMMR but L and R cells are written as
+;   screen = pipe_byte | (bg_byte & outside_mask)
+; with `outside_mask` selecting only the pixels that aren't part of the
+; 24-px pipe shape at this phase. bg_buffer (which holds the cityscape
+; pattern only at columns/rows where buildings actually exist) supplies
+; the building bricks; the mask keeps cityscape OUT of pipe-occupied
+; pixels so the pipe itself never has skyscraper inside it. M1/M2 stay
+; direct writes (ATTR_PIPE green paper).
+;
+; Performance: DE holds a parallel bg_buffer pointer (= HL with bit 7 of
+; high byte set), so per-byte set/res 7,h is replaced by a single set 7,d
+; per line plus inc e to follow HL.
+;
+; Joffa-style unrolled A/B-pair: same shape as paint_LMMR — preamble for
+; odd start (1 B line), B/2 AB pairs, optional A tail for odd remainder.
+; No per-line `bit 0, h` parity test.
+paint_LMMR_city:
+        ld      (paint_LMMR_start_line), a
         ld      h, 0
         ld      l, a
         add     hl, hl
@@ -728,7 +1056,198 @@ paint_LMM:
         add     hl, de
         ld      (saved_sp), sp
         ld      sp, hl
-.lp:
+        ld      a, (paint_LMMR_start_line)
+        bit     0, a
+        jr      z, .start_was_even
+        ; Preamble: 1 B line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+        ld      d, h
+        ld      e, l
+        set     7, d
+        ld      a, (de)
+.smc_pre_b_l_outmask:
+        and     0
+.smc_pre_b_l:
+        or      0
+        ld      (hl), a
+        inc     l
+.smc_pre_b_m1:
+        ld      (hl), 0
+        inc     l
+.smc_pre_b_m2:
+        ld      (hl), 0
+        inc     l
+        inc     e
+        inc     e
+        inc     e
+        ld      a, (de)
+.smc_pre_b_r_outmask:
+        and     0
+.smc_pre_b_r:
+        or      0
+        ld      (hl), a
+        dec     b
+        jp      z, .done
+.start_was_even:
+        xor     a
+        bit     0, b
+        jr      z, .count_was_even
+        inc     a
+        dec     b
+.count_was_even:
+        ld      (.smc_count_odd + 1), a
+        srl     b
+        jp      z, .check_tail
+.pair_loop:
+        ; A line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+        ld      d, h
+        ld      e, l
+        set     7, d
+        ld      a, (de)
+.smc_l_outmask:
+        and     0
+.smc_l:
+        or      0
+        ld      (hl), a
+        inc     l
+.smc_m1:
+        ld      (hl), 0
+        inc     l
+.smc_m2:
+        ld      (hl), 0
+        inc     l
+        inc     e
+        inc     e
+        inc     e
+        ld      a, (de)
+.smc_r_outmask:
+        and     0
+.smc_r:
+        or      0
+        ld      (hl), a
+        ; B line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+        ld      d, h
+        ld      e, l
+        set     7, d
+        ld      a, (de)
+.smc_b_l_outmask:
+        and     0
+.smc_b_l:
+        or      0
+        ld      (hl), a
+        inc     l
+.smc_b_m1:
+        ld      (hl), 0
+        inc     l
+.smc_b_m2:
+        ld      (hl), 0
+        inc     l
+        inc     e
+        inc     e
+        inc     e
+        ld      a, (de)
+.smc_b_r_outmask:
+        and     0
+.smc_b_r:
+        or      0
+        ld      (hl), a
+        djnz    .pair_loop
+.check_tail:
+.smc_count_odd:
+        ld      a, 0                     ; SMC: 0 or 1
+        or      a
+        jr      z, .done
+        ; Tail: 1 A line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+        ld      d, h
+        ld      e, l
+        set     7, d
+        ld      a, (de)
+.smc_tail_l_outmask:
+        and     0
+.smc_tail_l:
+        or      0
+        ld      (hl), a
+        inc     l
+.smc_tail_m1:
+        ld      (hl), 0
+        inc     l
+.smc_tail_m2:
+        ld      (hl), 0
+        inc     l
+        inc     e
+        inc     e
+        inc     e
+        ld      a, (de)
+.smc_tail_r_outmask:
+        and     0
+.smc_tail_r:
+        or      0
+        ld      (hl), a
+.done:
+        ld      sp, (saved_sp)
+        ret
+
+; paint_LMM: A/B-pair unrolled. Parity only affects M2 (A: smc_m2, B: smc_b_m2);
+; L and M1 are identical across A/B (same SMC value patched to all 4 instances).
+paint_LMM:
+        ld      (paint_LMMR_start_line), a
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+        ld      a, (paint_LMMR_start_line)
+        bit     0, a
+        jr      z, .start_was_even
+        ; Preamble: 1 B line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+.smc_pre_l:
+        ld      (hl), 0
+        inc     l
+.smc_pre_m1:
+        ld      (hl), 0
+        inc     l
+.smc_pre_b_m2:
+        ld      (hl), 0
+        dec     b
+        jp      z, .done
+.start_was_even:
+        xor     a
+        bit     0, b
+        jr      z, .ce
+        inc     a
+        dec     b
+.ce:
+        ld      (.smc_count_odd + 1), a
+        srl     b
+        jp      z, .check_tail
+.pair_loop:
+        ; A line
         pop     hl
         ld      a, c
         add     a, l
@@ -740,16 +1259,42 @@ paint_LMM:
 .smc_m1:
         ld      (hl), 0
         inc     l
-        bit     0, h
-        jr      nz, .odd
 .smc_m2:
         ld      (hl), 0
-        jr      .next
-.odd:
+        ; B line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+.smc_pair_b_l:
+        ld      (hl), 0
+        inc     l
+.smc_pair_b_m1:
+        ld      (hl), 0
+        inc     l
 .smc_b_m2:
         ld      (hl), 0
-.next:
-        djnz    .lp
+        djnz    .pair_loop
+.check_tail:
+.smc_count_odd:
+        ld      a, 0
+        or      a
+        jr      z, .done
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+.smc_tail_l:
+        ld      (hl), 0
+        inc     l
+.smc_tail_m1:
+        ld      (hl), 0
+        inc     l
+.smc_tail_m2:
+        ld      (hl), 0
+.done:
         ld      sp, (saved_sp)
         ret
 
@@ -796,7 +1341,9 @@ paint_L:
         ld      sp, (saved_sp)
         ret
 
+; paint_MMR: A/B-pair unrolled. M1 same across A/B; M2 and R alternate.
 paint_MMR:
+        ld      (paint_LMMR_start_line), a
         ld      h, 0
         ld      l, a
         add     hl, hl
@@ -804,7 +1351,36 @@ paint_MMR:
         add     hl, de
         ld      (saved_sp), sp
         ld      sp, hl
-.lp:
+        ld      a, (paint_LMMR_start_line)
+        bit     0, a
+        jr      z, .start_was_even
+        ; Preamble: 1 B line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+.smc_pre_m1:
+        ld      (hl), 0
+        inc     l
+.smc_pre_b_m2:
+        ld      (hl), 0
+        inc     l
+.smc_pre_b_r:
+        ld      (hl), 0
+        dec     b
+        jp      z, .done
+.start_was_even:
+        xor     a
+        bit     0, b
+        jr      z, .ce
+        inc     a
+        dec     b
+.ce:
+        ld      (.smc_count_odd + 1), a
+        srl     b
+        jp      z, .check_tail
+.pair_loop:
+        ; A line
         pop     hl
         ld      a, c
         add     a, l
@@ -812,26 +1388,49 @@ paint_MMR:
 .smc_m1:
         ld      (hl), 0
         inc     l
-        bit     0, h
-        jr      nz, .odd
 .smc_m2:
         ld      (hl), 0
         inc     l
 .smc_r:
         ld      (hl), 0
-        jr      .next
-.odd:
+        ; B line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+.smc_pair_b_m1:
+        ld      (hl), 0
+        inc     l
 .smc_b_m2:
         ld      (hl), 0
         inc     l
 .smc_b_r:
         ld      (hl), 0
-.next:
-        djnz    .lp
+        djnz    .pair_loop
+.check_tail:
+.smc_count_odd:
+        ld      a, 0
+        or      a
+        jr      z, .done
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+.smc_tail_m1:
+        ld      (hl), 0
+        inc     l
+.smc_tail_m2:
+        ld      (hl), 0
+        inc     l
+.smc_tail_r:
+        ld      (hl), 0
+.done:
         ld      sp, (saved_sp)
         ret
 
+; paint_MR: A/B-pair unrolled. Both M and R alternate.
 paint_MR:
+        ld      (paint_LMMR_start_line), a
         ld      h, 0
         ld      l, a
         add     hl, hl
@@ -839,32 +1438,338 @@ paint_MR:
         add     hl, de
         ld      (saved_sp), sp
         ld      sp, hl
-.lp:
+        ld      a, (paint_LMMR_start_line)
+        bit     0, a
+        jr      z, .start_was_even
+        ; Preamble: 1 B line
         pop     hl
         ld      a, c
         add     a, l
         ld      l, a
         inc     l
-        bit     0, h
-        jr      nz, .odd
+.smc_pre_b_m:
+        ld      (hl), 0
+        inc     l
+.smc_pre_b_r:
+        ld      (hl), 0
+        dec     b
+        jp      z, .done
+.start_was_even:
+        xor     a
+        bit     0, b
+        jr      z, .ce
+        inc     a
+        dec     b
+.ce:
+        ld      (.smc_count_odd + 1), a
+        srl     b
+        jp      z, .check_tail
+.pair_loop:
+        ; A line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        inc     l
 .smc_m:
         ld      (hl), 0
         inc     l
 .smc_r:
         ld      (hl), 0
-        jr      .next
-.odd:
+        ; B line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        inc     l
 .smc_b_m:
         ld      (hl), 0
         inc     l
 .smc_b_r:
+        ld      (hl), 0
+        djnz    .pair_loop
+.check_tail:
+.smc_count_odd:
+        ld      a, 0
+        or      a
+        jr      z, .done
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        inc     l
+.smc_tail_m:
+        ld      (hl), 0
+        inc     l
+.smc_tail_r:
+        ld      (hl), 0
+.done:
+        ld      sp, (saved_sp)
+        ret
+
+; paint_R: A/B-pair unrolled. Only R cell, alternates.
+paint_R:
+        ld      (paint_LMMR_start_line), a
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+        ld      a, (paint_LMMR_start_line)
+        bit     0, a
+        jr      z, .start_was_even
+        ; Preamble: 1 B line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        inc     l
+        inc     l
+.smc_pre_b_r:
+        ld      (hl), 0
+        dec     b
+        jp      z, .done
+.start_was_even:
+        xor     a
+        bit     0, b
+        jr      z, .ce
+        inc     a
+        dec     b
+.ce:
+        ld      (.smc_count_odd + 1), a
+        srl     b
+        jp      z, .check_tail
+.pair_loop:
+        ; A line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        inc     l
+        inc     l
+.smc_r:
+        ld      (hl), 0
+        ; B line
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        inc     l
+        inc     l
+.smc_b_r:
+        ld      (hl), 0
+        djnz    .pair_loop
+.check_tail:
+.smc_count_odd:
+        ld      a, 0
+        or      a
+        jr      z, .done
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        inc     l
+        inc     l
+.smc_tail_r:
+        ld      (hl), 0
+.done:
+        ld      sp, (saved_sp)
+        ret
+
+; Edge body city variants — same shape as their non-city counterparts but
+; the L cell (right-edge variants) or R cell (left-edge variants) is written
+; with masked OR against bg_buffer: `screen = pipe_byte | (bg_byte & out_mask)`
+; so cityscape pattern fills outside-pipe pixels only, never inside the pipe.
+
+paint_LMM_city:                         ; byte_x=30: L+M1+M2 visible
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l                       ; → L cell
+        set     7, h
+        ld      a, (hl)
+.smc_l_outmask:
+        and     0
+        res     7, h
+.smc_l:
+        or      0
+        ld      (hl), a
+        inc     l                       ; → M1
+.smc_m1:
+        ld      (hl), 0
+        inc     l                       ; → M2
+        bit     0, h
+        jr      nz, .odd
+.smc_m2:
+        ld      (hl), 0
+        jr      .next
+.odd:
+.smc_b_m2:
         ld      (hl), 0
 .next:
         djnz    .lp
         ld      sp, (saved_sp)
         ret
 
-paint_R:
+paint_LM_city:                          ; byte_x=31: L+M visible
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l                       ; → L cell
+        set     7, h
+        ld      a, (hl)
+.smc_l_outmask:
+        and     0
+        res     7, h
+.smc_l:
+        or      0
+        ld      (hl), a
+        inc     l                       ; → M
+.smc_m:
+        ld      (hl), 0
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
+paint_L_city:                           ; byte_x=32: L cell only
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l                       ; → L cell
+        set     7, h
+        ld      a, (hl)
+.smc_l_outmask:
+        and     0
+        res     7, h
+.smc_l:
+        or      0
+        ld      (hl), a
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
+paint_MMR_city:                         ; byte_x=0: M1+M2+R visible
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a                    ; → M1
+.smc_m1:
+        ld      (hl), 0
+        inc     l                       ; → M2
+        bit     0, h
+        jr      nz, .odd
+.smc_m2:
+        ld      (hl), 0
+        inc     l                       ; → R
+        set     7, h
+        ld      a, (hl)
+.smc_r_outmask:
+        and     0
+        res     7, h
+.smc_r:
+        or      0
+        ld      (hl), a
+        jr      .next
+.odd:
+.smc_b_m2:
+        ld      (hl), 0
+        inc     l                       ; → R
+        set     7, h
+        ld      a, (hl)
+.smc_b_r_outmask:
+        and     0
+        res     7, h
+.smc_b_r:
+        or      0
+        ld      (hl), a
+.next:
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
+paint_MR_city:                          ; byte_x=255: M+R visible (at cols 0,1)
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        inc     l                       ; → M (col 0)
+        bit     0, h
+        jr      nz, .odd
+.smc_m:
+        ld      (hl), 0
+        inc     l                       ; → R (col 1)
+        set     7, h
+        ld      a, (hl)
+.smc_r_outmask:
+        and     0
+        res     7, h
+.smc_r:
+        or      0
+        ld      (hl), a
+        jr      .next
+.odd:
+.smc_b_m:
+        ld      (hl), 0
+        inc     l
+        set     7, h
+        ld      a, (hl)
+.smc_b_r_outmask:
+        and     0
+        res     7, h
+.smc_b_r:
+        or      0
+        ld      (hl), a
+.next:
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
+paint_R_city:                           ; byte_x=254: R cell only (at col 0)
         ld      h, 0
         ld      l, a
         add     hl, hl
@@ -878,15 +1783,25 @@ paint_R:
         add     a, l
         ld      l, a
         inc     l
-        inc     l
+        inc     l                       ; → R (col 0)
+        set     7, h
+        ld      a, (hl)
         bit     0, h
         jr      nz, .odd
+.smc_r_outmask:
+        and     0
+        res     7, h
 .smc_r:
-        ld      (hl), 0
+        or      0
+        ld      (hl), a
         jr      .next
 .odd:
+.smc_b_r_outmask:
+        and     0
+        res     7, h
 .smc_b_r:
-        ld      (hl), 0
+        or      0
+        ld      (hl), a
 .next:
         djnz    .lp
         ld      sp, (saved_sp)
@@ -915,6 +1830,52 @@ paint_cap_rounded_LMMR:
 .smc_m2: ld     (hl), 0
         inc     l
 .smc_r: ld      (hl), 0
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
+; paint_cap_rounded_LMMR_city: cap-rim variant for the cityscape band.
+; Same masked-OR approach as paint_LMMR_city — bg_buffer is OR'd into
+; the L and R cells but only in pixels outside the 24-px cap shape, so
+; the cap rim itself never has skyscraper inside it. M1/M2 stay direct
+; writes (ATTR_PIPE green paper).
+paint_cap_rounded_LMMR_city:
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l                       ; HL → L cell
+        set     7, h
+        ld      a, (hl)
+.smc_l_outmask:
+        and     0
+        res     7, h
+.smc_l:
+        or      0
+        ld      (hl), a
+        inc     l                       ; → M1
+.smc_m1:
+        ld      (hl), 0
+        inc     l                       ; → M2
+.smc_m2:
+        ld      (hl), 0
+        inc     l                       ; → R
+        set     7, h
+        ld      a, (hl)
+.smc_r_outmask:
+        and     0
+        res     7, h
+.smc_r:
+        or      0
+        ld      (hl), a
         djnz    .lp
         ld      sp, (saved_sp)
         ret
@@ -1045,6 +2006,178 @@ paint_cap_rounded_R:
         ld      sp, (saved_sp)
         ret
 
+; Edge cap city variants — same shape as the non-city cap variants but
+; with masked-OR against bg_buffer at the L/R cells (whichever the variant
+; has). Used for cap rim lines that fall inside the cityscape band.
+
+paint_cap_rounded_LMM_city:             ; byte_x=30: L+M1+M2
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+        set     7, h
+        ld      a, (hl)
+.smc_l_outmask:
+        and     0
+        res     7, h
+.smc_l:
+        or      0
+        ld      (hl), a
+        inc     l
+.smc_m1: ld     (hl), 0
+        inc     l
+.smc_m2: ld     (hl), 0
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
+paint_cap_rounded_LM_city:              ; byte_x=31: L+M
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+        set     7, h
+        ld      a, (hl)
+.smc_l_outmask:
+        and     0
+        res     7, h
+.smc_l:
+        or      0
+        ld      (hl), a
+        inc     l
+.smc_m: ld      (hl), 0
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
+paint_cap_rounded_L_city:               ; byte_x=32: L only
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        dec     l
+        set     7, h
+        ld      a, (hl)
+.smc_l_outmask:
+        and     0
+        res     7, h
+.smc_l:
+        or      0
+        ld      (hl), a
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
+paint_cap_rounded_MMR_city:             ; byte_x=0: M1+M2+R
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+.smc_m1: ld     (hl), 0
+        inc     l
+.smc_m2: ld     (hl), 0
+        inc     l
+        set     7, h
+        ld      a, (hl)
+.smc_r_outmask:
+        and     0
+        res     7, h
+.smc_r:
+        or      0
+        ld      (hl), a
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
+paint_cap_rounded_MR_city:              ; byte_x=255: M+R at cols 0,1
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        inc     l
+.smc_m: ld      (hl), 0
+        inc     l
+        set     7, h
+        ld      a, (hl)
+.smc_r_outmask:
+        and     0
+        res     7, h
+.smc_r:
+        or      0
+        ld      (hl), a
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
+paint_cap_rounded_R_city:               ; byte_x=254: R only at col 0
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      (saved_sp), sp
+        ld      sp, hl
+.lp:
+        pop     hl
+        ld      a, c
+        add     a, l
+        ld      l, a
+        inc     l
+        inc     l
+        set     7, h
+        ld      a, (hl)
+.smc_r_outmask:
+        and     0
+        res     7, h
+.smc_r:
+        or      0
+        ld      (hl), a
+        djnz    .lp
+        ld      sp, (saved_sp)
+        ret
+
 ;----------------------------------------------------------------
 clear_pipe_col:
         ld      a, e
@@ -1058,11 +2191,11 @@ clear_pipe_col:
 .no_top:
         ld      a, e
         add     a, PIPE_GAP
-        cp      192
+        cp      GROUND_TOP              ; stop at ground — pipe doesn't paint below
         ret     nc
         ld      d, a
         neg
-        add     a, 192
+        add     a, GROUND_TOP           ; count = GROUND_TOP - (gap_y + PIPE_GAP)
         ld      b, a
         ld      a, d
         jp      paint_restore
@@ -1071,6 +2204,13 @@ clear_pipe_col:
 ; paint_restore: copy bg_buffer[col] → screen[col] for B scan lines
 ; starting at line A. Used as the "erase" when pipe leaves a col,
 ; so cityscape pixels survive.
+;
+; 4x-unrolled per iteration to amortize the djnz / loop overhead.
+; Callers (clear_pipe_col) always pass B as a multiple of 8 (gap_y is
+; aligned to 8), so no remainder handling is needed: B is divided by 4
+; up front and the inner block writes 4 lines per pass.
+; Cost: ~55 cyc/line vs ~65 unrolled = ~10 cyc/line saved × ~336 lines
+; per wrap = ~3300 cyc saved per wrap frame.
 ;----------------------------------------------------------------
 paint_restore:
         ld      h, 0
@@ -1080,14 +2220,41 @@ paint_restore:
         add     hl, de
         ld      (saved_sp), sp
         ld      sp, hl
+        srl     b
+        srl     b                       ; B = line groups of 4
+        ret     z                       ; (caller never passes B<4 in practice)
 .lp:
-        pop     hl
+        pop     hl                      ; line N
         ld      a, c
         add     a, l
         ld      l, a
-        set     7, h                    ; HL → bg_buffer addr
+        set     7, h
         ld      d, (hl)
-        res     7, h                    ; HL → screen addr
+        res     7, h
+        ld      (hl), d
+        pop     hl                      ; line N+1
+        ld      a, c
+        add     a, l
+        ld      l, a
+        set     7, h
+        ld      d, (hl)
+        res     7, h
+        ld      (hl), d
+        pop     hl                      ; line N+2
+        ld      a, c
+        add     a, l
+        ld      l, a
+        set     7, h
+        ld      d, (hl)
+        res     7, h
+        ld      (hl), d
+        pop     hl                      ; line N+3
+        ld      a, c
+        add     a, l
+        ld      l, a
+        set     7, h
+        ld      d, (hl)
+        res     7, h
         ld      (hl), d
         djnz    .lp
         ld      sp, (saved_sp)
@@ -1145,17 +2312,19 @@ update_bird:
         ld      (bird_vy), hl
         ret
 
+; draw_bird: compiled-sprite version specialized for fixed col BIRD_X=8.
+;   - `set 3, l` replaces `ld a,c; add a,l; ld l,a` (offsets to col 8 — bit 3
+;     of L is always 0 because line_table addresses are 8-aligned).
+;   - DE holds the sprite pointer (7-cyc `ld a,(de)`) instead of IY (19-cyc
+;     `ld a,(iy+d)` + 10-cyc `inc iy`).
+; ~85 cyc/line vs ~125 in the generic version. Saved ~640 cyc/frame.
 draw_bird:
         ld      a, (bird_y + 1)
         ld      (bird_old_y), a
         ld      a, 1
         ld      (bird_old_y_valid), a
 
-        ld      a, (bird_y + 1)         ; A = pixel Y
-        ld      iy, bird_sprite
-        ld      c, BIRD_X
-        ld      b, BIRD_LINES
-
+        ld      a, (bird_y + 1)
         ld      h, 0
         ld      l, a
         add     hl, hl
@@ -1163,20 +2332,20 @@ draw_bird:
         add     hl, de
         ld      (saved_sp), sp
         ld      sp, hl
+        ld      de, bird_sprite
+        ld      b, BIRD_LINES
 .lp:
         pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        ld      a, (iy+0)
+        set     3, l                    ; HL → screen[col BIRD_X=8]
+        ld      a, (de)
         or      (hl)
         ld      (hl), a
-        inc     l
-        ld      a, (iy+1)
+        inc     hl
+        inc     de
+        ld      a, (de)
         or      (hl)
         ld      (hl), a
-        inc     iy
-        inc     iy
+        inc     de
         djnz    .lp
         ld      sp, (saved_sp)
         ret
@@ -1187,9 +2356,6 @@ restore_bird_bg:
         ret     z
 
         ld      a, (bird_old_y)
-        ld      c, BIRD_X
-        ld      b, BIRD_LINES
-
         ld      h, 0
         ld      l, a
         add     hl, hl
@@ -1197,20 +2363,19 @@ restore_bird_bg:
         add     hl, de
         ld      (saved_sp), sp
         ld      sp, hl
+        ld      b, BIRD_LINES
 .lp:
         pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        set     7, h
-        ld      d, (hl)
-        res     7, h
-        ld      (hl), d
-        inc     l
-        set     7, h
-        ld      d, (hl)
-        res     7, h
-        ld      (hl), d
+        set     3, l                    ; HL → screen[col 8]
+        ld      d, h
+        ld      e, l
+        set     7, d                    ; DE → bg_buffer at col 8
+        ld      a, (de)
+        ld      (hl), a
+        inc     hl
+        inc     e
+        ld      a, (de)
+        ld      (hl), a
         djnz    .lp
         ld      sp, (saved_sp)
         ret
@@ -1226,41 +2391,19 @@ restore_bird_bg:
 ;   Ground band is static $20 = ATTR_PIPE already, no refill needed.
 ;----------------------------------------------------------------
 update_pipe_attrs:
-        ; Refill sky+city (rows 0..19) with ATTR_SKY; buildings overlay later.
-        ld      hl, ATTRS
-        ld      de, ATTRS + 1
-        ld      (hl), ATTR_SKY
-        ld      bc, 20 * 32 - 1
-        ldir
-        ; Row 20: ground (1 row)
-        inc     hl
-        ld      (hl), ATTR_GROUND
-        ld      d, h
-        ld      e, l
-        inc     de
-        ld      bc, 1 * 32 - 1
-        ldir
-        ; Rows 21..23: scoreboard
-        inc     hl
-        ld      (hl), ATTR_SCOREBOARD
-        ld      d, h
-        ld      e, l
-        inc     de
-        ld      bc, 3 * 32 - 1
-        ldir
-        call    paint_city_attrs        ; ATTR_CITY only where buildings exist
+        call    refill_base_attrs       ; full attr refill (slow path, init only)
+        ; fall through to apply_pipe_attrs
 
+;----------------------------------------------------------------
+; apply_pipe_attrs: for each pipe, overlay ATTR_PIPE at M1/M2 cells.
+; Reads pipe_state; chooses the right per-row routine based on byte_x.
+;----------------------------------------------------------------
+apply_pipe_attrs:
         ld      iy, pipe_state
         ld      b, NUM_PIPES
 .lp:
         push    bc
         ld      a, (iy+0)
-        ; Green paper = 2 cells at M1, M2 (= byte_x, byte_x+1). Walls at L and R
-        ; cells stay on sky → sky spills into pipe on both sides.
-        ;   byte_x = 0..30  : 2 cells at byte_x, byte_x+1
-        ;   byte_x = 31     : 1 cell at col 31 (M1 only; M2 off-screen)
-        ;   byte_x = 255 (-1): 1 cell at col 0 (M2 only; M1 off-screen)
-        ;   otherwise: skip (single-cell L or R edge → sky-into-pipe)
         cp      31
         jr      z, .case_31
         cp      255
@@ -1273,16 +2416,94 @@ update_pipe_attrs:
         call    paint_pipe_attrs_inner
         jr      .skip
 .case_31:
-        ld      c, 31                   ; LM variant: M1 only at col 31
+        ld      c, 31                   ; LM: M1 only at col 31
         ld      a, (iy+1)
         ld      e, a
         call    paint_pipe_attrs_inner_1col
         jr      .skip
 .case_neg1:
-        ld      c, 0                    ; MR variant: M2 only at col 0
+        ld      c, 0                    ; MR: M2 only at col 0
         ld      a, (iy+1)
         ld      e, a
         call    paint_pipe_attrs_inner_1col
+.skip:
+        inc     iy
+        inc     iy
+        pop     bc
+        djnz    .lp
+        ret
+
+;----------------------------------------------------------------
+; refill_base_attrs: LDIR sky + ground + scoreboard rows, then overlay city.
+; Used once at init to set up BACKUP_ATTRS. NOT called per frame anymore.
+;----------------------------------------------------------------
+refill_base_attrs:
+        ld      hl, ATTRS
+        ld      de, ATTRS + 1
+        ld      (hl), ATTR_SKY
+        ld      bc, 20 * 32 - 1
+        ldir
+        inc     hl
+        ld      (hl), ATTR_GROUND
+        ld      d, h
+        ld      e, l
+        inc     de
+        ld      bc, 1 * 32 - 1
+        ldir
+        inc     hl
+        ld      (hl), ATTR_SCOREBOARD
+        ld      d, h
+        ld      e, l
+        inc     de
+        ld      bc, 3 * 32 - 1
+        ldir
+        jp      paint_city_attrs        ; tail-call
+
+;----------------------------------------------------------------
+; backup_base_attrs: copy ATTRS → BACKUP_ATTRS. Called once at init after
+; refill_base_attrs so BACKUP_ATTRS holds the "no pipes" base.
+;----------------------------------------------------------------
+backup_base_attrs:
+        ld      hl, ATTRS
+        ld      de, BACKUP_ATTRS
+        ld      bc, 768
+        ldir
+        ret
+
+;----------------------------------------------------------------
+; restore_pipe_attrs: per-pipe, restore base attrs at CURRENT (= about-to-be-old)
+; pipe cells. Called BEFORE wrap_byte_x so pipe_state still has old positions.
+; After this + wrap_byte_x + apply_pipe_attrs, ATTRS reflects new positions
+; without needing a full refill.
+;----------------------------------------------------------------
+restore_pipe_attrs:
+        ld      iy, pipe_state
+        ld      b, NUM_PIPES
+.lp:
+        push    bc
+        ld      a, (iy+0)
+        cp      31
+        jr      z, .case_31
+        cp      255
+        jr      z, .case_neg1
+        cp      31
+        jr      nc, .skip
+        ld      c, a
+        ld      a, (iy+1)
+        ld      e, a
+        call    restore_pipe_attrs_inner
+        jr      .skip
+.case_31:
+        ld      c, 31
+        ld      a, (iy+1)
+        ld      e, a
+        call    restore_pipe_attrs_inner_1col
+        jr      .skip
+.case_neg1:
+        ld      c, 0
+        ld      a, (iy+1)
+        ld      e, a
+        call    restore_pipe_attrs_inner_1col
 .skip:
         inc     iy
         inc     iy
@@ -1549,6 +2770,150 @@ paint_attr_rows:
 .no_carry:
         djnz    .row_lp
         pop     de                       ; restore caller's gap_y
+        ret
+
+;----------------------------------------------------------------
+; restore_pipe_attrs_inner: mirror of paint_pipe_attrs_inner that copies
+; base attrs from BACKUP_ATTRS into ATTRS at M1, M2 cells across the pipe
+; body rows. Used to clear OLD pipe attrs before wrap_byte_x advances.
+;----------------------------------------------------------------
+restore_pipe_attrs_inner:
+        ld      a, e
+        or      a
+        jr      z, .no_top
+        dec     a
+        srl     a
+        srl     a
+        srl     a
+        inc     a
+        ld      b, a
+        xor     a
+        call    restore_attr_rows
+.no_top:
+        ld      a, e
+        add     a, PIPE_GAP
+        jr      c, .done
+        add     a, 7
+        jr      c, .done
+        srl     a
+        srl     a
+        srl     a
+        cp      20
+        jr      nc, .done
+        ld      d, a
+        ld      a, 20
+        sub     d
+        ld      b, a
+        ld      a, d
+        call    restore_attr_rows
+.done:
+        ret
+
+restore_pipe_attrs_inner_1col:
+        ld      a, e
+        or      a
+        jr      z, .no_top
+        dec     a
+        srl     a
+        srl     a
+        srl     a
+        inc     a
+        ld      b, a
+        xor     a
+        call    restore_attr_rows_1col
+.no_top:
+        ld      a, e
+        add     a, PIPE_GAP
+        jr      c, .done
+        add     a, 7
+        jr      c, .done
+        srl     a
+        srl     a
+        srl     a
+        cp      20
+        jr      nc, .done
+        ld      d, a
+        ld      a, 20
+        sub     d
+        ld      b, a
+        ld      a, d
+        call    restore_attr_rows_1col
+.done:
+        ret
+
+;----------------------------------------------------------------
+; restore_attr_rows: read 2 cells at (row*32+C, row*32+C+1) from BACKUP_ATTRS
+; and write to ATTRS, for B rows starting at row A. Preserves DE.
+; BACKUP_ATTRS is at HL | $8000 (set 7,h → backup, res 7,h → attrs).
+;----------------------------------------------------------------
+restore_attr_rows:
+        push    de
+        push    bc
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; HL = row * 32
+        ld      de, ATTRS
+        add     hl, de
+        ld      d, 0
+        ld      e, c
+        add     hl, de                  ; HL = ATTRS + row*32 + byte_x
+        pop     bc
+.row_lp:
+        set     7, h                    ; HL → BACKUP_ATTRS
+        ld      a, (hl)
+        res     7, h                    ; HL → ATTRS
+        ld      (hl), a                 ; restore M1
+        inc     hl
+        set     7, h
+        ld      a, (hl)
+        res     7, h
+        ld      (hl), a                 ; restore M2
+        ld      a, l
+        add     a, 31
+        ld      l, a
+        jr      nc, .nc
+        inc     h
+.nc:
+        djnz    .row_lp
+        pop     de
+        ret
+
+;----------------------------------------------------------------
+; restore_attr_rows_1col: same as restore_attr_rows but 1 cell per row.
+;----------------------------------------------------------------
+restore_attr_rows_1col:
+        push    de
+        push    bc
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        ld      de, ATTRS
+        add     hl, de
+        ld      d, 0
+        ld      e, c
+        add     hl, de
+        pop     bc
+.row_lp:
+        set     7, h
+        ld      a, (hl)
+        res     7, h
+        ld      (hl), a
+        ld      a, l
+        add     a, 32
+        ld      l, a
+        jr      nc, .nc
+        inc     h
+.nc:
+        djnz    .row_lp
+        pop     de
         ret
 
 ;----------------------------------------------------------------
