@@ -886,6 +886,13 @@ gen_pipe_program:
         ldir
 
         ld      iy, PIPE_PROGRAM
+        ; Emit prologue: ld (saved_sp), sp  (4 bytes: ED 73 lo hi)
+        ld      (iy+0), $ED
+        ld      (iy+1), $73
+        ld      (iy+2), low saved_sp
+        ld      (iy+3), high saved_sp
+        ld      de, 4
+        add     iy, de
         ld      b, 0                    ; row counter
 .row_lp:
         ld      c, 0                    ; pipe counter
@@ -1968,8 +1975,10 @@ redraw_pipes_v2:
         ; --- Reload BC/DE from scratch (BC'/DE' weren't clobbered — neither routine exx's) ---
         ld      bc, (body_a_bc)
         ld      de, (body_a_de)
-        ; --- Tail-jump to generated program; program restores SP and RETs to our caller ---
-        jp      PIPE_PROGRAM
+        ; --- Call generated program ---
+        call    PIPE_PROGRAM            ; PIPE_PROGRAM ends with ld sp,(saved_sp) + ret
+        ld      sp, (saved_sp)
+        ret
 
 seed_pipe_program_with_ret:
         ld      a, $C9                  ; RET
