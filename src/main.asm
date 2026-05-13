@@ -63,7 +63,6 @@ start:
         call    init_bird
         call    apply_pipe_attrs        ; overlay ATTR_PIPE at initial pipe positions
         im      1
-        call    seed_pipe_program_with_ret      ; TEMP — replaced by gen_pipe_program later
         ei
 
 main_loop:
@@ -526,10 +525,9 @@ draw_bg_column:
 init_pipes:
         xor     a
         ld      (phase), a
-        call    update_smc
-        call    update_cap_smc
-        call    patch_pipe_smc          ; seed redraw_pipes_linemajor offb/capt/capb SMC
-        call    redraw_pipes_linemajor
+        call    update_city_cache
+        call    gen_pipe_program
+        call    redraw_pipes_v2
         ret
 
 ;----------------------------------------------------------------
@@ -842,6 +840,178 @@ patch_pipe_targets:
         inc     c
         dec     b
         jp      nz, .pipe_outer
+        ret
+
+;----------------------------------------------------------------
+; gen_pipe_program: full regenerate of the flat render program.
+; Walks rows 0..159; for each pipe, classifies row and emits the
+; appropriate template at IY (output cursor in pipe_program).
+; Records slot addresses into slot_addr_table[pipe][row] and screen
+; targets into target_table[pipe][row].
+;
+; TASK 5: sky body only. Cap/city emit added later.
+;----------------------------------------------------------------
+gen_pipe_program:
+        ; Zero the slot_addr_table so unused rows are marked inactive.
+        ld      hl, SLOT_ADDR_TABLE
+        ld      de, SLOT_ADDR_TABLE + 1
+        ld      (hl), 0
+        ld      bc, SLOT_ADDR_TABLE_END - SLOT_ADDR_TABLE - 1
+        ldir
+
+        ld      iy, PIPE_PROGRAM
+        ld      b, 0                    ; row counter
+.row_lp:
+        ld      c, 0                    ; pipe counter
+.pipe_lp:
+        push    bc
+        ; Classify row B for pipe C → decide template
+        ;   body row     : row < gap_y_C - 1
+        ;   cap top      : row == gap_y_C - 1
+        ;   in gap       : gap_y_C <= row < gap_y_C + PIPE_GAP
+        ;   cap bot      : row == gap_y_C + PIPE_GAP
+        ;   body bot     : gap_y_C + PIPE_GAP < row < GROUND_TOP
+        ld      hl, pipe_state
+        ld      a, c
+        add     a, a
+        add     a, l
+        ld      l, a                    ; HL → pipe_state[pipe*2]
+        ld      a, (hl)                 ; A = byte_x
+        ld      e, a                    ; E = byte_x
+        inc     hl
+        ld      a, (hl)                 ; A = gap_y
+        ld      d, a                    ; D = gap_y
+
+        ; row in (gap_y .. gap_y+PIPE_GAP-1)?  in_gap if true.
+        ld      a, b
+        cp      d
+        jr      c, .not_in_gap          ; row < gap_y
+        ld      a, d
+        add     a, PIPE_GAP
+        ld      l, a                    ; L = gap_y + PIPE_GAP
+        ld      a, b
+        cp      l
+        jr      nc, .not_in_gap         ; row >= gap_y+PIPE_GAP
+        ; In gap — skip.
+        jp      .pipe_done
+.not_in_gap:
+        ; Active row. For TASK 5: emit sky-body template regardless (cap/city later).
+        ; This produces visually-wrong caps and city; gets fixed in Task 6-7.
+
+        ; --- Emit: ld sp, line_table[row]+byte_x+3 ; push de ; push bc ---
+        ;   ld sp, nn       opcode = $31, then nn lo, nn hi (3 bytes)
+        ;   push de         opcode = $D5                    (1 byte)
+        ;   push bc         opcode = $C5                    (1 byte)
+        ;
+        ; Even row uses BC/DE (sky-A); odd row prepends exx + appends exx (sky-B).
+        ld      a, b
+        and     1
+        jr      z, .emit_a
+        ld      (iy+0), $D9             ; exx (prepend)
+        inc     iy
+.emit_a:
+        ; Record slot addr → slot_addr_table[pipe][row] = address of "ld sp" immediate (= IY+1)
+        push    iy
+        pop     hl
+        inc     hl                      ; HL = address of nn-lo byte of "ld sp,nn"
+        push    hl                      ; save slot-immediate addr
+        ld      a, c
+        add     a, a                    ; pipe * 2 (16-bit entry stride)
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_slot_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; HL = SLOT_ADDR_TABLE base for this pipe
+        ld      a, b
+        add     a, a                    ; row*2
+        add     a, l
+        ld      l, a
+        jr      nc, .nc1
+        inc     h
+.nc1:
+        pop     de                      ; DE = slot-immediate addr (= original IY+1)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; --- Compute screen_target = line_table[row] + byte_x + 3 ---
+        ld      a, b
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      de, line_table
+        add     hl, de                  ; HL → line_table[row]
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = line_addr
+        ; Reload byte_x for pipe C (E was clobbered earlier inside this row)
+        ld      hl, pipe_state
+        ld      a, c
+        add     a, a
+        add     a, l
+        ld      l, a
+        ld      a, (hl)                 ; A = byte_x
+        add     a, 3                    ; +3 for stack-blast offset
+        ld      l, a
+        ld      h, 0
+        add     hl, de                  ; HL = line_addr + byte_x + 3
+        push    hl                      ; save target
+
+        ; Save into target_table[pipe][row]
+        ld      a, c
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_target_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; HL = target_table base for pipe
+        ld      a, b
+        add     a, a
+        add     a, l
+        ld      l, a
+        jr      nc, .nc2
+        inc     h
+.nc2:
+        pop     de                      ; DE = target
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; --- Emit the actual 5 bytes at IY ---
+        ld      (iy+0), $31             ; ld sp, nn
+        ld      (iy+1), e               ; lo
+        ld      (iy+2), d               ; hi
+        ld      (iy+3), $D5             ; push de
+        ld      (iy+4), $C5             ; push bc
+        ld      de, 5
+        add     iy, de
+
+        ; If odd row, append exx to swap back
+        ld      a, b
+        and     1
+        jr      z, .pipe_done
+        ld      (iy+0), $D9             ; exx
+        inc     iy
+
+.pipe_done:
+        pop     bc                      ; restore pipe loop state
+        inc     c
+        ld      a, c
+        cp      NUM_PIPES
+        jp      c, .pipe_lp
+
+        inc     b
+        ld      a, b
+        cp      GROUND_TOP
+        jp      c, .row_lp
+
+        ld      (iy+0), $C9             ; emit RET — end of program
         ret
 
 ;----------------------------------------------------------------
