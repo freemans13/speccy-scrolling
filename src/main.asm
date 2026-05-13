@@ -1963,8 +1963,11 @@ redraw_pipes_v2:
         ld      (body_b_de), de         ; NEW
         exx
         ; --- Refresh cap immediates ---
-        call    update_cap_imm          ; NEW
-        call    update_city_cache       ; NEW — fill city_cache before PIPE_PROGRAM runs
+        call    update_cap_imm          ; NEW — clobbers BC, DE
+        call    update_city_cache       ; NEW — clobbers BC, DE
+        ; --- Reload BC/DE from scratch (BC'/DE' weren't clobbered — neither routine exx's) ---
+        ld      bc, (body_a_bc)
+        ld      de, (body_a_de)
         ; --- Tail-jump to generated program; program restores SP and RETs to our caller ---
         jp      PIPE_PROGRAM
 
