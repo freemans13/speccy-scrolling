@@ -923,8 +923,11 @@ gen_pipe_program:
         add     a, PIPE_GAP
         cp      b
         jp      z, .emit_cap_bot
-        ; Otherwise: sky-body row — fall through into existing emit
+        ; Otherwise: sky-body row — check for city band first
 .emit_sky_body:
+        ld      a, b
+        cp      CITY_TOP
+        jp      nc, .emit_city_body     ; row >= 128 → city template
         ; --- Emit: ld sp, line_table[row]+byte_x+3 ; push de ; push bc ---
         ;   ld sp, nn       opcode = $31, then nn lo, nn hi (3 bytes)
         ;   push de         opcode = $D5                    (1 byte)
@@ -1179,6 +1182,153 @@ gen_pipe_program:
         jp      .pipe_done
 
 .cap_idx_temp:  db 0
+
+.emit_city_body:
+        ; City template (10 bytes total):
+        ;   ld sp, $imm_city_cache_slot   ; $31 + 2 bytes (3 bytes)
+        ;   pop bc                        ; $C1           (1)
+        ;   pop de                        ; $D1           (1)
+        ;   ld sp, $imm_screen_target     ; $31 + 2 bytes (3)
+        ;   push de                       ; $D5           (1)
+        ;   push bc                       ; $C5           (1)
+
+        ; Compute city_cache slot addr = CITY_CACHE + (row - CITY_TOP) * 12 + pipe * 4
+        ld      a, b
+        sub     CITY_TOP
+        ; A = row offset (0..31). Multiply by 12.
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; *2
+        add     hl, hl                  ; *4
+        ld      d, h
+        ld      e, l                    ; DE = row_offset * 4
+        add     hl, hl                  ; *8
+        add     hl, de                  ; *12
+        ld      de, CITY_CACHE
+        add     hl, de                  ; HL = CITY_CACHE + row_offset * 12
+        ld      a, c                    ; A = pipe
+        add     a, a
+        add     a, a                    ; pipe * 4
+        add     a, l
+        ld      l, a
+        jr      nc, .city_nc1
+        inc     h
+.city_nc1:
+        ; HL = city_cache slot addr for (row, pipe)
+        ; Emit "ld sp, HL" at IY+0..IY+2
+        ld      (iy+0), $31
+        ld      (iy+1), l
+        ld      (iy+2), h
+        ld      (iy+3), $C1             ; pop bc
+        ld      (iy+4), $D1             ; pop de
+
+        ; --- Compute screen_target = line_table[row] + byte_x + 3 ---
+        ld      a, b                    ; row
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = line_addr
+        ld      hl, pipe_state
+        ld      a, c
+        add     a, a
+        add     a, l
+        ld      l, a
+        ld      a, (hl)
+        add     a, 3
+        ld      l, a
+        ld      h, 0
+        add     hl, de                  ; HL = target
+        push    hl                      ; save target
+
+        ; --- Save target to target_table[pipe][row] ---
+        ld      a, c
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_target_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; HL = target_table base for pipe
+        ld      a, b
+        add     a, a
+        add     a, l
+        ld      l, a
+        jr      nc, .city_nc2
+        inc     h
+.city_nc2:
+        pop     de                      ; DE = target
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; --- Record slot_addr_table[pipe][row] = IY+6 (the screen-target imm) ---
+        push    iy
+        pop     hl
+        inc     hl
+        inc     hl
+        inc     hl
+        inc     hl
+        inc     hl
+        inc     hl                      ; HL = IY+6
+        push    hl                      ; save IY+6 addr
+        ld      a, c
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_slot_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; HL = slot_addr_table base for pipe
+        ld      a, b
+        add     a, a
+        add     a, l
+        ld      l, a
+        jr      nc, .city_nc3
+        inc     h
+.city_nc3:
+        pop     de                      ; DE = IY+6 = screen-target imm addr
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; --- Reload target from target_table[pipe][row] and emit IY+5..IY+9 ---
+        ld      a, c
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_target_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; HL = target_table base for pipe
+        ld      a, b
+        add     a, a
+        add     a, l
+        ld      l, a
+        jr      nc, .city_nc4
+        inc     h
+.city_nc4:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = target
+
+        ld      (iy+5), $31
+        ld      (iy+6), e
+        ld      (iy+7), d
+        ld      (iy+8), $D5
+        ld      (iy+9), $C5
+        ld      de, 10
+        add     iy, de
+        jp      .pipe_done
 
 .pipe_done:
         pop     bc                      ; restore pipe loop state
@@ -1800,6 +1950,7 @@ redraw_pipes_v2:
         exx
         ; --- Refresh cap immediates ---
         call    update_cap_imm          ; NEW
+        call    update_city_cache       ; NEW — fill city_cache before PIPE_PROGRAM runs
         ; --- Call generated program ---
         call    PIPE_PROGRAM            ; program ends with RET
         ld      sp, (saved_sp)
