@@ -1350,7 +1350,14 @@ gen_pipe_program:
         cp      GROUND_TOP
         jp      c, .row_lp
 
-        ld      (iy+0), $C9             ; emit RET — end of program
+        ; Emit "ld sp, (saved_sp) ; ret" — restores caller SP (which was
+        ; clobbered by the last row's ld sp,target) before the RET pops the
+        ; real return address. 5 bytes total.
+        ld      (iy+0), $ED
+        ld      (iy+1), $7B
+        ld      (iy+2), low saved_sp
+        ld      (iy+3), high saved_sp
+        ld      (iy+4), $C9
         ret
 
 ;----------------------------------------------------------------
@@ -1958,10 +1965,8 @@ redraw_pipes_v2:
         ; --- Refresh cap immediates ---
         call    update_cap_imm          ; NEW
         call    update_city_cache       ; NEW — fill city_cache before PIPE_PROGRAM runs
-        ; --- Call generated program ---
-        call    PIPE_PROGRAM            ; program ends with RET
-        ld      sp, (saved_sp)
-        ret
+        ; --- Tail-jump to generated program; program restores SP and RETs to our caller ---
+        jp      PIPE_PROGRAM
 
 seed_pipe_program_with_ret:
         ld      a, $C9                  ; RET
