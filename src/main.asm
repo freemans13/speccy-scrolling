@@ -166,6 +166,24 @@ pipe_slot_base:
         dw      SLOT_ADDR_TABLE + 1 * 320
         dw      SLOT_ADDR_TABLE + 2 * 320
 
+; cap_slot_table: addresses of bc-imm and de-imm slots per cap-row per pipe.
+; Layout per cap-row (4 bytes): [bc_imm_lo_addr, bc_imm_hi_addr, de_imm_lo_addr, de_imm_hi_addr]
+; Per pipe: 2 cap-rows × 4 bytes = 8 bytes (cap_top at +0, cap_bot at +4)
+; Per 3 pipes: 24 bytes total. Zero = cap row not present.
+cap_slot_table: ds 24
+
+; Scratch words for cap_bot's BC/DE restore. Populated by redraw_pipes_v2 at frame entry.
+body_a_bc:      dw 0
+body_a_de:      dw 0
+body_b_bc:      dw 0
+body_b_de:      dw 0
+
+; Scratch bytes for update_cap_imm's phase-shifted cap values
+cap_L_temp:     db 0
+cap_M1_temp:    db 0
+cap_M2_temp:    db 0
+cap_R_temp:     db 0
+
 ; Score state: +1 each time a pipe's right edge clears the bird's left edge.
 ; pipe_scored is 1 once the bird has passed that pipe this cycle; reset when
 ; the pipe wraps back to the right of the screen so it can score again.
@@ -895,9 +913,18 @@ gen_pipe_program:
         ; In gap — skip.
         jp      .pipe_done
 .not_in_gap:
-        ; Active row. For TASK 5: emit sky-body template regardless (cap/city later).
-        ; This produces visually-wrong caps and city; gets fixed in Task 6-7.
-
+        ; Cap-top check: row B == gap_y D - 1
+        ld      a, d                    ; D = gap_y
+        dec     a
+        cp      b
+        jp      z, .emit_cap_top
+        ; Cap-bot check: row B == gap_y D + PIPE_GAP
+        ld      a, d
+        add     a, PIPE_GAP
+        cp      b
+        jp      z, .emit_cap_bot
+        ; Otherwise: sky-body row — fall through into existing emit
+.emit_sky_body:
         ; --- Emit: ld sp, line_table[row]+byte_x+3 ; push de ; push bc ---
         ;   ld sp, nn       opcode = $31, then nn lo, nn hi (3 bytes)
         ;   push de         opcode = $D5                    (1 byte)
@@ -995,9 +1022,163 @@ gen_pipe_program:
         ; If odd row, append exx to swap back
         ld      a, b
         and     1
-        jr      z, .pipe_done
+        jp      z, .pipe_done
         ld      (iy+0), $D9             ; exx
         inc     iy
+        jp      .pipe_done
+
+.emit_cap_top:
+        xor     a                       ; cap_idx_within_pipe = 0 (cap_top)
+        jp      .do_cap
+.emit_cap_bot:
+        ld      a, 4                    ; cap_idx_within_pipe = 4 (cap_bot)
+.do_cap:
+        ld      (.cap_idx_temp), a      ; remember which cap this is for restore decision
+
+        ; --- Emit "ld bc, 0, 0" at IY+0..IY+2 (cap L/M1 placeholder) ---
+        ld      (iy+0), $01             ; ld bc, nn
+        ld      (iy+1), 0
+        ld      (iy+2), 0
+        ; bc-imm slot address = IY+1. Record into cap_slot_table[pipe*8 + cap_idx + 0..1].
+        ld      a, c                    ; pipe (0..2)
+        add     a, a
+        add     a, a
+        add     a, a                    ; pipe * 8
+        ld      l, a
+        ld      h, 0
+        ld      de, cap_slot_table
+        add     hl, de                  ; HL → cap_slot_table[pipe*8]
+        ld      a, (.cap_idx_temp)
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; HL → cap_slot_table[pipe*8 + cap_idx]
+        push    iy
+        pop     de
+        inc     de                      ; DE = IY+1 = bc-imm slot
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl                      ; HL → de-imm slot ptr position
+
+        ; --- Emit "ld de, 0, 0" at IY+3..IY+5 (cap M2/R placeholder) ---
+        ld      (iy+3), $11             ; ld de, nn
+        ld      (iy+4), 0
+        ld      (iy+5), 0
+        ; de-imm slot address = IY+4. Record at HL.
+        push    iy
+        pop     de
+        inc     de
+        inc     de
+        inc     de
+        inc     de                      ; DE = IY+4 = de-imm slot
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; --- Compute screen_target = line_table[row] + byte_x + 3 ---
+        ld      a, b                    ; row
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = line_addr
+        ld      hl, pipe_state
+        ld      a, c
+        add     a, a
+        add     a, l
+        ld      l, a
+        ld      a, (hl)                 ; A = byte_x
+        add     a, 3                    ; +3 for stack-blast offset
+        ld      l, a
+        ld      h, 0
+        add     hl, de                  ; HL = line_addr + byte_x + 3 = target
+        push    hl                      ; save target
+
+        ; --- Save target to target_table[pipe][row] ---
+        ld      a, c
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_target_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; HL = target_table base for pipe
+        ld      a, b
+        add     a, a
+        add     a, l
+        ld      l, a
+        jr      nc, .cap_nc1
+        inc     h
+.cap_nc1:
+        pop     de                      ; DE = target
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; --- Emit "ld sp, target ; push de ; push bc" at IY+6..IY+10 ---
+        ld      (iy+6), $31             ; ld sp, nn
+        ld      (iy+7), e               ; lo
+        ld      (iy+8), d               ; hi
+        ld      (iy+9), $D5             ; push de
+        ld      (iy+10), $C5            ; push bc
+
+        ; --- Record slot_addr_table[pipe][row] = address of ld sp imm (= IY+7) ---
+        push    iy
+        pop     hl
+        ld      de, 7
+        add     hl, de                  ; HL = IY+7
+        push    hl                      ; save slot-imm addr
+        ld      a, c
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_slot_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; HL = slot_addr_table base for pipe
+        ld      a, b
+        add     a, a
+        add     a, l
+        ld      l, a
+        jr      nc, .cap_nc2
+        inc     h
+.cap_nc2:
+        pop     de                      ; DE = IY+7
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; --- Advance IY past the 11 emitted bytes ---
+        ld      de, 11
+        add     iy, de
+
+        ; --- If cap_bot, emit BC/DE restore (8 more bytes) ---
+        ld      a, (.cap_idx_temp)
+        cp      4
+        jp      nz, .pipe_done          ; cap_top — no restore needed
+
+        ; ld bc, (body_a_bc) — opcode ED 4B nn nn
+        ld      (iy+0), $ED
+        ld      (iy+1), $4B
+        ld      (iy+2), low body_a_bc
+        ld      (iy+3), high body_a_bc
+        ; ld de, (body_a_de) — opcode ED 5B nn nn
+        ld      (iy+4), $ED
+        ld      (iy+5), $5B
+        ld      (iy+6), low body_a_de
+        ld      (iy+7), high body_a_de
+        ld      de, 8
+        add     iy, de
+        jp      .pipe_done
+
+.cap_idx_temp:  db 0
 
 .pipe_done:
         pop     bc                      ; restore pipe loop state
@@ -1596,6 +1777,8 @@ redraw_pipes_v2:
         ld      e, (hl)                 ; E = M2_A
         inc     hl
         ld      d, (hl)                 ; D = R_A    →  DE = R<<8 | M2
+        ld      (body_a_bc), bc         ; NEW: save sky-A pair 1 to scratch
+        ld      (body_a_de), de         ; NEW: save sky-A pair 2 to scratch
         ; --- Sky-B pair into BC'/DE' ---
         exx
         ld      a, (phase)
@@ -1612,7 +1795,11 @@ redraw_pipes_v2:
         ld      e, (hl)
         inc     hl
         ld      d, (hl)
+        ld      (body_b_bc), bc         ; NEW (still inside exx — captures sky-B values)
+        ld      (body_b_de), de         ; NEW
         exx
+        ; --- Refresh cap immediates ---
+        call    update_cap_imm          ; NEW
         ; --- Call generated program ---
         call    PIPE_PROGRAM            ; program ends with RET
         ld      sp, (saved_sp)
@@ -3376,6 +3563,65 @@ paint_cap_rounded_R_city:               ; byte_x=254: R only at col 0
 ;
 ; Cost target: ~5 k T-states/frame.
 ;----------------------------------------------------------------
+
+;----------------------------------------------------------------
+; update_cap_imm: for each (pipe, cap-row) recorded in cap_slot_table,
+; write the current phase's cap byte values into the bc-imm and de-imm
+; slots inside pipe_program.
+;
+; cap_slot_table layout per cap-row entry (4 bytes):
+;   [bc_imm_lo_addr, bc_imm_hi_addr, de_imm_lo_addr, de_imm_hi_addr]
+; The bc-imm slot expects (lo=L, hi=M1). The de-imm slot expects (lo=M2, hi=R).
+; Cap bytes source: cap_rounded_bitmap[phase*4 + 0..3] = [L, M1, M2, R].
+;----------------------------------------------------------------
+update_cap_imm:
+        ld      hl, cap_rounded_bitmap
+        ld      a, (phase)
+        add     a, a
+        add     a, a                    ; phase * 4
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; HL → cap_rounded_bitmap[phase*4]
+        ld      a, (hl)                 ; L
+        ld      (cap_L_temp), a
+        inc     hl
+        ld      a, (hl)                 ; M1
+        ld      (cap_M1_temp), a
+        inc     hl
+        ld      a, (hl)                 ; M2
+        ld      (cap_M2_temp), a
+        inc     hl
+        ld      a, (hl)                 ; R
+        ld      (cap_R_temp), a
+
+        ld      ix, cap_slot_table
+        ld      b, 6                    ; 6 cap-rows worst case (3 pipes × 2 caps)
+.lp:
+        ld      l, (ix+0)
+        ld      h, (ix+1)
+        ld      a, h
+        or      l
+        jr      z, .skip                ; slot=0 means cap row not present
+        ; (HL) = L slot, (HL+1) = M1 slot
+        ld      a, (cap_L_temp)
+        ld      (hl), a
+        inc     hl
+        ld      a, (cap_M1_temp)
+        ld      (hl), a
+        ; Now the de-imm slot
+        ld      l, (ix+2)
+        ld      h, (ix+3)
+        ld      a, (cap_M2_temp)
+        ld      (hl), a
+        inc     hl
+        ld      a, (cap_R_temp)
+        ld      (hl), a
+.skip:
+        ld      de, 4
+        add     ix, de                  ; advance to next cap-row entry (4 bytes)
+        djnz    .lp
+        ret
+
 city_row_temp:   db 0                  ; current row
 city_pipe_temp:  db 0                  ; current pipe index
 city_bx_temp:    db 0                  ; current pipe byte_x
