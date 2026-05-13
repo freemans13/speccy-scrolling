@@ -64,6 +64,17 @@ DE' = R_B  << 8 | M2_B   (body sky-B, second pair)
 HL, IX, IY free
 ```
 
+Shadow scratch in main memory, populated by `redraw_pipes_v2` at function entry:
+
+```
+body_a_bc: dw 0          ; mirror of BC at entry  (body sky-A pair 1)
+body_a_de: dw 0          ; mirror of DE at entry  (body sky-A pair 2)
+body_b_bc: dw 0          ; mirror of BC' at entry (body sky-B pair 1)
+body_b_de: dw 0          ; mirror of DE' at entry (body sky-B pair 2)
+```
+
+These scratch words are read back only by the cap_bot restore sequence (§4.4). Body sky rows never read them — they push directly from registers.
+
 ### 4.1 Empty row
 
 ```
@@ -92,7 +103,7 @@ Cost: 96T + 8T = 104T for 3 pipes.
 
 ### 4.4 Cap row (cap A or cap B)
 
-The cap row uses cap-specific byte values, not the body cache, so we embed them as immediates patched by `update_cap_smc`:
+The cap row uses cap-specific byte values, not the body cache, so we embed them as immediates patched by `update_cap_imm`:
 
 ```
 ld bc, $imm_cap_p1_lo_pair   ; 10T  (M1<<8 | L)
@@ -103,6 +114,21 @@ push bc                      ; 11T
 ... per cap-visible pipe ...
 ```
 Cost per pipe per cap row: 52T. Caps land on at most 2 rows per pipe × 3 pipes = 6 rows worst case.
+
+**Register-set invariant (cap_bot only).** The cap bitmap has no A/B variant (cap pixels are the same shape on every row), so cap emit always uses BC/DE — never the shadow set. This means cap emit always clobbers BC and DE, regardless of row parity.
+
+For cap_top rows this is harmless: the next 48 rows are gap (no emit), and cap_bot itself reloads BC/DE from its own immediates.
+
+For cap_bot rows, the next body row two scan lines later (same row parity as cap_bot) uses BC/DE and would push corrupted bytes. The generator therefore appends a BC/DE restore immediately after each cap_bot emit:
+
+```
+ld bc, (body_a_bc)           ; 20T  reload sky-A first pair
+ld de, (body_a_de)           ; 20T  reload sky-A second pair
+```
+
+Cost: 40T per cap_bot × up to 3 cap_bots per frame = max 120T. The four scratch words `body_a_bc`, `body_a_de`, `body_b_bc`, `body_b_de` (8 bytes total) are populated by `redraw_pipes_v2` at function entry. Only `body_a_bc`/`body_a_de` are read at runtime; the body-B scratch words are reserved for future use (e.g. if a city-row clobber ever needs to be repaired before a following body-B row).
+
+City rows do not need a corresponding restore: the city band runs 128..159 and is followed only by the ground band (no more pipe rows), so any register clobber in a city row is harmless.
 
 ### 4.5 City body row (covers rows 128..159 = the city band)
 

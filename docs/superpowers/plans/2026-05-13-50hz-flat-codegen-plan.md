@@ -1047,147 +1047,343 @@ git commit -m "add gen_pipe_program: sky-body emit only; wire into init_pipes"
 
 ## Task 6: Extend `gen_pipe_program` with cap row emit + add `update_cap_imm`
 
-For cap rows, emit `ld bc,nn ; ld de,nn ; ld sp,nn ; push de ; push bc` (8 bytes). Record the slot addresses of the four `nn` immediates so `update_cap_imm` can refresh them per phase.
+For cap rows, emit `ld bc,nn ; ld de,nn ; ld sp,nn ; push de ; push bc` (11 bytes). For cap_bot rows, ALSO emit a BC/DE restore from scratch memory (8 more bytes, 19 bytes total) — see spec §4.4 for the register-set invariant. Record the slot addresses so `update_cap_imm` can refresh the cap byte values per phase.
 
 **Files:**
-- Modify: `src/main.asm` (extend `gen_pipe_program`; add `update_cap_imm`; add `cap_slot_table` data)
+- Modify: `src/main.asm` — add `cap_slot_table`, body scratch words, modify `redraw_pipes_v2` to populate scratch and call `update_cap_imm`, modify `gen_pipe_program` to detect+emit cap rows, add `update_cap_imm`.
 
-- [ ] **Step 1: Reserve `cap_slot_table`**
+- [ ] **Step 1: Reserve `cap_slot_table` and `cap_L_temp` etc.**
 
-Near the existing `pipe_target_base` / `pipe_slot_base` block, add:
-
-```
-; cap_slot_table: addresses of the 4 immediate slots per cap-row per pipe.
-; 2 cap rows × 3 pipes × 4 slots × 2 bytes = 48 bytes.
-; Order: [pipe0_capt_bc_lo_addr, pipe0_capt_de_lo_addr, pipe0_capb_bc_lo_addr, pipe0_capb_de_lo_addr,
-;         pipe1_..., pipe2_...]. Zero = inactive.
-cap_slot_table: ds 24                   ; 12 16-bit pointers
-```
-
-- [ ] **Step 2: Modify `gen_pipe_program`'s row classification to detect cap rows**
-
-In the `.not_in_gap` block, before falling into the sky-body emit, add cap detection:
+Find an appropriate data spot near the existing `pipe_target_base` / `pipe_slot_base` block (around line 160 in current `src/main.asm`). Add:
 
 ```
-.not_in_gap:
-        ; Cap-top check: row == gap_y - 1
-        ld      a, d                    ; D = gap_y
-        dec     a
-        cp      b
-        jr      z, .emit_cap            ; row == gap_y-1 → cap top
-        ; Cap-bot check: row == gap_y + PIPE_GAP
-        ld      a, d
-        add     a, PIPE_GAP
-        cp      b
-        jr      z, .emit_cap_bot
-        ; Otherwise: body row — fall through to existing emit
-        jp      .emit_body
-.emit_cap:
-        ; ... see Step 3
-.emit_cap_bot:
-        ; ... see Step 3
-.emit_body:
-        ; existing sky-body emit code from Task 5 goes here
+; cap_slot_table: addresses of bc-imm and de-imm slots per cap-row per pipe.
+; Layout per cap-row (4 bytes): [bc_imm_lo_addr, bc_imm_hi_addr, de_imm_lo_addr, de_imm_hi_addr]
+; Per pipe: 2 cap-rows × 4 bytes = 8 bytes (cap_top at +0, cap_bot at +4)
+; Per 3 pipes: 24 bytes total. Zero = cap row not present.
+cap_slot_table: ds 24
+
+; Scratch words for cap_bot's BC/DE restore. Populated by redraw_pipes_v2 at frame entry.
+body_a_bc:      dw 0
+body_a_de:      dw 0
+body_b_bc:      dw 0
+body_b_de:      dw 0
+
+; Scratch bytes for update_cap_imm's phase-shifted cap values
+cap_L_temp:     db 0
+cap_M1_temp:    db 0
+cap_M2_temp:    db 0
+cap_R_temp:     db 0
 ```
 
-- [ ] **Step 3: Add the cap emit blocks**
+- [ ] **Step 2: Modify `redraw_pipes_v2` to populate body scratch + call `update_cap_imm`**
 
-Inside `gen_pipe_program`, fill in `.emit_cap` and `.emit_cap_bot` to emit the cap template and record slot addresses into `cap_slot_table`. Both blocks share the same template (top and bottom caps draw the same pixel pattern — only the row differs). Use this for both, parameterised by an offset index:
+Find `redraw_pipes_v2` (added in Task 2). After the sky-A pair load (loads BC and DE from `pipe_bitmap[phase*4]`), insert:
 
 ```
-.emit_cap:
-        ld      a, 0                    ; cap-top offset within cap_slot_table for this pipe = 0
-        jp      .do_cap
-.emit_cap_bot:
-        ld      a, 4                    ; cap-bot offset = 4 (after 2 cap-top slots)
-.do_cap:
-        ld      l, a                    ; L = within-pipe offset
-        ; Build pointer cap_slot_table + pipe*8 + offset
-        ld      a, c                    ; pipe
+        ld      (body_a_bc), bc         ; NEW: save sky-A pair 1 to scratch
+        ld      (body_a_de), de         ; NEW: save sky-A pair 2 to scratch
+```
+
+After the sky-B pair load (which happens INSIDE an `exx` block — BC and DE temporarily hold the sky-B values), insert BEFORE the closing `exx`:
+
+```
+        ld      (body_b_bc), bc         ; NEW: save sky-B pair 1 (currently in active BC under exx)
+        ld      (body_b_de), de         ; NEW: save sky-B pair 2
+```
+
+Just before `call PIPE_PROGRAM`, insert:
+
+```
+        call    update_cap_imm          ; refresh cap immediates from cap_rounded_bitmap[phase*4]
+```
+
+(The `call update_city_cache` will be added in Task 7.)
+
+The completed `redraw_pipes_v2` should look like:
+
+```
+redraw_pipes_v2:
+        ld      (saved_sp), sp
+        ; --- Sky-A pair into BC/DE ---
+        ld      a, (phase)
         add     a, a
-        add     a, a
-        add     a, a                    ; pipe * 8
-        add     a, l
-        ld      l, a
-        ld      h, 0
-        ld      de, cap_slot_table
-        add     hl, de                  ; HL → cap_slot_table[pipe*8 + offset]
-
-        ; Emit "ld bc, nn" — opcode $01, then nn lo, nn hi
-        ld      (iy+0), $01
-        ; record slot addr = IY+1
-        push    iy
-        pop     de
-        inc     de
-        ld      (hl), e
+        add     a, a                    ; phase * 4
+        ld      c, a
+        ld      b, 0
+        ld      hl, pipe_bitmap
+        add     hl, bc
+        ld      c, (hl)
         inc     hl
-        ld      (hl), d
-        inc     hl                      ; HL → next slot (de_lo_addr)
-        ld      (iy+1), 0               ; placeholder (patched by update_cap_imm)
-        ld      (iy+2), 0
-        ; Emit "ld de, nn" — opcode $11, then nn lo, nn hi
-        ld      (iy+3), $11
-        push    iy
-        pop     de
-        inc     de
-        inc     de
-        inc     de
-        inc     de                      ; DE = IY+4 (de-imm lo)
-        ld      (hl), e
+        ld      b, (hl)
         inc     hl
-        ld      (hl), d
-        ld      (iy+4), 0               ; placeholder
-        ld      (iy+5), 0
-        ; Emit "ld sp, nn ; push de ; push bc" — same as sky-body tail
-        ; Compute screen target for THIS row (same code as sky-body), then emit ld sp+pushes
-        ; ... (same target compute + emit as sky-body)
-        ; Then record slot_addr_table[pipe][row] as the address of the ld sp,nn immediate
-        ; (for patch_pipe_targets to find on wrap).
-        ; Implementer: copy the target-compute and slot-record logic from .emit_body, but
-        ; emit at IY+6..IY+10 (after the 6 bytes of ld bc,nn ; ld de,nn).
-        ; Total cap row = 11 bytes; advance IY by 11.
-        ; Then jp .pipe_done.
-```
-
-The cap emit is mostly copy-and-adapt from the sky-body emit. The only differences are:
-1. Two extra `ld bc,nn / ld de,nn` instructions prefixed (6 extra bytes).
-2. Slot addresses for those 4 immediates recorded into `cap_slot_table` (not `slot_addr_table` — that one tracks the `ld sp` immediate).
-3. Implementer must copy or refactor the slot/target compute into a helper to avoid duplicating ~30 lines.
-
-- [ ] **Step 4: Add `update_cap_imm` to refresh cap-row immediates per phase**
-
-```
-;----------------------------------------------------------------
-; update_cap_imm: for each (pipe, cap-row) recorded in cap_slot_table,
-; writes the current phase's cap byte values into the bc-imm and de-imm
-; slots in pipe_program.
-;
-; bc-imm holds M1<<8 | L (lo=L, hi=M1).
-; de-imm holds R<<8  | M2 (lo=M2, hi=R).
-; Source: cap_rounded_bitmap[phase*4 + 0..3] = [L, M1, M2, R].
-;----------------------------------------------------------------
-update_cap_imm:
-        ; Compute current cap bytes
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (body_a_bc), bc         ; NEW
+        ld      (body_a_de), de         ; NEW
+        ; --- Sky-B pair into BC'/DE' ---
+        exx
         ld      a, (phase)
         add     a, a
         add     a, a
         ld      c, a
         ld      b, 0
-        ld      hl, cap_rounded_bitmap
+        ld      hl, pipe_bitmap_b
         add     hl, bc
-        ld      a, (hl)                 ; A = L
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        inc     hl
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (body_b_bc), bc         ; NEW (still inside exx — captures sky-B values)
+        ld      (body_b_de), de         ; NEW
+        exx
+        ; --- Refresh cap immediates ---
+        call    update_cap_imm          ; NEW
+        ; --- Call generated program ---
+        call    PIPE_PROGRAM
+        ld      sp, (saved_sp)
+        ret
+```
+
+- [ ] **Step 3: Modify `gen_pipe_program`'s `.not_in_gap` block to dispatch to cap emit**
+
+Find the `.not_in_gap:` label in `gen_pipe_program` (around line 897 in current `src/main.asm`). The current body looks like:
+
+```
+.not_in_gap:
+        ; Active row. For TASK 5: emit sky-body template regardless ...
+        ; --- Emit: ld sp, line_table[row]+byte_x+3 ; push de ; push bc ---
+        ...
+```
+
+Replace the comment line and insert the cap classification BEFORE the existing sky-body emit. The result:
+
+```
+.not_in_gap:
+        ; Cap-top check: row B == gap_y D - 1
+        ld      a, d                    ; D = gap_y
+        dec     a
+        cp      b
+        jp      z, .emit_cap_top
+        ; Cap-bot check: row B == gap_y D + PIPE_GAP
+        ld      a, d
+        add     a, PIPE_GAP
+        cp      b
+        jp      z, .emit_cap_bot
+        ; Otherwise: sky-body row — fall through into existing emit
+.emit_sky_body:
+        ; --- Emit: ld sp, line_table[row]+byte_x+3 ; push de ; push bc ---
+        ; (existing code from Task 5 unchanged from here through .pipe_done)
+        ld      a, b
+        and     1
+        jr      z, .emit_a
+        ; ...
+```
+
+(Keep the rest of the sky-body emit code exactly as Task 5 wrote it. Just add the cap classification before it and add the `.emit_sky_body:` label.)
+
+- [ ] **Step 4: Add `.emit_cap_top` and `.emit_cap_bot` blocks**
+
+Insert these two blocks AFTER the sky-body emit completes but BEFORE `.pipe_done:`. They both jump into a shared `.do_cap:` block that emits the cap template and conditionally appends the restore.
+
+```
+.emit_cap_top:
+        xor     a                       ; cap_idx_within_pipe = 0 (cap_top)
+        jp      .do_cap
+.emit_cap_bot:
+        ld      a, 4                    ; cap_idx_within_pipe = 4 (cap_bot)
+.do_cap:
+        ld      (.cap_idx_temp), a      ; remember which cap this is for restore decision
+
+        ; --- Emit "ld bc, 0, 0" at IY+0..IY+2 (cap L/M1 placeholder) ---
+        ld      (iy+0), $01             ; ld bc, nn
+        ld      (iy+1), 0
+        ld      (iy+2), 0
+        ; bc-imm slot address = IY+1. Record into cap_slot_table[pipe*8 + cap_idx + 0..1].
+        ld      a, c                    ; pipe (0..2)
+        add     a, a
+        add     a, a
+        add     a, a                    ; pipe * 8
+        ld      l, a
+        ld      h, 0
+        ld      de, cap_slot_table
+        add     hl, de                  ; HL → cap_slot_table[pipe*8]
+        ld      a, (.cap_idx_temp)
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; HL → cap_slot_table[pipe*8 + cap_idx]
+        push    iy
+        pop     de
+        inc     de                      ; DE = IY+1 = bc-imm slot
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl                      ; HL → de-imm slot ptr position
+
+        ; --- Emit "ld de, 0, 0" at IY+3..IY+5 (cap M2/R placeholder) ---
+        ld      (iy+3), $11             ; ld de, nn
+        ld      (iy+4), 0
+        ld      (iy+5), 0
+        ; de-imm slot address = IY+4. Record at HL.
+        push    iy
+        pop     de
+        inc     de
+        inc     de
+        inc     de
+        inc     de                      ; DE = IY+4 = de-imm slot
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; --- Compute screen_target = line_table[row] + byte_x + 3 ---
+        ld      a, b                    ; row
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = line_addr
+        ld      hl, pipe_state
+        ld      a, c
+        add     a, a
+        add     a, l
+        ld      l, a
+        ld      a, (hl)                 ; A = byte_x
+        add     a, 3                    ; +3 for stack-blast offset
+        ld      l, a
+        ld      h, 0
+        add     hl, de                  ; HL = line_addr + byte_x + 3 = target
+        push    hl                      ; save target
+
+        ; --- Save target to target_table[pipe][row] ---
+        ld      a, c
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_target_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; HL = target_table base for pipe
+        ld      a, b
+        add     a, a
+        add     a, l
+        ld      l, a
+        jr      nc, .cap_nc1
+        inc     h
+.cap_nc1:
+        pop     de                      ; DE = target
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; --- Emit "ld sp, target ; push de ; push bc" at IY+6..IY+10 ---
+        ld      (iy+6), $31             ; ld sp, nn
+        ld      (iy+7), e               ; lo
+        ld      (iy+8), d               ; hi
+        ld      (iy+9), $D5             ; push de
+        ld      (iy+10), $C5            ; push bc
+
+        ; --- Record slot_addr_table[pipe][row] = address of ld sp imm (= IY+7) ---
+        push    iy
+        pop     hl
+        ld      de, 7
+        add     hl, de                  ; HL = IY+7
+        push    hl                      ; save slot-imm addr
+        ld      a, c
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_slot_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; HL = slot_addr_table base for pipe
+        ld      a, b
+        add     a, a
+        add     a, l
+        ld      l, a
+        jr      nc, .cap_nc2
+        inc     h
+.cap_nc2:
+        pop     de                      ; DE = IY+7
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; --- Advance IY past the 11 emitted bytes ---
+        ld      de, 11
+        add     iy, de
+
+        ; --- If cap_bot, emit BC/DE restore (8 more bytes) ---
+        ld      a, (.cap_idx_temp)
+        cp      4
+        jp      nz, .pipe_done          ; cap_top — no restore needed
+
+        ; ld bc, (body_a_bc) — opcode ED 4B nn nn
+        ld      (iy+0), $ED
+        ld      (iy+1), $4B
+        ld      (iy+2), low body_a_bc
+        ld      (iy+3), high body_a_bc
+        ; ld de, (body_a_de) — opcode ED 5B nn nn
+        ld      (iy+4), $ED
+        ld      (iy+5), $5B
+        ld      (iy+6), low body_a_de
+        ld      (iy+7), high body_a_de
+        ld      de, 8
+        add     iy, de
+        jp      .pipe_done
+
+.cap_idx_temp:  db 0
+```
+
+Place this block AFTER the existing sky-body emit's final `inc iy` (where the odd-row trailing `exx` is emitted) but BEFORE the `.pipe_done:` label.
+
+Note on `low body_a_bc` / `high body_a_bc`: sjasmplus supports these as the low and high bytes of the symbol's address. If sjasmplus uses a different syntax (e.g. `body_a_bc & $FF` and `body_a_bc >> 8`), adapt accordingly.
+
+- [ ] **Step 5: Add `update_cap_imm`**
+
+Place this routine near `update_city_cache` (added in Task 3, around line 3126 in current `main.asm`).
+
+```
+;----------------------------------------------------------------
+; update_cap_imm: for each (pipe, cap-row) recorded in cap_slot_table,
+; write the current phase's cap byte values into the bc-imm and de-imm
+; slots inside pipe_program.
+;
+; cap_slot_table layout per cap-row entry (4 bytes):
+;   [bc_imm_lo_addr, bc_imm_hi_addr, de_imm_lo_addr, de_imm_hi_addr]
+; The bc-imm slot expects (lo=L, hi=M1). The de-imm slot expects (lo=M2, hi=R).
+; Cap bytes source: cap_rounded_bitmap[phase*4 + 0..3] = [L, M1, M2, R].
+;----------------------------------------------------------------
+update_cap_imm:
+        ld      hl, cap_rounded_bitmap
+        ld      a, (phase)
+        add     a, a
+        add     a, a                    ; phase * 4
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; HL → cap_rounded_bitmap[phase*4]
+        ld      a, (hl)                 ; L
         ld      (cap_L_temp), a
         inc     hl
-        ld      a, (hl)
+        ld      a, (hl)                 ; M1
         ld      (cap_M1_temp), a
         inc     hl
-        ld      a, (hl)
+        ld      a, (hl)                 ; M2
         ld      (cap_M2_temp), a
         inc     hl
-        ld      a, (hl)
+        ld      a, (hl)                 ; R
         ld      (cap_R_temp), a
 
-        ; Walk cap_slot_table (12 16-bit entries, paired bc-slot then de-slot per cap-row).
         ld      ix, cap_slot_table
         ld      b, 6                    ; 6 cap-rows worst case (3 pipes × 2 caps)
 .lp:
@@ -1196,13 +1392,13 @@ update_cap_imm:
         ld      a, h
         or      l
         jr      z, .skip                ; slot=0 means cap row not present
-        ; (HL) = L, (HL+1) = M1
+        ; (HL) = L slot, (HL+1) = M1 slot
         ld      a, (cap_L_temp)
         ld      (hl), a
         inc     hl
         ld      a, (cap_M1_temp)
         ld      (hl), a
-        ; Now the de-slot
+        ; Now the de-imm slot
         ld      l, (ix+2)
         ld      h, (ix+3)
         ld      a, (cap_M2_temp)
@@ -1212,25 +1408,9 @@ update_cap_imm:
         ld      (hl), a
 .skip:
         ld      de, 4
-        add     ix, de                  ; advance to next cap-row pair (4 bytes)
+        add     ix, de                  ; advance to next cap-row entry (4 bytes)
         djnz    .lp
         ret
-
-cap_L_temp:  db 0
-cap_M1_temp: db 0
-cap_M2_temp: db 0
-cap_R_temp:  db 0
-```
-
-- [ ] **Step 5: Call `update_cap_imm` from `redraw_pipes_v2` entry**
-
-In `redraw_pipes_v2`, immediately after the EXX section and before `call PIPE_PROGRAM`:
-
-```
-        exx
-        ; ↑ end of sky-B load
-        call    update_cap_imm          ; refresh cap immediates from cap_rounded_bitmap[phase*4]
-        call    PIPE_PROGRAM
 ```
 
 - [ ] **Step 6: Assemble**
@@ -1241,20 +1421,14 @@ make clean && make
 
 Expected: PASS.
 
-- [ ] **Step 7: Run in Fuse**
-
-```bash
-make run
-```
-
-Expected behavior: pipes now have **rounded cap pixels** at top and bottom of the gap (matching the visual style of the old renderer). City band still wrong (will be fixed in Task 7).
-
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/main.asm
-git commit -m "add cap-row emit + update_cap_imm; pipes now have proper rounded caps"
+git commit -m "add cap-row emit + BC/DE restore for cap_bot + update_cap_imm"
 ```
+
+(Skip the plan's earlier "run in Fuse" step — deferred to user visual verification after the task chain.)
 
 ---
 
