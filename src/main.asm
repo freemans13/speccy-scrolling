@@ -1976,8 +1976,9 @@ redraw_pipes_v2:
         ld      bc, (body_a_bc)
         ld      de, (body_a_de)
         ; --- Call generated program ---
-        call    PIPE_PROGRAM            ; PIPE_PROGRAM ends with ld sp,(saved_sp) + ret
-        ld      sp, (saved_sp)
+        ; PIPE_PROGRAM saves SP via its own prologue and restores via epilogue,
+        ; so a plain call/ret pair works.
+        call    PIPE_PROGRAM
         ret
 
 seed_pipe_program_with_ret:
