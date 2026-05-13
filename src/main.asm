@@ -39,6 +39,15 @@ SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= 
 CITY_TOP        EQU 128                 ; first scan line of cityscape band
 CITY_BOTTOM     EQU 160                 ; first scan line below cityscape
 
+PIPE_PROGRAM        EQU $DB00       ; generated render program (4 KB)
+PIPE_PROGRAM_END    EQU $EB00
+CITY_CACHE          EQU $EB00       ; 32 rows × 3 pipes × 4 bytes = 384 B
+CITY_CACHE_END      EQU $EC80
+TARGET_TABLE        EQU $EC80       ; 3 pipes × 320 B
+TARGET_TABLE_END    EQU $EE40
+SLOT_ADDR_TABLE     EQU $EE40       ; 3 pipes × 320 B
+SLOT_ADDR_TABLE_END EQU $F000
+
         ORG $8000
 
 start:
