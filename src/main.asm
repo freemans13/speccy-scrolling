@@ -191,7 +191,8 @@ score:        dw 0
 score_last:   dw $FFFF                  ; force first render
 pipe_scored:  db 0, 0, 0
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
-wrap_pending: db 0                      ; set when a wrap happened this frame
+wrap_pending:  db 0                      ; set when a wrap happened this frame
+pending_regen: db 0                      ; set when a recycle happened; gen_pipe_program deferred
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
@@ -554,7 +555,7 @@ frame_update:
         ; OUT-($fe) — saved 18 T-st of lead-time over the raster. The border
         ; band that used to mark "pipes phase" is gone; what was BLUE for
         ; restore-bird-bg now spans the full pipes+restore region. Worth it.
-        call    redraw_pipes_linemajor
+        call    redraw_pipes_v2
         ld      a, 1                    ; PROFILE: BLUE = bird ops region
         out     ($fe), a
         call    restore_bird_bg
@@ -572,8 +573,6 @@ frame_update:
         out     ($fe), a
         call    advance_phase           ; 2 px/frame scroll, takes effect NEXT frame
         call    advance_phase
-        call    update_smc
-        call    update_cap_smc
         ; Deferred wrap cleanup: restore OLD pipe positions to bg attrs.
         ; Safe here because the raster has passed all pipe attr rows by now;
         ; the restore affects NEXT frame's display, not this one's.
@@ -584,6 +583,15 @@ frame_update:
         ld      (wrap_pending), a
         call    restore_trailing_pipe_attrs
 .skip_restore:
+        ; Deferred full regen: if a pipe recycled this frame, regenerate the
+        ; flat program now (after pipe_state is fully updated by wrap_byte_x).
+        ld      a, (pending_regen)
+        or      a
+        jr      z, .no_regen
+        xor     a
+        ld      (pending_regen), a
+        call    gen_pipe_program
+.no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
         ld      de, (score_last)
@@ -1374,6 +1382,8 @@ wrap_byte_x:
 .recycle:
         call    random_gap_y            ; A = new random gap_y; IY/BC preserved
         ld      (iy+1), a
+        ld      a, 1
+        ld      (pending_regen), a      ; defer gen_pipe_program to end of frame_update
         ld      a, 29
 .save:
         ld      (iy+0), a
@@ -1381,11 +1391,8 @@ wrap_byte_x:
         inc     iy
         pop     bc
         djnz    .outer
-        ; Fall through to patch_pipe_smc — recomputes the per-pipe offb/offc/
-        ; capt/capb SMC slots in redraw_pipes_linemajor from the (now-updated)
-        ; pipe_state. This runs ONLY on wrap (1-in-8 frames) so the line loop
-        ; in redraw_pipes_linemajor needs zero pipe-state setup — its X_0 stays
-        ; at ~1200 T-st instead of ~2200, giving more lead time vs raster.
+        jp      patch_pipe_targets      ; tail-call: replaces fall-through to patch_pipe_smc
+
 patch_pipe_smc:
         ; Patch ALL variant slots — sky A, sky B, city A, city B — for each
         ; pipe's offb/offc/capt/capb/capb_plus_1. Pipe state is identical
