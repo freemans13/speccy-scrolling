@@ -63,6 +63,7 @@ start:
         call    init_bird
         call    apply_pipe_attrs        ; overlay ATTR_PIPE at initial pipe positions
         im      1
+        call    seed_pipe_program_with_ret      ; TEMP — replaced by gen_pipe_program later
         ei
 
 main_loop:
@@ -1307,6 +1308,61 @@ update_smc:
         inc     hl                      ; skip M1, M2 → R byte
         ld      a, (hl)
         ld      (city_bR_cache), a
+        ret
+
+;----------------------------------------------------------------
+; redraw_pipes_v2: per-frame entry into the flat code-gen renderer.
+; Loads BC/DE with sky-A pre-shifted body bytes, BC'/DE' with sky-B,
+; then jumps to the generated program at PIPE_PROGRAM.
+;
+; Register convention inside PIPE_PROGRAM:
+;   BC  = M1_A << 8 | L_A      (body sky-A pair 1)
+;   DE  = R_A  << 8 | M2_A     (body sky-A pair 2)
+;   BC' = M1_B << 8 | L_B      (body sky-B pair 1)
+;   DE' = R_B  << 8 | M2_B     (body sky-B pair 2)
+;----------------------------------------------------------------
+redraw_pipes_v2:
+        ld      (saved_sp), sp
+        ; --- Sky-A pair into BC/DE ---
+        ld      a, (phase)
+        add     a, a
+        add     a, a                    ; phase * 4
+        ld      c, a
+        ld      b, 0
+        ld      hl, pipe_bitmap
+        add     hl, bc                  ; HL → pipe_bitmap[phase*4]
+        ld      c, (hl)                 ; C = L_A
+        inc     hl
+        ld      b, (hl)                 ; B = M1_A   →  BC = M1<<8 | L
+        inc     hl
+        ld      e, (hl)                 ; E = M2_A
+        inc     hl
+        ld      d, (hl)                 ; D = R_A    →  DE = R<<8 | M2
+        ; --- Sky-B pair into BC'/DE' ---
+        exx
+        ld      a, (phase)
+        add     a, a
+        add     a, a
+        ld      c, a
+        ld      b, 0
+        ld      hl, pipe_bitmap_b
+        add     hl, bc
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        inc     hl
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        exx
+        ; --- Call generated program ---
+        call    PIPE_PROGRAM            ; program ends with RET
+        ld      sp, (saved_sp)
+        ret
+
+seed_pipe_program_with_ret:
+        ld      a, $C9                  ; RET
+        ld      (PIPE_PROGRAM), a
         ret
 
 ;----------------------------------------------------------------
