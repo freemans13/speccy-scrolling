@@ -3105,6 +3105,164 @@ paint_cap_rounded_R_city:               ; byte_x=254: R only at col 0
         ret
 
 ;----------------------------------------------------------------
+; update_city_cache: refresh 384-byte cache at CITY_CACHE.
+;   slot[(row - CITY_TOP) * 12 + pipe * 4 + cell] =
+;     if cityscape_heights[col_cell] >= (CITY_BOTTOM - row):
+;       L/R: pipe_bitmap_city_X[phase*4 + cell] OR bg_buffer[col_cell][row]
+;       M1/M2: pipe_bitmap_city_X[phase*4 + cell]
+;     else:
+;       pipe_bitmap[phase*4 + cell]
+;
+; X = 'a' for even rows, 'b' for odd rows.
+; col_cell = byte_x_pipe + cell - 1 (cell in {0=L, 1=M1, 2=M2, 3=R}).
+;
+; Cost target: ~5 k T-states/frame.
+;----------------------------------------------------------------
+city_row_temp:   db 0                  ; current row
+city_pipe_temp:  db 0                  ; current pipe index
+city_bx_temp:    db 0                  ; current pipe byte_x
+city_cell_temp:  db 0                  ; current cell index 0..3
+
+update_city_cache:
+        ld      iy, CITY_CACHE          ; output cursor
+        ld      a, CITY_TOP
+        ld      (city_row_temp), a
+.row_lp:
+        xor     a
+        ld      (city_pipe_temp), a
+.pipe_lp:
+        ; Load this pipe's byte_x -> city_bx_temp
+        ld      hl, pipe_state
+        ld      a, (city_pipe_temp)
+        add     a, a                    ; pipe * 2 (entry stride)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)                 ; byte_x
+        ld      (city_bx_temp), a
+
+        xor     a
+        ld      (city_cell_temp), a
+.cell_lp:
+        call    .fill_one_cell          ; writes 1 byte at IY, advances IY
+        inc     iy
+        ld      a, (city_cell_temp)
+        inc     a
+        ld      (city_cell_temp), a
+        cp      4
+        jr      c, .cell_lp
+
+        ld      a, (city_pipe_temp)
+        inc     a
+        ld      (city_pipe_temp), a
+        cp      NUM_PIPES
+        jr      c, .pipe_lp
+
+        ld      a, (city_row_temp)
+        inc     a
+        ld      (city_row_temp), a
+        cp      GROUND_TOP              ; = CITY_BOTTOM = 160
+        jr      c, .row_lp
+        ret
+
+.fill_one_cell:
+        ; Compute col_cell = byte_x + cell - 1
+        ld      a, (city_bx_temp)
+        ld      hl, city_cell_temp
+        add     a, (hl)
+        dec     a
+        ld      e, a                    ; E = col_cell (0..31 in playfield)
+        ; cityscape_heights[col_cell]
+        ld      hl, cityscape_heights
+        ld      d, 0
+        add     hl, de
+        ld      a, (hl)                 ; A = height
+        ld      b, a                    ; B = height
+        ; threshold = CITY_BOTTOM - row
+        ld      a, CITY_BOTTOM
+        ld      hl, city_row_temp
+        sub     (hl)                    ; A = CITY_BOTTOM - row
+        ; If height >= threshold: city. Else: sky.
+        cp      b
+        jr      z, .is_city
+        jr      c, .is_city             ; threshold < height -> covered
+        ; ---- sky variant: pipe_bitmap[phase*4 + cell] ----
+        ld      hl, pipe_bitmap
+.write_bitmap:
+        ld      a, (phase)
+        add     a, a
+        add     a, a                    ; phase*4
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; HL -> bitmap[phase*4]
+        ld      a, (city_cell_temp)
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; HL -> bitmap[phase*4 + cell]
+        ld      a, (hl)
+        ld      (iy+0), a
+        ret
+.is_city:
+        ; Pick city bitmap A or B based on row parity
+        ld      a, (city_row_temp)
+        and     1
+        jr      nz, .is_city_b
+        ld      hl, pipe_bitmap_city_a
+        jr      .have_city_bitmap
+.is_city_b:
+        ld      hl, pipe_bitmap_city_b
+.have_city_bitmap:
+        ld      a, (phase)
+        add     a, a
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; HL -> city_bitmap[phase*4]
+        ld      a, (city_cell_temp)
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; HL -> city_bitmap[phase*4 + cell]
+        ld      a, (hl)                 ; A = city pipe byte for this cell
+        ; M1 (cell=1) and M2 (cell=2): no OR. L (0) and R (3): OR with bg_buffer.
+        ld      hl, city_cell_temp
+        ld      c, (hl)                 ; C = cell
+        ld      b, a                    ; B = city pipe byte
+        ld      a, c
+        cp      1
+        jr      z, .write_b             ; M1 -- no OR
+        cp      2
+        jr      z, .write_b             ; M2 -- no OR
+        ; L or R: OR with bg_buffer[col_cell][row].
+        ld      a, (city_row_temp)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      a, (hl)
+        ld      e, a
+        inc     hl
+        ld      a, (hl)
+        or      $80                     ; bg_buffer addr (bit 15 set vs screen at $4xxx)
+        ld      d, a                    ; DE = bg_buffer row base
+        ld      a, (city_bx_temp)
+        ld      hl, city_cell_temp
+        add     a, (hl)
+        dec     a                       ; A = col_cell
+        add     a, e
+        ld      e, a
+        jr      nc, .no_carry
+        inc     d
+.no_carry:
+        ld      a, (de)
+        or      b                       ; A = pipe city byte OR bg byte
+        ld      (iy+0), a
+        ret
+.write_b:
+        ld      (iy+0), b
+        ret
+
+;----------------------------------------------------------------
 clear_pipe_col:
         ld      a, e
         or      a
