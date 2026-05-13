@@ -157,6 +157,16 @@ pipe_state:
         db 19, 40
         db  9, 88
 
+pipe_target_base:
+        dw      TARGET_TABLE + 0 * 320
+        dw      TARGET_TABLE + 1 * 320
+        dw      TARGET_TABLE + 2 * 320
+
+pipe_slot_base:
+        dw      SLOT_ADDR_TABLE + 0 * 320
+        dw      SLOT_ADDR_TABLE + 1 * 320
+        dw      SLOT_ADDR_TABLE + 2 * 320
+
 ; Score state: +1 each time a pipe's right edge clears the bird's left edge.
 ; pipe_scored is 1 once the bird has passed that pipe this cycle; reset when
 ; the pipe wraps back to the right of the screen so it can score again.
@@ -754,6 +764,84 @@ update_cap_smc:
         inc     hl                      ; skip M1, M2 → R byte
         ld      a, (hl)
         ld      (city_cR_cache), a
+        ret
+
+;----------------------------------------------------------------
+; patch_pipe_targets: called after wrap_byte_x. For each of 3 pipes,
+; walks 160 rows; for each row whose slot_addr_table entry is non-zero,
+; decrements target_table[row] (since byte_x dropped by 1) and writes
+; the new 16-bit target into the ld sp,nn immediate slot at slot_addr.
+;
+; ~11 k T-states amortized over 4 frames = 2.7 k per frame.
+;----------------------------------------------------------------
+patch_pipe_targets:
+        ld      b, NUM_PIPES
+        ld      c, 0                    ; pipe index
+.pipe_outer:
+        push    bc
+
+        ld      a, c
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, pipe_target_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a                    ; HL = target_table[pipe]
+        push    hl
+
+        pop     hl
+        push    hl                      ; (HL preserved across next block)
+        ld      a, c
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, pipe_slot_base
+        add     hl, de
+        ld      a, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, a
+        push    hl
+        pop     ix                      ; IX = slot_addr_table[pipe]
+        pop     hl                      ; HL = target_table[pipe]
+
+        ld      b, 160
+.row_lp:
+        ld      a, (ix+0)
+        ld      e, a
+        ld      a, (ix+1)
+        ld      d, a
+        or      e
+        jr      z, .next
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        ld      c, a
+        inc     hl
+        ld      a, (hl)
+        sbc     a, 0
+        ld      (hl), a
+        dec     hl
+        ex      de, hl
+        ld      (hl), c
+        inc     hl
+        ld      (hl), a
+        dec     hl
+        ex      de, hl
+.next:
+        inc     hl
+        inc     hl
+        inc     ix
+        inc     ix
+        djnz    .row_lp
+
+        pop     bc
+        inc     c
+        dec     b
+        jp      nz, .pipe_outer
         ret
 
 ;----------------------------------------------------------------
