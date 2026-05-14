@@ -1752,7 +1752,16 @@ patch_pipe_targets:
         ;
         ; Assumes ACTIVE_COUNT = 336 (constant, 3 pipes × 112 active rows).
         ; 336/4 = 84 djnz iterations.
+        ;
+        ; On recycle frames (pending_regen != 0) the recycled pipe's 112 entries
+        ; are skipped because configure_pipe_slots will overwrite them anyway.
+        ; That saves ~28 djnz iterations × 4 entries × ~46T ≈ 5.2k T-states.
         ld      (saved_sp_inner), sp
+        ld      a, (pending_regen)
+        or      a
+        jr      nz, .pt_skip_path
+
+        ; --- Normal path: all 3 pipes, 84 iterations ---
         ld      sp, ACTIVE_LIST_NEW
         ld      b, 84                           ; 336 / 4
 .pt_lp:
@@ -1789,6 +1798,140 @@ patch_pipe_targets:
         dec     (hl)
 .pt_nc4:
         djnz    .pt_lp
+        ld      sp, (saved_sp_inner)
+        ret
+
+        ; --- Recycle path: skip the recycled pipe's 112 entries ---
+        ; Three inline sub-walks (28 iters each = 112 entries each).
+        ; Each is guarded by a jr z so the recycled pipe is skipped.
+.pt_skip_path:
+        ld      a, (recycled_pipe_idx)
+
+        ; Pipe 0
+        or      a                               ; recycled_pipe_idx == 0?
+        jr      z, .pt_done_p0
+        ld      sp, ACTIVE_PIPE_0
+        ld      b, 28                           ; 112 / 4
+.pt_lp_p0:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p0_nc1
+        inc     hl
+        dec     (hl)
+.pt_p0_nc1:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p0_nc2
+        inc     hl
+        dec     (hl)
+.pt_p0_nc2:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p0_nc3
+        inc     hl
+        dec     (hl)
+.pt_p0_nc3:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p0_nc4
+        inc     hl
+        dec     (hl)
+.pt_p0_nc4:
+        djnz    .pt_lp_p0
+.pt_done_p0:
+
+        ; Pipe 1
+        ld      a, (recycled_pipe_idx)
+        cp      1                               ; recycled_pipe_idx == 1?
+        jr      z, .pt_done_p1
+        ld      sp, ACTIVE_PIPE_1
+        ld      b, 28
+.pt_lp_p1:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p1_nc1
+        inc     hl
+        dec     (hl)
+.pt_p1_nc1:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p1_nc2
+        inc     hl
+        dec     (hl)
+.pt_p1_nc2:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p1_nc3
+        inc     hl
+        dec     (hl)
+.pt_p1_nc3:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p1_nc4
+        inc     hl
+        dec     (hl)
+.pt_p1_nc4:
+        djnz    .pt_lp_p1
+.pt_done_p1:
+
+        ; Pipe 2
+        ld      a, (recycled_pipe_idx)
+        cp      2                               ; recycled_pipe_idx == 2?
+        jr      z, .pt_done_p2
+        ld      sp, ACTIVE_PIPE_2
+        ld      b, 28
+.pt_lp_p2:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p2_nc1
+        inc     hl
+        dec     (hl)
+.pt_p2_nc1:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p2_nc2
+        inc     hl
+        dec     (hl)
+.pt_p2_nc2:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p2_nc3
+        inc     hl
+        dec     (hl)
+.pt_p2_nc3:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_p2_nc4
+        inc     hl
+        dec     (hl)
+.pt_p2_nc4:
+        djnz    .pt_lp_p2
+.pt_done_p2:
+
         ld      sp, (saved_sp_inner)
         ret
 
