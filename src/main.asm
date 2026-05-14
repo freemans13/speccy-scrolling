@@ -55,11 +55,11 @@ CITY_TABLE_STRIDE   EQU 6
 ; Reuse existing scratch labels (sky_a_L, sky_a_M1, ... lmask_temp, rmask_temp, cap_L_temp etc.)
 ; defined elsewhere in the source; the inline-city architecture references those addresses
 ; rather than allocating fresh ones.
-ACTIVE_LIST_NEW     EQU $FA40       ; 288 bytes (max 144 entries × 2 bytes)
-ACTIVE_COUNT_NEW    EQU $FB60       ; 1 byte
-CAP_SLOT_LIST_NEW   EQU $FB61       ; 24 bytes (6 cap rows × 4 byte addrs each)
-CAP_SLOT_COUNT_NEW  EQU $FB79       ; 1 byte
-BIRD_OVERLAP_NEEDED EQU $FB7A       ; 1 byte
+ACTIVE_LIST_NEW     EQU $FA40       ; 720 bytes (max 360 entries × 2 bytes; 3 pipes × ~113 active rows)
+ACTIVE_COUNT_NEW    EQU $FD10       ; 2 bytes (16-bit count — 339 > 255)
+CAP_SLOT_LIST_NEW   EQU $FD12       ; 24 bytes (6 cap rows × 4 byte addrs each)
+CAP_SLOT_COUNT_NEW  EQU $FD2A       ; 1 byte
+BIRD_OVERLAP_NEEDED EQU $FD2B       ; 1 byte
 
         ORG $8000
 
@@ -812,21 +812,19 @@ update_cap_smc:
 ; ~11 k T-states amortized over 4 frames = 2.7 k per frame.
 ;----------------------------------------------------------------
 patch_pipe_targets:
-        ; Walk ACTIVE_LIST_NEW (built by gen_pipe_program at gen time). Only
-        ; ~120 entries vs 480 in the slot_addr_table approach, eliminating the
-        ; per-inactive-row iteration overhead. Each entry is a 16-bit slot addr
-        ; pointing at the screen-target immediate of a sky-body/cap/city emit.
-        ld      a, (ACTIVE_COUNT_NEW)
-        or      a
+        ; Walk ACTIVE_LIST_NEW (built by gen_pipe_program). Uses 16-bit counter
+        ; in BC since active count can exceed 255 (~339 entries for 3 pipes).
+        ld      bc, (ACTIVE_COUNT_NEW)
+        ld      a, b
+        or      c
         ret     z
-        ld      b, a
         ld      hl, ACTIVE_LIST_NEW
 .lp:
         ld      e, (hl)
         inc     hl
         ld      d, (hl)
         inc     hl
-        ; DE = slot addr; decrement 16-bit value at DE by 1
+        ; DE = slot addr; decrement 16-bit value at DE
         ld      a, (de)
         sub     1
         ld      (de), a
@@ -834,7 +832,10 @@ patch_pipe_targets:
         ld      a, (de)
         sbc     a, 0
         ld      (de), a
-        djnz    .lp
+        dec     bc
+        ld      a, b
+        or      c
+        jp      nz, .lp
         ret
 
 ;----------------------------------------------------------------
@@ -1343,14 +1344,15 @@ gen_pipe_program:
 
 build_active_list_new:
         ; Walk SLOT_ADDR_TABLE (480 entries). For each non-zero entry, append
-        ; its 16-bit value to ACTIVE_LIST_NEW and bump ACTIVE_COUNT_NEW.
+        ; its 16-bit value to ACTIVE_LIST_NEW and bump ACTIVE_COUNT_NEW (16-bit).
         xor     a
         ld      (ACTIVE_COUNT_NEW), a
-        ld      c, NUM_PIPES                    ; outer pipe counter
-        ld      hl, SLOT_ADDR_TABLE             ; walking pointer into source
-        ld      iy, ACTIVE_LIST_NEW             ; walking pointer into dest
+        ld      (ACTIVE_COUNT_NEW + 1), a
+        ld      c, NUM_PIPES
+        ld      hl, SLOT_ADDR_TABLE
+        ld      iy, ACTIVE_LIST_NEW
 .bal_pipe:
-        ld      b, 160                          ; rows per pipe
+        ld      b, 160
 .bal_row:
         ld      a, (hl)
         inc     hl
@@ -1364,9 +1366,12 @@ build_active_list_new:
         ld      (iy+1), d
         inc     iy
         inc     iy
-        ld      a, (ACTIVE_COUNT_NEW)
-        inc     a
-        ld      (ACTIVE_COUNT_NEW), a
+        ; 16-bit increment of ACTIVE_COUNT_NEW
+        push    hl
+        ld      hl, (ACTIVE_COUNT_NEW)
+        inc     hl
+        ld      (ACTIVE_COUNT_NEW), hl
+        pop     hl
 .bal_skip:
         djnz    .bal_row
         dec     c
