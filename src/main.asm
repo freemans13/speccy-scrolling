@@ -1548,7 +1548,8 @@ frame_update:
         ld      e, (hl)
         pop     af
         call    configure_pipe_slots
-        call    build_city_slot_bases   ; rebuild city slot bases for new byte_x
+        ld      a, (recycled_pipe_idx)
+        call    build_city_slot_bases_pipe   ; rebuild only this pipe's 32 entries (~3k vs ~10k T)
 .no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
@@ -5259,12 +5260,38 @@ update_city_cache:
 ;
 ; Clobbers AF, BC, DE, HL, IX, IY.
 ;----------------------------------------------------------------
+build_city_slot_bases_pipe:
+        ; Single-pipe entry: A = pipe index (0..2).
+        ; Updates only the 32 city_patch_table entries for that pipe.
+        ; IX = city_patch_table + pipe*128 (32 entries × 4 bytes)
+        ; Sets bcsb_pipe_limit = pipe+1 so the outer loop exits after one iteration.
+        ld      h, 0
+        ld      l, a
+        add     hl, hl          ; *2
+        add     hl, hl          ; *4
+        add     hl, hl          ; *8
+        add     hl, hl          ; *16
+        add     hl, hl          ; *32
+        add     hl, hl          ; *64
+        add     hl, hl          ; *128
+        ld      de, city_patch_table
+        add     hl, de
+        push    hl
+        pop     ix              ; IX = write cursor for this pipe's entries
+        ld      iyl, a          ; IYL = pipe index
+        ld      iyh, 0
+        inc     a               ; A = pipe+1 (loop limit)
+        ld      (bcsb_pipe_limit), a
+        jp      bcsb_pipe_lp    ; enter the common body
+
 build_city_slot_bases:
         ; Walk pipe 0..2 (outer), row_idx 0..31 (inner) — pipe-major
+        ld      a, NUM_PIPES
+        ld      (bcsb_pipe_limit), a    ; limit = NUM_PIPES (all pipes)
         ld      iy, 0                   ; IY = pipe index (use as counter)
         ld      ix, city_patch_table    ; IX = write cursor into city_patch_table
 
-.bcsb_pipe_lp:
+bcsb_pipe_lp:
         ; A = pipe index (low byte of IY)
         push    iy
         pop     hl
@@ -5462,12 +5489,15 @@ build_city_slot_bases:
         push    hl
         pop     iy
         ld      a, l
-        cp      NUM_PIPES
-        jp      nz, .bcsb_pipe_lp
+        ld      b, a
+        ld      a, (bcsb_pipe_limit)
+        cp      b
+        jp      nz, bcsb_pipe_lp
 
         ret
 
-bcsb_base_tmp: dw 0                    ; temp: holds base during SLOT_ADDR_TABLE lookup
+bcsb_base_tmp:  dw 0   ; temp: holds base during SLOT_ADDR_TABLE lookup
+bcsb_pipe_limit: db NUM_PIPES  ; outer loop limit (NUM_PIPES = all, pipe+1 = single)
 
 ; city_patch_table layout: pipe-major order (pipe 0 rows 0..31, pipe 1 rows 0..31,
 ; pipe 2 rows 0..31). Each 4-byte entry: target_lo, target_hi, base_lo, base_hi.
