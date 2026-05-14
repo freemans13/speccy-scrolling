@@ -970,13 +970,11 @@ gen_pipe_program:
         inc     hl
         ld      h, (hl)
         ld      l, a                    ; HL = SLOT_ADDR_TABLE base for this pipe
-        ld      a, b
-        add     a, a                    ; row*2
-        add     a, l
-        ld      l, a
-        jr      nc, .nc1
-        inc     h
-.nc1:
+        ex      de, hl                  ; DE = base
+        ld      h, 0
+        ld      l, b
+        add     hl, hl                  ; HL = row*2 (16-bit, no overflow)
+        add     hl, de                  ; HL = base + row*2
         pop     de                      ; DE = slot-immediate addr (= original IY+1)
         ld      (hl), e
         inc     hl
@@ -1016,13 +1014,11 @@ gen_pipe_program:
         inc     hl
         ld      h, (hl)
         ld      l, a                    ; HL = target_table base for pipe
-        ld      a, b
-        add     a, a
-        add     a, l
-        ld      l, a
-        jr      nc, .nc2
-        inc     h
-.nc2:
+        ex      de, hl                  ; DE = base
+        ld      h, 0
+        ld      l, b
+        add     hl, hl                  ; HL = row*2 (16-bit, no overflow)
+        add     hl, de                  ; HL = base + row*2
         pop     de                      ; DE = target
         ld      (hl), e
         inc     hl
@@ -1126,13 +1122,11 @@ gen_pipe_program:
         inc     hl
         ld      h, (hl)
         ld      l, a                    ; HL = target_table base for pipe
-        ld      a, b
-        add     a, a
-        add     a, l
-        ld      l, a
-        jr      nc, .cap_nc1
-        inc     h
-.cap_nc1:
+        ex      de, hl                  ; DE = base
+        ld      h, 0
+        ld      l, b
+        add     hl, hl                  ; HL = row*2 (16-bit)
+        add     hl, de                  ; HL = base + row*2
         pop     de                      ; DE = target
         ld      (hl), e
         inc     hl
@@ -1161,13 +1155,11 @@ gen_pipe_program:
         inc     hl
         ld      h, (hl)
         ld      l, a                    ; HL = slot_addr_table base for pipe
-        ld      a, b
-        add     a, a
-        add     a, l
-        ld      l, a
-        jr      nc, .cap_nc2
-        inc     h
-.cap_nc2:
+        ex      de, hl                  ; DE = base
+        ld      h, 0
+        ld      l, b
+        add     hl, hl                  ; HL = row*2 (16-bit)
+        add     hl, de                  ; HL = base + row*2
         pop     de                      ; DE = IY+7
         ld      (hl), e
         inc     hl
@@ -1270,13 +1262,11 @@ gen_pipe_program:
         inc     hl
         ld      h, (hl)
         ld      l, a                    ; HL = target_table base for pipe
-        ld      a, b
-        add     a, a
-        add     a, l
-        ld      l, a
-        jr      nc, .city_nc2
-        inc     h
-.city_nc2:
+        ex      de, hl                  ; DE = base
+        ld      h, 0
+        ld      l, b
+        add     hl, hl                  ; HL = row*2 (16-bit)
+        add     hl, de                  ; HL = base + row*2
         pop     de                      ; DE = target
         ld      (hl), e
         inc     hl
@@ -1302,13 +1292,11 @@ gen_pipe_program:
         inc     hl
         ld      h, (hl)
         ld      l, a                    ; HL = slot_addr_table base for pipe
-        ld      a, b
-        add     a, a
-        add     a, l
-        ld      l, a
-        jr      nc, .city_nc3
-        inc     h
-.city_nc3:
+        ex      de, hl                  ; DE = base
+        ld      h, 0
+        ld      l, b
+        add     hl, hl                  ; HL = row*2 (16-bit)
+        add     hl, de                  ; HL = base + row*2
         pop     de                      ; DE = IY+6 = screen-target imm addr
         ld      (hl), e
         inc     hl
@@ -1325,13 +1313,11 @@ gen_pipe_program:
         inc     hl
         ld      h, (hl)
         ld      l, a                    ; HL = target_table base for pipe
-        ld      a, b
-        add     a, a
-        add     a, l
-        ld      l, a
-        jr      nc, .city_nc4
-        inc     h
-.city_nc4:
+        ex      de, hl                  ; DE = base
+        ld      h, 0
+        ld      l, b
+        add     hl, hl                  ; HL = row*2 (16-bit)
+        add     hl, de                  ; HL = base + row*2
         ld      e, (hl)
         inc     hl
         ld      d, (hl)                 ; DE = target
