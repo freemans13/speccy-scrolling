@@ -3830,73 +3830,87 @@ update_city_cache:
         ret
 
 .fill_one_cell:
-        ; Compute col_cell = byte_x + cell - 1
+        ; --- Compute col_cell = byte_x + cell - 1 ---
         ld      a, (city_bx_temp)
         ld      hl, city_cell_temp
         add     a, (hl)
         dec     a
-        ld      e, a                    ; E = col_cell (0..31 in playfield)
-        ; cityscape_heights[col_cell]
-        ld      hl, cityscape_heights
-        ld      d, 0
-        add     hl, de
-        ld      a, (hl)                 ; A = height
-        ld      b, a                    ; B = height
-        ; threshold = CITY_BOTTOM - row
-        ld      a, CITY_BOTTOM
-        ld      hl, city_row_temp
-        sub     (hl)                    ; A = CITY_BOTTOM - row
-        ; If height >= threshold: city. Else: sky.
-        cp      b
-        jr      z, .is_city
-        jr      c, .is_city             ; threshold < height -> covered
-        ; ---- sky variant: pipe_bitmap[phase*4 + cell] ----
+        ld      e, a                    ; E = col_cell
+
+        ; --- Pick sky-variant bitmap (pipe_bitmap A on even rows, _b on odd) ---
+        ld      a, (city_row_temp)
+        and     1
+        jr      nz, .use_b
         ld      hl, pipe_bitmap
-.write_bitmap:
+        jr      .have_bitmap
+.use_b:
+        ld      hl, pipe_bitmap_b
+.have_bitmap:
+        ; Load pipe_bitmap_X[phase*4 + cell] -> B (pipe byte)
         ld      a, (phase)
         add     a, a
         add     a, a                    ; phase*4
-        ld      e, a
-        ld      d, 0
-        add     hl, de                  ; HL -> bitmap[phase*4]
+        ld      c, a
+        ld      b, 0
+        add     hl, bc
         ld      a, (city_cell_temp)
-        ld      e, a
-        ld      d, 0
-        add     hl, de                  ; HL -> bitmap[phase*4 + cell]
+        ld      c, a
+        add     hl, bc                  ; HL -> pipe_bitmap_X[phase*4 + cell]
         ld      a, (hl)
-        ld      (iy+0), a
+        ld      b, a                    ; B = pipe byte (sky variant)
+
+        ; --- Decide if cell is in front of a building ---
+        ; height = cityscape_heights[col_cell]
+        ld      d, 0
+        ld      hl, cityscape_heights
+        add     hl, de
+        ld      a, (hl)
+        ld      c, a                    ; C = height
+        ; threshold = CITY_BOTTOM - row
+        ld      a, CITY_BOTTOM
+        ld      hl, city_row_temp
+        sub     (hl)
+        ; covered if height >= threshold (i.e. threshold <= height -> CY or Z from cp c)
+        cp      c
+        jr      z, .is_city
+        jr      c, .is_city
+
+.write_b:
+        ; Sky cell (no building cover): write pipe byte directly
+        ld      (iy+0), b
         ret
+
 .is_city:
-        ; Pick city bitmap A or B based on row parity
-        ld      a, (city_row_temp)
-        and     1
-        jr      nz, .is_city_b
-        ld      hl, pipe_bitmap_city_a
-        jr      .have_city_bitmap
-.is_city_b:
-        ld      hl, pipe_bitmap_city_b
-.have_city_bitmap:
-        ld      a, (phase)
-        add     a, a
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        add     hl, de                  ; HL -> city_bitmap[phase*4]
+        ; City cell. M1/M2 (cell 1/2): write pipe byte directly (fully inside pipe).
+        ; L (cell 0): OR with (l_out_masks[phase] & bg_buffer[col_cell][row]).
+        ; R (cell 3): OR with (r_out_masks[phase] & bg_buffer[col_cell][row]).
         ld      a, (city_cell_temp)
-        ld      e, a
-        ld      d, 0
-        add     hl, de                  ; HL -> city_bitmap[phase*4 + cell]
-        ld      a, (hl)                 ; A = city pipe byte for this cell
-        ; M1 (cell=1) and M2 (cell=2): no OR. L (0) and R (3): OR with bg_buffer.
-        ld      hl, city_cell_temp
-        ld      c, (hl)                 ; C = cell
-        ld      b, a                    ; B = city pipe byte
-        ld      a, c
-        cp      1
-        jr      z, .write_b             ; M1 -- no OR
-        cp      2
-        jr      z, .write_b             ; M2 -- no OR
-        ; L or R: OR with bg_buffer[col_cell][row].
+        or      a
+        jr      z, .city_L
+        cp      3
+        jr      z, .city_R
+        ; M1 or M2: no OR
+        ld      (iy+0), b
+        ret
+
+.city_L:
+        ld      a, (phase)
+        ld      l, a
+        ld      h, 0
+        ld      de, l_out_masks
+        add     hl, de
+        ld      a, (hl)                 ; A = l_out_mask[phase]
+        jr      .or_masked_bg
+.city_R:
+        ld      a, (phase)
+        ld      l, a
+        ld      h, 0
+        ld      de, r_out_masks
+        add     hl, de
+        ld      a, (hl)                 ; A = r_out_mask[phase]
+.or_masked_bg:
+        ld      c, a                    ; C = out_mask
+        ; Compute bg_buffer[col_cell][row]
         ld      a, (city_row_temp)
         ld      l, a
         ld      h, 0
@@ -3907,7 +3921,7 @@ update_city_cache:
         ld      e, a
         inc     hl
         ld      a, (hl)
-        or      $80                     ; bg_buffer addr (bit 15 set vs screen at $4xxx)
+        or      $80                     ; map screen $4xxx -> bg_buffer $Cxxx
         ld      d, a                    ; DE = bg_buffer row base
         ld      a, (city_bx_temp)
         ld      hl, city_cell_temp
@@ -3918,12 +3932,10 @@ update_city_cache:
         jr      nc, .no_carry
         inc     d
 .no_carry:
-        ld      a, (de)
-        or      b                       ; A = pipe city byte OR bg byte
+        ld      a, (de)                 ; A = bg byte
+        and     c                       ; A = mask & bg  (only OUTSIDE-pipe bits)
+        or      b                       ; A = pipe byte | masked bg
         ld      (iy+0), a
-        ret
-.write_b:
-        ld      (iy+0), b
         ret
 
 ;----------------------------------------------------------------
