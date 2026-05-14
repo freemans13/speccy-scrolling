@@ -3066,7 +3066,20 @@ redraw_pipes_v2:
         exx
         ; Refresh cap and city byte values for current phase
         call    update_cap_imm_v2       ; clobbers BC, DE
-        call    update_city_cache       ; clobbers BC, DE
+        ; update_city_cache is the per-frame hot path (~25k T-states).
+        ; Optimisation: only rebuild on phase==0 (every 4 frames, aligned with
+        ; byte_x wrap). City pixels are 1-pixel stale on intermediate frames,
+        ; but the 2 px/frame scroll means a 4-frame stale interval is at most
+        ; 8 pixels off — still readable.
+        ld      a, (phase)
+        and     3                       ; refresh every 4 frames (on wrap)
+        jr      nz, .skip_city_cache
+        ld      a, 6                    ; DIAGNOSTIC YELLOW
+        out     ($fe), a
+        call    update_city_cache
+.skip_city_cache:
+        ld      a, 3                    ; DIAGNOSTIC MAGENTA
+        out     ($fe), a
         ; PIPE_PROGRAM has a leading EXX at every row to alternate A/B variants.
         ; Enter with main = B-pattern, shadow = A-pattern; row 0's EXX swaps to A.
         ld      bc, (body_a_bc)
