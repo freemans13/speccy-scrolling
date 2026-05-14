@@ -1932,7 +1932,7 @@ update_smc:
 ;   DE' = R_B  << 8 | M2_B     (body sky-B pair 2)
 ;----------------------------------------------------------------
 redraw_pipes_v2:
-        ld      (saved_sp), sp
+        ; DIAGNOSTIC v3: BC/DE setup re-enabled. update_cap_imm and update_city_cache STILL SKIPPED.
         ; --- Sky-A pair into BC/DE ---
         ld      a, (phase)
         add     a, a
@@ -1940,16 +1940,16 @@ redraw_pipes_v2:
         ld      c, a
         ld      b, 0
         ld      hl, pipe_bitmap
-        add     hl, bc                  ; HL → pipe_bitmap[phase*4]
-        ld      c, (hl)                 ; C = L_A
+        add     hl, bc
+        ld      c, (hl)
         inc     hl
-        ld      b, (hl)                 ; B = M1_A   →  BC = M1<<8 | L
+        ld      b, (hl)
         inc     hl
-        ld      e, (hl)                 ; E = M2_A
+        ld      e, (hl)
         inc     hl
-        ld      d, (hl)                 ; D = R_A    →  DE = R<<8 | M2
-        ld      (body_a_bc), bc         ; NEW: save sky-A pair 1 to scratch
-        ld      (body_a_de), de         ; NEW: save sky-A pair 2 to scratch
+        ld      d, (hl)
+        ld      (body_a_bc), bc
+        ld      (body_a_de), de
         ; --- Sky-B pair into BC'/DE' ---
         exx
         ld      a, (phase)
@@ -1966,18 +1966,16 @@ redraw_pipes_v2:
         ld      e, (hl)
         inc     hl
         ld      d, (hl)
-        ld      (body_b_bc), bc         ; NEW (still inside exx — captures sky-B values)
-        ld      (body_b_de), de         ; NEW
+        ld      (body_b_bc), bc
+        ld      (body_b_de), de
         exx
-        ; --- Refresh cap immediates ---
-        call    update_cap_imm          ; NEW — clobbers BC, DE
-        call    update_city_cache       ; NEW — clobbers BC, DE
-        ; --- Reload BC/DE from scratch (BC'/DE' weren't clobbered — neither routine exx's) ---
+        ; Refresh cap and city byte values for current phase
+        call    update_cap_imm          ; clobbers BC, DE
+        call    update_city_cache       ; clobbers BC, DE
+        ; Reload BC/DE from scratch so PIPE_PROGRAM sees correct body bytes
         ld      bc, (body_a_bc)
         ld      de, (body_a_de)
-        ; --- Call generated program ---
-        ; PIPE_PROGRAM saves SP via its own prologue and restores via epilogue,
-        ; so a plain call/ret pair works.
+        ; PIPE_PROGRAM has its own prologue (save SP) and epilogue (restore SP + ret)
         call    PIPE_PROGRAM
         ret
 
