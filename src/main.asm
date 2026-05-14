@@ -812,22 +812,21 @@ update_cap_smc:
 ; ~11 k T-states amortized over 4 frames = 2.7 k per frame.
 ;----------------------------------------------------------------
 patch_pipe_targets:
-        ; Walk slot_addr_table directly with HL (fast). For each non-zero slot,
-        ; read the 2-byte target from the slot, decrement, write back. No
-        ; separate target_table needed — the slot itself holds the target.
-        ld      hl, SLOT_ADDR_TABLE
-        ld      c, NUM_PIPES            ; outer pipe counter (3 → 0)
-.pipe_outer:
-        ld      b, 160                  ; rows per pipe
-.row_lp:
+        ; Walk ACTIVE_LIST_NEW (built by gen_pipe_program at gen time). Only
+        ; ~120 entries vs 480 in the slot_addr_table approach, eliminating the
+        ; per-inactive-row iteration overhead. Each entry is a 16-bit slot addr
+        ; pointing at the screen-target immediate of a sky-body/cap/city emit.
+        ld      a, (ACTIVE_COUNT_NEW)
+        or      a
+        ret     z
+        ld      b, a
+        ld      hl, ACTIVE_LIST_NEW
+.lp:
         ld      e, (hl)
         inc     hl
         ld      d, (hl)
         inc     hl
-        ld      a, d
-        or      e
-        jr      z, .next
-        ; DE = slot addr inside pipe_program (16-bit target imm location)
+        ; DE = slot addr; decrement 16-bit value at DE by 1
         ld      a, (de)
         sub     1
         ld      (de), a
@@ -835,10 +834,7 @@ patch_pipe_targets:
         ld      a, (de)
         sbc     a, 0
         ld      (de), a
-.next:
-        djnz    .row_lp
-        dec     c
-        jp      nz, .pipe_outer
+        djnz    .lp
         ret
 
 ;----------------------------------------------------------------
@@ -1337,6 +1333,44 @@ gen_pipe_program:
         ld      (iy+2), low saved_sp
         ld      (iy+3), high saved_sp
         ld      (iy+4), $C9
+
+        ; Build ACTIVE_LIST_NEW from non-zero slot_addr_table entries.
+        ; This lets patch_pipe_targets walk only active rows (~120) instead of
+        ; all 480 slots, cutting wrap-frame cost from ~25k to ~6k T-states.
+        ; Cost runs only on gen (init + recycle), not on per-wrap patch.
+        call    build_active_list_new
+        ret
+
+build_active_list_new:
+        ; Walk SLOT_ADDR_TABLE (480 entries). For each non-zero entry, append
+        ; its 16-bit value to ACTIVE_LIST_NEW and bump ACTIVE_COUNT_NEW.
+        xor     a
+        ld      (ACTIVE_COUNT_NEW), a
+        ld      c, NUM_PIPES                    ; outer pipe counter
+        ld      hl, SLOT_ADDR_TABLE             ; walking pointer into source
+        ld      iy, ACTIVE_LIST_NEW             ; walking pointer into dest
+.bal_pipe:
+        ld      b, 160                          ; rows per pipe
+.bal_row:
+        ld      a, (hl)
+        inc     hl
+        ld      e, a
+        ld      a, (hl)
+        inc     hl
+        ld      d, a
+        or      e
+        jr      z, .bal_skip
+        ld      (iy+0), e
+        ld      (iy+1), d
+        inc     iy
+        inc     iy
+        ld      a, (ACTIVE_COUNT_NEW)
+        inc     a
+        ld      (ACTIVE_COUNT_NEW), a
+.bal_skip:
+        djnz    .bal_row
+        dec     c
+        jp      nz, .bal_pipe
         ret
 
 ;----------------------------------------------------------------
