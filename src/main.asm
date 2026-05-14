@@ -799,72 +799,32 @@ update_cap_smc:
 ; ~11 k T-states amortized over 4 frames = 2.7 k per frame.
 ;----------------------------------------------------------------
 patch_pipe_targets:
-        ld      b, NUM_PIPES
-        ld      c, 0                    ; pipe index
+        ; Walk slot_addr_table directly with HL (fast). For each non-zero slot,
+        ; read the 2-byte target from the slot, decrement, write back. No
+        ; separate target_table needed — the slot itself holds the target.
+        ld      hl, SLOT_ADDR_TABLE
+        ld      c, NUM_PIPES            ; outer pipe counter (3 → 0)
 .pipe_outer:
-        push    bc
-
-        ld      a, c
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        ld      hl, pipe_target_base
-        add     hl, de
-        ld      a, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, a                    ; HL = target_table[pipe]
-        push    hl
-
-        pop     hl
-        push    hl                      ; (HL preserved across next block)
-        ld      a, c
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        ld      hl, pipe_slot_base
-        add     hl, de
-        ld      a, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, a
-        push    hl
-        pop     ix                      ; IX = slot_addr_table[pipe]
-        pop     hl                      ; HL = target_table[pipe]
-
-        ld      b, 160
+        ld      b, 160                  ; rows per pipe
 .row_lp:
-        ld      a, (ix+0)
-        ld      e, a
-        ld      a, (ix+1)
-        ld      d, a
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        inc     hl
+        ld      a, d
         or      e
         jr      z, .next
-        ld      a, (hl)
+        ; DE = slot addr inside pipe_program (16-bit target imm location)
+        ld      a, (de)
         sub     1
-        ld      (hl), a
-        ld      c, a
-        inc     hl
-        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        ld      a, (de)
         sbc     a, 0
-        ld      (hl), a
-        dec     hl
-        ex      de, hl
-        ld      (hl), c
-        inc     hl
-        ld      (hl), a
-        dec     hl
-        ex      de, hl
+        ld      (de), a
 .next:
-        inc     hl
-        inc     hl
-        inc     ix
-        inc     ix
         djnz    .row_lp
-
-        pop     bc
-        inc     c
-        dec     b
+        dec     c
         jp      nz, .pipe_outer
         ret
 
