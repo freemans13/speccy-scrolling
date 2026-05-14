@@ -1374,10 +1374,14 @@ cps_sublist_base_table:
         dw      ACTIVE_PIPE_1
         dw      ACTIVE_PIPE_2
 
-; Per-city-body-slot cache base addresses. Set by build_city_slot_bases at
-; init and on each recycle. Indexed slot_idx = (row - CITY_TOP) * NUM_PIPES + pipe.
-; 32 city rows x 3 pipes x 2 bytes = 192 bytes.
-city_slot_bases: ds 192, 0
+; Combined city patch table. Set by build_city_slot_bases at init and on
+; each recycle. 96 entries × 4 bytes = 384 bytes.
+; Each entry (pipe-major order): target_lo, target_hi, base_lo, base_hi
+;   target = slot+1 addr (where cache_lo is written); base = bitmap base addr.
+;   For cap slots: target = city_patch_scratch, base = 0 (write is harmless).
+city_patch_table: ds 384, 0
+city_patch_scratch: dw 0            ; harmless write target for cap slots
+pcsca_saved_sp: dw 0               ; SP save/restore for SP-hijack patch
 
 ;----------------------------------------------------------------
 ; init_background: fill bg_buffer with sky + cityscape, then blit
@@ -5231,10 +5235,10 @@ update_city_cache:
         ret
 
 ;----------------------------------------------------------------
-; build_city_slot_bases: populate city_slot_bases[96] from current pipe_state
+; build_city_slot_bases: populate city_patch_table[96] from current pipe_state
 ; and cityscape_heights. Called once at init and on each recycle.
 ;
-; For each pipe 0..2 and city row 128..159 (row_idx 0..31):
+; For each pipe 0..2 and city row 128..159 (row_idx 0..31) — pipe-major order:
 ;   threshold = CITY_BOTTOM - row = 32 - row_idx
 ;   h_L = cityscape_heights[byte_x - 1]
 ;   h_R = cityscape_heights[byte_x + 2]
@@ -5242,15 +5246,23 @@ update_city_cache:
 ;     base = pipe_bitmap_city_a (even row) or pipe_bitmap_city_b (odd row)
 ;   else:
 ;     base = pipe_bitmap
-;   city_slot_bases[slot_idx*2] = base (16-bit, LE)
-;   slot_idx = row_idx * 3 + pipe
+;
+;   Look up slot first-byte addr via SLOT_ADDR_TABLE:
+;     entry_index = (128 + row_idx)*3 + pipe
+;     slot_first_byte = SLOT_ADDR_TABLE[entry_index]
+;   If (slot_first_byte) == $31 (ld sp,nn body opcode):
+;     city_patch_table[entry*4 + 0..1] = slot_first_byte + 1  (target)
+;     city_patch_table[entry*4 + 2..3] = base
+;   Else (cap/skip slot):
+;     city_patch_table[entry*4 + 0..1] = city_patch_scratch  (harmless)
+;     city_patch_table[entry*4 + 2..3] = 0
 ;
 ; Clobbers AF, BC, DE, HL, IX, IY.
 ;----------------------------------------------------------------
 build_city_slot_bases:
-        ; Walk pipe 0..2
+        ; Walk pipe 0..2 (outer), row_idx 0..31 (inner) — pipe-major
         ld      iy, 0                   ; IY = pipe index (use as counter)
-        ld      ix, city_slot_bases     ; IX = write cursor into city_slot_bases
+        ld      ix, city_patch_table    ; IX = write cursor into city_patch_table
 
 .bcsb_pipe_lp:
         ; A = pipe index (low byte of IY)
@@ -5326,13 +5338,109 @@ build_city_slot_bases:
         ld      hl, pipe_bitmap_city_b
 
 .bcsb_store:
-        ; Write base (HL) to city_slot_bases via IX
-        ; IX write position: slot_idx = row_idx*3 + pipe
-        ; We write sequentially per pipe through all rows, so IX just advances +2
-        ld      (ix+0), l
-        ld      (ix+1), h
+        ; HL = base (bitmap address for this slot)
+        ; Stack (top to bottom): row_idx(E), h_L(C)/h_R(B), threshold
+        ; Now look up slot first-byte addr via SLOT_ADDR_TABLE
+        ; entry_index = (128 + row_idx)*3 + pipe
+        ; IY = pipe index
+
+        ; Save base
+        push    hl                      ; save base
+
+        ; Get row_idx from stack (peek — it's already on stack as DE, E=row_idx)
+        pop     hl                      ; HL = base (just saved)
+        ; Access stack without popping: we have three levels: [DE(row_idx), BC(hL/hR), AF(thresh)]
+        ; They are already saved; we need row_idx (E from DE push).
+        ; Use IY for pipe; we need row_idx. Quickest: re-derive from IY and loop state.
+        ; row_idx is in the stacked DE.E — but we can't peek stack easily.
+        ; Instead keep HL=base aside in bcsb_base_tmp and use fresh regs.
+        ld      (bcsb_base_tmp), hl     ; stash base
+
+        ; Peek row_idx: it's the E byte of the DE we pushed 3rd from top
+        ; Stack layout (SP → low address): DE(row_idx), BC(h_L/h_R), AF(thresh)
+        ;  SP+0 = E (row_idx lo), SP+1 = D
+        ; We can't easily peek without full pop/push. Just pop and repush.
+        pop     de                      ; DE has row_idx in E (restoring DE push)
+        ; D held a temporary value; E = row_idx
+        push    de                      ; put it back
+
+        ; Compute SLOT_ADDR_TABLE entry for (row=128+row_idx, pipe=IY_lo)
+        ; entry_index = row*3 + pipe
+        ; byte offset = entry_index * 2
+        ; row = 128 + E
+        ld      a, e
+        add     a, 128                  ; A = row (128..159)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      d, h
+        ld      b, l
+        add     hl, hl                  ; row*4  (use D=row*2 hi, B=row*2 lo)
+        ; hl = row*4, db = row*2 (as 16-bit pair d:b — careful: d=h of row*2, b=l of row*2)
+        ; Actually let's redo: hl=row*2, de=row*2, then hl=row*2+row*2+row*2? No.
+        ; row*3 = row*2 + row. hl = row*2 after first add hl,hl.
+        ; restart cleaner:
+        ld      a, e
+        add     a, 128                  ; A = row
+        ld      l, a
+        ld      h, 0                    ; HL = row
+        add     hl, hl                  ; HL = row*2
+        ld      d, h
+        ld      b, l                    ; save row*2 in DB (d=hi, b=lo) — nonstandard but ok
+        add     hl, hl                  ; HL = row*4
+        ; HL = row*4, need row*6 = row*4 + row*2
+        ; row*2 hi is in D, lo in B
+        ld      a, l
+        add     a, b                    ; (row*4+row*2) lo
+        ld      l, a
+        ld      a, h
+        adc     a, d                    ; (row*4+row*2) hi
+        ld      h, a                    ; HL = row*6 = (row*3)*2
+
+        ; Add pipe*2
+        push    iy
+        pop     de
+        ld      a, e                    ; A = pipe index
+        add     a, a                    ; A = pipe*2
+        add     a, l
+        ld      l, a
+        jr      nc, .bcsb_sat_nc
+        inc     h
+.bcsb_sat_nc:
+        ; HL = byte offset in SLOT_ADDR_TABLE
+        ld      de, SLOT_ADDR_TABLE
+        add     hl, de                  ; HL → SLOT_ADDR_TABLE[entry*2]
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = slot_first_byte_addr
+
+        ; Check opcode: is (DE) == $31 (ld sp,nn)?
+        ld      a, (de)
+        cp      $31
+        jr      nz, .bcsb_cap_slot
+
+        ; Body slot: target = slot_first_byte_addr + 1
+        inc     de                      ; DE = slot+1 (target)
+        ld      hl, (bcsb_base_tmp)     ; HL = base
+        ; Write 4-byte entry: target_lo, target_hi, base_lo, base_hi
+        ld      (ix+0), e               ; target_lo
+        ld      (ix+1), d               ; target_hi
+        ld      (ix+2), l               ; base_lo
+        ld      (ix+3), h               ; base_hi
+        jr      .bcsb_entry_done
+
+.bcsb_cap_slot:
+        ; Cap/skip slot: target = city_patch_scratch, base = 0
+        ld      (ix+0), low city_patch_scratch
+        ld      (ix+1), high city_patch_scratch
+        ld      (ix+2), 0
+        ld      (ix+3), 0
+
+.bcsb_entry_done:
         inc     ix
         inc     ix
+        inc     ix
+        inc     ix                      ; advance IX by 4 bytes
 
         pop     de                      ; restore row_idx (E)
         pop     bc                      ; restore h_L (C), h_R (B)
@@ -5345,7 +5453,7 @@ build_city_slot_bases:
         ld      a, e
         cp      32
         ld      a, d                    ; restore threshold
-        jr      nz, .bcsb_row_lp
+        jp      nz, .bcsb_row_lp
 
         ; Next pipe
         push    iy
@@ -5355,122 +5463,54 @@ build_city_slot_bases:
         pop     iy
         ld      a, l
         cp      NUM_PIPES
-        jr      nz, .bcsb_pipe_lp
+        jp      nz, .bcsb_pipe_lp
 
         ret
 
-; city_slot_bases layout: pipe-major order (pipe 0 rows 0..31, pipe 1 rows 0..31,
-; pipe 2 rows 0..31). patch_city_slot_cache_addrs walks in the same order.
+bcsb_base_tmp: dw 0                    ; temp: holds base during SLOT_ADDR_TABLE lookup
+
+; city_patch_table layout: pipe-major order (pipe 0 rows 0..31, pipe 1 rows 0..31,
+; pipe 2 rows 0..31). Each 4-byte entry: target_lo, target_hi, base_lo, base_hi.
+; patch_city_slot_cache_addrs walks in the same order via SP-hijack (pop).
 
 ;----------------------------------------------------------------
 ; patch_city_slot_cache_addrs: per-frame SMC patch of city body slot cache_addrs.
-; For each city slot (pipe 0..2, row_idx 0..31):
-;   base = city_slot_bases[slot_idx]   (pipe-major: slot_idx = pipe*32 + row_idx)
-;   cache_addr = base + phase*4
-;   write cache_addr to slot's ld sp imm (bytes +1, +2)
+; Walks city_patch_table (96 × 4-byte entries) via SP-hijack (pop).
+; Each entry: target (slot+1 addr), base (bitmap base).
+; Computes cache_addr = base + phase*4, writes lo/hi at (target)/(target+1).
+; Cap slots have target=city_patch_scratch, base=0 → write is harmless.
 ;
-; Uses SLOT_ADDR_TABLE to find each slot's address.
-; Per-slot cost ~50T. Total for 96 slots ~5000T.
-; Clobbers AF, BC, DE, HL.
+; Per-slot cost ~72T. Total for 96 slots ~7000T (was ~12000T).
+; Clobbers AF, BC, DE, HL. Saves/restores SP.
 ;----------------------------------------------------------------
 patch_city_slot_cache_addrs:
-        ; phase_offset = phase * 4
         ld      a, (phase)
         add     a, a
         add     a, a                    ; A = phase * 4 (0..28)
-        ld      (pcsca_phase_off), a   ; stash for inner use
+        ld      c, a                    ; C = phase_offset
 
-        ; Set up HL = city_slot_bases (pipe-major walk)
-        ld      hl, city_slot_bases    ; HL walks city_slot_bases
+        ld      (pcsca_saved_sp), sp
+        ld      sp, city_patch_table    ; SP-hijack: pop walks the table
+        ld      b, 96                   ; 96 entries
 
-        ; Walk pipe 0..2 (outer), row_idx 0..31 (inner)
-        ld      c, 0                   ; C = pipe
+.pcsca_lp:
+        pop     hl                      ; HL = target addr (slot+1) — 10T
+        pop     de                      ; DE = base addr              — 10T
+        ; cache_addr = base + phase_offset
+        ld      a, e
+        add     a, c                    ; A = base_lo + phase_off     — 4T+4T
+        ld      e, a                    ; E = cache_lo                — 4T
+        ld      a, d
+        adc     a, 0                    ; A = base_hi + carry         — 4T+7T
+        ld      d, a                    ; D = cache_hi                — 4T
+        ; Write cache_lo at (HL), cache_hi at (HL+1)
+        ld      (hl), e                 ; write cache_lo              — 7T
+        inc     hl                      ;                             — 6T
+        ld      (hl), d                 ; write cache_hi              — 7T
+        djnz    .pcsca_lp               ; 13T taken / 8T not taken
 
-.pcsca_pipe_lp:
-        ld      b, 0                   ; B = row_idx (0..31)
-
-.pcsca_row_lp:
-        ; Read base from city_slot_bases (HL)
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        inc     hl                     ; DE = base table addr
-
-        ; Add phase offset → cache_addr in DE
-        ld      a, (pcsca_phase_off)
-        add     a, e
-        ld      e, a
-        jr      nc, .pcsca_nc1
-        inc     d
-.pcsca_nc1:
-        ; Now look up slot address from SLOT_ADDR_TABLE
-        ; row = 128 + row_idx (B)
-        ; slot entry index = row*3 + pipe = (128+B)*3 + C
-        ; byte offset in table = ((128+B)*3 + C) * 2
-        push    hl                     ; save city_slot_bases cursor
-        push    de                     ; save cache_addr
-        push    bc                     ; save row_idx (B), pipe (C)
-
-        ; Compute (128+B)*3 + C in HL
-        ld      a, b
-        add     a, 128                 ; A = row (128..159)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                 ; row*2
-        ld      d, h
-        ld      e, l
-        add     hl, hl                 ; row*4
-        add     hl, de                 ; row*6   (= row*3 * 2 — byte offset for pipe 0)
-        ld      a, c                   ; A = pipe
-        add     a, a                   ; pipe*2 (each entry is 2 bytes)
-        add     a, l
-        ld      l, a
-        jr      nc, .pcsca_nc2
-        inc     h
-.pcsca_nc2:
-        ld      de, SLOT_ADDR_TABLE
-        add     hl, de                 ; HL → SLOT_ADDR_TABLE[(row*3+pipe)*2]
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                ; DE = slot first byte address
-
-        ; cache_addr is on stack; slot addr in DE.
-        ; Patch: ld (DE+1), cache_lo ; ld (DE+2), cache_hi
-        pop     bc                     ; restore row_idx (B), pipe (C)
-        pop     hl                     ; HL = cache_addr (was DE)
-        push    bc
-
-        ; If slot's first byte is NOT $31 (ld sp,nn city-body opcode), this
-        ; row is a cap (JP $C3) or skip slot — DO NOT patch, doing so would
-        ; clobber the cap's JP-target imm and break dispatch.
-        ld      a, (de)
-        cp      $31
-        jr      nz, .pcsca_skip_patch
-
-        inc     de                     ; DE → slot+1 (lo byte of ld sp imm)
-        ld      a, l
-        ld      (de), a
-        inc     de                     ; DE → slot+2 (hi byte of ld sp imm)
-        ld      a, h
-        ld      (de), a
-.pcsca_skip_patch:
-
-        pop     bc                     ; restore row_idx (B), pipe (C)
-        pop     hl                     ; restore city_slot_bases cursor
-
-        inc     b                      ; row_idx++
-        ld      a, b
-        cp      32
-        jr      nz, .pcsca_row_lp
-
-        inc     c                      ; pipe++
-        ld      a, c
-        cp      NUM_PIPES
-        jr      nz, .pcsca_pipe_lp
-
+        ld      sp, (pcsca_saved_sp)
         ret
-
-pcsca_phase_off: db 0                  ; scratch: phase * 4
 
 ;----------------------------------------------------------------
 clear_pipe_col:
