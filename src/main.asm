@@ -572,6 +572,218 @@ init_slot_addr_table:
         ret
 
 ;----------------------------------------------------------------
+; init_pipe_program: emit the initial slot grid into PIPE_PROGRAM
+; memory ($DB00+).  Caller must call init_slot_addr_table first
+; (this routine assumes the table is already populated).
+;
+; Walks rows 0..159.  For each row:
+;   - Reads slot[row][0] address from SLOT_ADDR_TABLE (entry index
+;     row*3, 2-byte little-endian address).
+;   - Writes $D9 (EXX) at (slot[row][0] - 1).
+;   - Writes 3 body templates (5 B normal / 10 B city) for pipes 0-2.
+;
+; After the loop writes the 5-byte epilogue at SLOT_GRID_END:
+;   ED 7B lo hi C9  =  ld sp,(saved_sp) ; ret
+;
+; Scratch: ipp_byte_x (3 bytes) caches byte_x for each pipe so we
+; don't touch pipe_state during the inner loop.
+;
+; Register usage (outer loop):
+;   B  = row (0..159)
+;   IY = write cursor (slot[row][0] for each row, advances per pipe)
+;   HL = address scratch
+;   DE = address scratch / cache_addr
+;   C  = pipe index (0..2) in inner loops
+;----------------------------------------------------------------
+init_pipe_program:
+        ; Cache byte_x (first byte of each pipe_state entry).
+        ; pipe_state layout: db byte_x, gap_y  for each pipe.
+        ld      a, (pipe_state + 0)
+        ld      (ipp_byte_x + 0), a
+        ld      a, (pipe_state + 2)
+        ld      (ipp_byte_x + 1), a
+        ld      a, (pipe_state + 4)
+        ld      (ipp_byte_x + 2), a
+
+        ld      b, 0                    ; row counter 0..159
+.ipp_row_lp:
+        push    bc                      ; save B=row
+
+        ; ── Look up slot[row][0] address from SLOT_ADDR_TABLE ─────
+        ; Table entry index = row*3 + pipe (pipe=0 here).
+        ; Each entry is 2 bytes → byte offset = (row*3)*2 = row*6.
+        ld      l, b
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      d, h
+        ld      e, l                    ; DE = row*2
+        add     hl, hl                  ; row*4
+        add     hl, de                  ; row*6
+        ld      de, SLOT_ADDR_TABLE
+        add     hl, de                  ; HL → table[row*3]
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = slot[row][0] address
+
+        ; ── Write EXX ($D9) at (slot_addr - 1) ───────────────────
+        dec     de
+        ld      a, $D9
+        ld      (de), a
+        inc     de                      ; DE back to slot[row][0]
+
+        ; Transfer slot cursor to IY
+        push    de
+        pop     iy                      ; IY = write cursor at slot[row][0]
+
+        ; ── Dispatch on band ─────────────────────────────────────
+        ld      a, b
+        cp      CITY_TOP                ; 128
+        jp      nc, .ipp_city_row
+
+        ; ──────────────────────────────────────────────────────────
+        ; Normal row (0..127): 3 × 5-byte body template
+        ;   $31 lo hi $D5 $C5  =  ld sp,target ; push de ; push bc
+        ; ──────────────────────────────────────────────────────────
+        ld      c, 0                    ; pipe index
+.ipp_normal_pipe_lp:
+        ; Compute screen_target = line_table[B] + byte_x[C] + 3
+        ; Step 1: line_addr = line_table[B]  (B preserved on stack)
+        ld      a, b
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      de, line_table
+        add     hl, de                  ; HL → line_table[row]
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = line_addr
+
+        ; Step 2: byte_x = ipp_byte_x[C]
+        ld      hl, ipp_byte_x
+        ld      a, c
+        add     a, l
+        ld      l, a
+        jr      nc, .ipp_np_nc
+        inc     h
+.ipp_np_nc:
+        ld      a, (hl)                 ; A = byte_x[C]
+        add     a, 3                    ; +3 for stack-blast offset
+        ld      l, a
+        ld      h, 0
+        add     hl, de                  ; HL = screen_target
+
+        ; Emit 5 bytes at IY
+        ld      (iy+0), $31
+        ld      (iy+1), l
+        ld      (iy+2), h
+        ld      (iy+3), $D5             ; push de
+        ld      (iy+4), $C5             ; push bc
+        ld      de, NORMAL_SLOT_STRIDE  ; = 5
+        add     iy, de                  ; advance cursor to next slot
+
+        inc     c
+        ld      a, c
+        cp      NUM_PIPES               ; 3
+        jr      nz, .ipp_normal_pipe_lp
+        jp      .ipp_row_done
+
+        ; ──────────────────────────────────────────────────────────
+        ; City row (128..159): 3 × 10-byte city body template
+        ;   $31 cache_lo cache_hi $C1 $D1 $31 screen_lo screen_hi $D5 $C5
+        ; ──────────────────────────────────────────────────────────
+.ipp_city_row:
+        ld      c, 0                    ; pipe index
+.ipp_city_pipe_lp:
+        ; Compute cache_addr = CITY_CACHE + (row - CITY_TOP)*12 + pipe*4
+        ld      a, b
+        sub     CITY_TOP                ; A = row - 128 (0..31)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; *2
+        add     hl, hl                  ; *4
+        ld      d, h
+        ld      e, l                    ; DE = (row-CITY_TOP)*4
+        add     hl, hl                  ; *8
+        add     hl, de                  ; *12
+        ld      de, CITY_CACHE
+        add     hl, de                  ; HL = CITY_CACHE + (row-CITY_TOP)*12
+        ld      a, c
+        add     a, a
+        add     a, a                    ; pipe*4
+        add     a, l
+        ld      l, a
+        jr      nc, .ipp_cache_nc
+        inc     h
+.ipp_cache_nc:
+        ; HL = cache_addr for (row, pipe)
+        ; Emit first 5 bytes: ld sp,cache_addr ; pop bc ; pop de
+        ld      (iy+0), $31
+        ld      (iy+1), l
+        ld      (iy+2), h
+        ld      (iy+3), $C1             ; pop bc
+        ld      (iy+4), $D1             ; pop de
+
+        ; Compute screen_target = line_table[B] + byte_x[C] + 3
+        ld      a, b
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      de, line_table
+        add     hl, de                  ; HL → line_table[row]
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = line_addr
+        ld      hl, ipp_byte_x
+        ld      a, c
+        add     a, l
+        ld      l, a
+        jr      nc, .ipp_cp_nc
+        inc     h
+.ipp_cp_nc:
+        ld      a, (hl)                 ; A = byte_x[C]
+        add     a, 3
+        ld      l, a
+        ld      h, 0
+        add     hl, de                  ; HL = screen_target
+
+        ; Emit last 5 bytes at IY+5: ld sp,screen_target ; push de ; push bc
+        ld      (iy+5), $31
+        ld      (iy+6), l
+        ld      (iy+7), h
+        ld      (iy+8), $D5             ; push de
+        ld      (iy+9), $C5             ; push bc
+        ld      de, CITY_SLOT_STRIDE    ; = 10
+        add     iy, de                  ; advance cursor to next slot
+
+        inc     c
+        ld      a, c
+        cp      NUM_PIPES               ; 3
+        jr      nz, .ipp_city_pipe_lp
+
+.ipp_row_done:
+        pop     bc                      ; restore B=row
+        inc     b
+        ld      a, b
+        cp      GROUND_TOP              ; 160
+        jp      nz, .ipp_row_lp
+
+        ; ── Epilogue at SLOT_GRID_END: ld sp,(saved_sp) ; ret ────
+        ; Encoding: ED 7B lo hi C9
+        ld      hl, SLOT_GRID_END
+        ld      (hl), $ED
+        inc     hl
+        ld      (hl), $7B
+        inc     hl
+        ld      (hl), low saved_sp
+        inc     hl
+        ld      (hl), high saved_sp
+        inc     hl
+        ld      (hl), $C9
+        ret
+
+ipp_byte_x: ds 3, 0                    ; scratch: byte_x per pipe (3 bytes)
+
+;----------------------------------------------------------------
 ; init_background: fill bg_buffer with sky + cityscape, then blit
 ; the buffer to the screen
 ;----------------------------------------------------------------
