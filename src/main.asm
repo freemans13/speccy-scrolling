@@ -39,27 +39,48 @@ SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= 
 CITY_TOP        EQU 128                 ; first scan line of cityscape band
 CITY_BOTTOM     EQU 160                 ; first scan line below cityscape
 
-PIPE_PROGRAM        EQU $DB00       ; generated render program (5 KB)
-PIPE_PROGRAM_END    EQU $EF00
-CITY_CACHE          EQU $EF00       ; 32 rows × 3 pipes × 4 bytes = 384 B  (LEGACY; removed in Task 7)
-CITY_CACHE_END      EQU $F080
-TARGET_TABLE        EQU $F080       ; 3 pipes × 320 B  (LEGACY)
-TARGET_TABLE_END    EQU $F440
-SLOT_ADDR_TABLE     EQU $F440       ; 3 pipes × 320 B  (LEGACY)
-SLOT_ADDR_TABLE_END EQU $F800
-; New structures for inline city emit architecture (coexist with legacy until cleanup in Task 7)
-CITY_TABLE          EQU $F800       ; 96 entries × 6 bytes = 576 B
-CITY_TABLE_END      EQU $FA40
-CITY_TABLE_ENTRIES  EQU 96
-CITY_TABLE_STRIDE   EQU 6
-; Reuse existing scratch labels (sky_a_L, sky_a_M1, ... lmask_temp, rmask_temp, cap_L_temp etc.)
-; defined elsewhere in the source; the inline-city architecture references those addresses
-; rather than allocating fresh ones.
-ACTIVE_LIST_NEW     EQU $FA40       ; 720 bytes (max 360 entries × 2 bytes; 3 pipes × ~113 active rows)
-ACTIVE_COUNT_NEW    EQU $FD10       ; 2 bytes (16-bit count — 339 > 255)
-CAP_SLOT_LIST_NEW   EQU $FD12       ; 24 bytes (6 cap rows × 4 byte addrs each)
-CAP_SLOT_COUNT_NEW  EQU $FD2A       ; 1 byte
-BIRD_OVERLAP_NEEDED EQU $FD2B       ; 1 byte
+; ─── Slot grid layout (fixed-slot dispatch) ──────────────────────
+SLOT_GRID_BASE         EQU $DB00       ; 3045 B total grid
+SLOT_GRID_NORMAL_BASE  EQU SLOT_GRID_BASE              ; rows 0..127
+SLOT_GRID_NORMAL_SIZE  EQU 128 * 16                    ; 2048 B
+SLOT_GRID_CITY_BASE    EQU SLOT_GRID_BASE + SLOT_GRID_NORMAL_SIZE  ; $E300
+SLOT_GRID_CITY_SIZE    EQU 32 * 31                     ; 992 B
+SLOT_GRID_END          EQU SLOT_GRID_CITY_BASE + SLOT_GRID_CITY_SIZE  ; $E6E0
+PIPE_PROGRAM           EQU SLOT_GRID_BASE              ; entry point alias
+
+NORMAL_ROW_STRIDE      EQU 16          ; 1 (exx) + 3*5
+CITY_ROW_STRIDE        EQU 31          ; 1 (exx) + 3*10
+NORMAL_SLOT_STRIDE     EQU 5
+CITY_SLOT_STRIDE       EQU 10
+
+; ─── Cityscape data (unchanged) ──────────────────────────────────
+CITY_BG_TABLE          EQU $EB00       ; 1024 B
+CITY_BG_TABLE_END      EQU $EF00
+CITY_CACHE             EQU $EF00       ; 384 B
+CITY_CACHE_END         EQU $F080
+CITY_OVERLAY           EQU $F080       ; 192 B
+CITY_OVERLAY_END       EQU $F140
+
+; ─── Pre-computed slot addresses ─────────────────────────────────
+SLOT_ADDR_TABLE        EQU $F440       ; 480 entries × 2 B = 960 B
+SLOT_ADDR_TABLE_END    EQU $F800
+
+; ─── Legacy unchanged ────────────────────────────────────────────
+TARGET_TABLE           EQU $F080       ; 3 pipes × 320 B  (LEGACY)
+TARGET_TABLE_END       EQU $F440
+CITY_TABLE             EQU $F800       ; legacy unused
+CITY_TABLE_END         EQU $FA40
+
+; ─── Active list (per-pipe sublists) ─────────────────────────────
+ACTIVE_PIPE_0          EQU $FA40       ; 112 entries × 2 B = 224 B
+ACTIVE_PIPE_1          EQU ACTIVE_PIPE_0 + 224
+ACTIVE_PIPE_2          EQU ACTIVE_PIPE_1 + 224
+ACTIVE_LIST_END        EQU ACTIVE_PIPE_2 + 224       ; $FD10
+ACTIVE_COUNT           EQU 336         ; constant; all three sublists × 112
+
+; (Legacy alias kept until cleanup task; patch_pipe_targets currently reads it)
+ACTIVE_LIST_NEW        EQU ACTIVE_PIPE_0
+ACTIVE_COUNT_NEW       EQU $FD10       ; 2 B counter (will become an EQU)
 
         ORG $8000
 
