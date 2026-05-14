@@ -227,6 +227,7 @@ pipe_scored:  db 0, 0, 0
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
 wrap_pending:  db 0                      ; set when a wrap happened this frame
 pending_regen: db 0                      ; set when a recycle happened; gen_pipe_program deferred
+recycled_pipe_idx: db 0
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
@@ -1348,7 +1349,26 @@ init_pipes:
         xor     a
         ld      (phase), a
         call    update_city_cache
-        call    gen_pipe_program
+        call    init_pipe_program           ; emit fixed slot grid (also calls init_slot_addr_table internally)
+        ; For each pipe, apply initial cap/skip configuration.
+        xor     a                            ; pipe index 0
+.init_cps_lp:
+        push    af
+        ; E = pipe_state[pipe*2 + 1] = initial gap_y
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                       ; pipe * 2
+        ld      de, pipe_state
+        add     hl, de
+        inc     hl                           ; HL → gap_y byte
+        ld      e, (hl)                      ; E = initial gap_y
+        pop     af
+        push    af
+        call    configure_pipe_slots
+        pop     af
+        inc     a
+        cp      NUM_PIPES
+        jr      nz, .init_cps_lp
         call    redraw_pipes_v2
         ret
 
@@ -1393,7 +1413,18 @@ frame_update:
         jr      z, .no_regen
         xor     a
         ld      (pending_regen), a
-        call    gen_pipe_program
+        ld      a, (recycled_pipe_idx)
+        ; E = pipe_state[A*2 + 1] = new gap_y for the recycled pipe
+        push    af
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                      ; pipe * 2
+        ld      de, pipe_state
+        add     hl, de
+        inc     hl                          ; HL → gap_y
+        ld      e, (hl)
+        pop     af
+        call    configure_pipe_slots
 .no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
@@ -2199,6 +2230,10 @@ wrap_byte_x:
         ld      (iy+1), a
         ld      a, 1
         ld      (pending_regen), a      ; defer gen_pipe_program to end of frame_update
+        ; Record which pipe recycled — B counts down from NUM_PIPES to 1, so index = NUM_PIPES - B.
+        ld      a, NUM_PIPES
+        sub     b
+        ld      (recycled_pipe_idx), a
         ld      a, 29
 .save:
         ld      (iy+0), a
@@ -2905,11 +2940,15 @@ redraw_pipes_v2:
         ld      (body_b_de), de
         exx
         ; Refresh cap and city byte values for current phase
-        call    update_cap_imm          ; clobbers BC, DE
+        call    update_cap_imm_v2       ; clobbers BC, DE
         call    update_city_cache       ; clobbers BC, DE
-        ; Reload BC/DE from scratch so PIPE_PROGRAM sees correct body bytes
+        ; PIPE_PROGRAM has a leading EXX at every row to alternate A/B variants.
+        ; Enter with main = B-pattern, shadow = A-pattern; row 0's EXX swaps to A.
         ld      bc, (body_a_bc)
         ld      de, (body_a_de)
+        exx                                   ; A → shadow
+        ld      bc, (body_b_bc)
+        ld      de, (body_b_de)               ; B → main
         ; PIPE_PROGRAM has its own prologue (save SP) and epilogue (restore SP + ret)
         call    PIPE_PROGRAM
         ret
