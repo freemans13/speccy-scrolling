@@ -926,7 +926,7 @@ configure_pipe_slots:
         cp      CITY_TOP
         jr      nc, .cps_ct_city
         ld      hl, (cps_cap_top_handler_addr)
-        ld      (iy+0), $CD
+        ld      (iy+0), $C3
         ld      (iy+1), l
         ld      (iy+2), h
         ld      (iy+3), $00
@@ -934,7 +934,7 @@ configure_pipe_slots:
         jr      .cps_ct_emit_active
 .cps_ct_city:
         ld      hl, (cps_cap_top_handler_addr)
-        ld      (iy+0), $CD
+        ld      (iy+0), $C3
         ld      (iy+1), l
         ld      (iy+2), h
         ld      (iy+3), $00
@@ -971,7 +971,7 @@ configure_pipe_slots:
         cp      CITY_TOP
         jr      nc, .cps_cb_city
         ld      hl, (cps_cap_bot_handler_addr)
-        ld      (iy+0), $CD
+        ld      (iy+0), $C3
         ld      (iy+1), l
         ld      (iy+2), h
         ld      (iy+3), $00
@@ -979,7 +979,7 @@ configure_pipe_slots:
         jr      .cps_cb_emit_active
 .cps_cb_city:
         ld      hl, (cps_cap_bot_handler_addr)
-        ld      (iy+0), $CD
+        ld      (iy+0), $C3
         ld      (iy+1), l
         ld      (iy+2), h
         ld      (iy+3), $00
@@ -1237,6 +1237,54 @@ configure_pipe_slots:
         ld      a, h
         ld      (bc), a
 
+        ; ── Patch cap_top_next imm ────────────────────────────────
+        ld      a, (cps_cap_top_row)
+        call    compute_next_slot       ; HL = next slot address
+        push    hl                      ; save next_slot
+        ld      a, (cps_pipe)
+        add     a, a                    ; pipe*2
+        ld      de, cap_top_next_imm_addrs
+        add     a, e
+        ld      e, a
+        jr      nc, .cps_ctn_nc
+        inc     d
+.cps_ctn_nc:
+        ld      a, (de)
+        ld      c, a
+        inc     de
+        ld      a, (de)
+        ld      b, a                    ; BC = address of _next imm lo byte
+        pop     hl                      ; restore next_slot
+        ld      a, l
+        ld      (bc), a
+        inc     bc
+        ld      a, h
+        ld      (bc), a
+
+        ; ── Patch cap_bot_next imm ────────────────────────────────
+        ld      a, (cps_cap_bot_row)
+        call    compute_next_slot       ; HL = next slot address
+        push    hl
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      de, cap_bot_next_imm_addrs
+        add     a, e
+        ld      e, a
+        jr      nc, .cps_cbn_nc
+        inc     d
+.cps_cbn_nc:
+        ld      a, (de)
+        ld      c, a
+        inc     de
+        ld      a, (de)
+        ld      b, a
+        pop     hl
+        ld      a, l
+        ld      (bc), a
+        inc     bc
+        ld      a, h
+        ld      (bc), a
+
         ; ── Store new_gap_y → pipe_state[pipe*2 + 1] ─────────────
         ld      a, (cps_pipe)
         add     a, a                    ; pipe*2
@@ -1249,6 +1297,66 @@ configure_pipe_slots:
 .cps_store_nc:
         ld      a, (cps_gap_y)
         ld      (hl), a
+        ret
+
+;----------------------------------------------------------------
+; compute_next_slot: given a cap row and the current pipe, return the address
+; of the next slot to execute after the cap handler finishes.
+;
+; Input:  A = cap_row (0..159), cps_pipe = pipe index (0..2)
+; Output: HL = address of next slot
+; Clobbers: A, B, D, E
+;----------------------------------------------------------------
+compute_next_slot:
+        ld      b, a                    ; B = row
+        ld      a, (cps_pipe)
+        cp      2
+        jr      z, .cns_next_row        ; pipe == 2 → go to next row
+        ; pipe 0 or 1: next pipe in same row = SLOT_ADDR_TABLE[(row*3 + pipe+1)*2]
+        inc     a                       ; A = pipe + 1
+        ; index = row*6 + (pipe+1)*2
+        ld      l, b
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      d, h
+        ld      e, l                    ; DE = row*2
+        add     hl, hl                  ; row*4
+        add     hl, de                  ; row*6
+        add     a, a                    ; (pipe+1)*2
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; row*6 + (pipe+1)*2
+        ld      de, SLOT_ADDR_TABLE
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl                  ; HL = slot[row][pipe+1]
+        ret
+.cns_next_row:
+        ; pipe == 2: next = slot_addr_table[row+1][0] - 1 (the EXX byte before it)
+        ld      a, b
+        inc     a                       ; A = row + 1
+        cp      GROUND_TOP              ; 160 = end of grid
+        jr      z, .cns_end_of_grid
+        ; index = (row+1)*6
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; (row+1)*2
+        ld      d, h
+        ld      e, l
+        add     hl, hl                  ; (row+1)*4
+        add     hl, de                  ; (row+1)*6
+        ld      de, SLOT_ADDR_TABLE
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ex      de, hl                  ; HL = slot[row+1][0]
+        dec     hl                      ; HL = EXX byte before slot[row+1][0]
+        ret
+.cns_end_of_grid:
+        ld      hl, SLOT_GRID_END
         ret
 
 ; ── Scratch variables for configure_pipe_slots ───────────────────
@@ -2770,40 +2878,40 @@ update_smc:
         ret
 
 ;----------------------------------------------------------------
-; Cap handlers (called by cap_top / cap_bot slots).
+; Cap handlers (JP'd to by cap_top / cap_bot slots — never CALLed).
 ; Each handler:
-;   1. Saves caller SP (so call's return-addr survives the inner SP-hijack)
-;   2. Hijacks SP to the cap's screen target (SMC slot patched by patch_pipe_targets)
-;   3. Loads cap M2/R byte pair into HL via SMC imm, pushes (writes M2/R cells)
-;   4. Loads cap L/M1 byte pair into HL via SMC imm, pushes (writes L/M1 cells)
-;   5. Restores caller SP and returns
+;   1. Hijacks SP to the cap's screen target (SMC slot patched by patch_pipe_targets)
+;   2. Loads cap M2/R byte pair into HL via SMC imm, pushes (writes M2/R cells)
+;   3. Loads cap L/M1 byte pair into HL via SMC imm, pushes (writes L/M1 cells)
+;   4. JPs to next slot (SMC imm patched by configure_pipe_slots)
 ;
-; HL is used (not BC/DE) so the row's main register set survives the call —
+; No CALL/RET — the slot emits JP $CD→$C3 so SP is never pushed with a
+; return address while pointing into screen RAM.  The next slot's ld sp,target
+; will set SP correctly, so the interim SP value doesn't matter.
+;
+; HL is used (not BC/DE) so the row's main register set survives —
 ; this preserves A/B row-parity dithering across cap rows.
 ;
-; The SMC slots:
-;   *_target  : 2-byte screen address, patched by patch_pipe_targets each wrap
-;   *_bc_imm  : 2-byte L/M1 byte pair (low=L, high=M1), patched by update_cap_imm_v2
-;   *_de_imm  : 2-byte M2/R byte pair (low=M2, high=R), patched by update_cap_imm_v2
+; SMC slots:
+;   *_target  : 2-byte screen address, patched by configure_pipe_slots
+;   *_de      : 2-byte M2/R byte pair (low=M2, high=R), patched by update_cap_imm_v2
+;   *_bc      : 2-byte L/M1 byte pair (low=L, high=M1), patched by update_cap_imm_v2
+;   *_next    : 2-byte address of next slot, patched by configure_pipe_slots
 ;----------------------------------------------------------------
 
-cap_saved_caller_sp: dw 0
-
 cap_top_handler_pipe_0:
-        ld      (cap_saved_caller_sp), sp
 cap_top_handler_pipe_0_target EQU $+1
-        ld      sp, $0000                       ; SMC: patched by patch_pipe_targets
+        ld      sp, $0000                       ; SMC: cap row's screen target
 cap_top_handler_pipe_0_de EQU $+1
-        ld      hl, $0000                       ; SMC: M2/R pair, patched by update_cap_imm_v2
+        ld      hl, $0000                       ; SMC: M2/R pair (low=M2, high=R)
         push    hl
 cap_top_handler_pipe_0_bc EQU $+1
-        ld      hl, $0000                       ; SMC: L/M1 pair, patched by update_cap_imm_v2
+        ld      hl, $0000                       ; SMC: L/M1 pair (low=L, high=M1)
         push    hl
-        ld      sp, (cap_saved_caller_sp)
-        ret
+cap_top_handler_pipe_0_next EQU $+1
+        jp      $0000                           ; SMC: address of next slot after cap row
 
 cap_top_handler_pipe_1:
-        ld      (cap_saved_caller_sp), sp
 cap_top_handler_pipe_1_target EQU $+1
         ld      sp, $0000
 cap_top_handler_pipe_1_de EQU $+1
@@ -2812,11 +2920,10 @@ cap_top_handler_pipe_1_de EQU $+1
 cap_top_handler_pipe_1_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      sp, (cap_saved_caller_sp)
-        ret
+cap_top_handler_pipe_1_next EQU $+1
+        jp      $0000
 
 cap_top_handler_pipe_2:
-        ld      (cap_saved_caller_sp), sp
 cap_top_handler_pipe_2_target EQU $+1
         ld      sp, $0000
 cap_top_handler_pipe_2_de EQU $+1
@@ -2825,11 +2932,10 @@ cap_top_handler_pipe_2_de EQU $+1
 cap_top_handler_pipe_2_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      sp, (cap_saved_caller_sp)
-        ret
+cap_top_handler_pipe_2_next EQU $+1
+        jp      $0000
 
 cap_bot_handler_pipe_0:
-        ld      (cap_saved_caller_sp), sp
 cap_bot_handler_pipe_0_target EQU $+1
         ld      sp, $0000
 cap_bot_handler_pipe_0_de EQU $+1
@@ -2838,11 +2944,10 @@ cap_bot_handler_pipe_0_de EQU $+1
 cap_bot_handler_pipe_0_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      sp, (cap_saved_caller_sp)
-        ret
+cap_bot_handler_pipe_0_next EQU $+1
+        jp      $0000
 
 cap_bot_handler_pipe_1:
-        ld      (cap_saved_caller_sp), sp
 cap_bot_handler_pipe_1_target EQU $+1
         ld      sp, $0000
 cap_bot_handler_pipe_1_de EQU $+1
@@ -2851,11 +2956,10 @@ cap_bot_handler_pipe_1_de EQU $+1
 cap_bot_handler_pipe_1_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      sp, (cap_saved_caller_sp)
-        ret
+cap_bot_handler_pipe_1_next EQU $+1
+        jp      $0000
 
 cap_bot_handler_pipe_2:
-        ld      (cap_saved_caller_sp), sp
 cap_bot_handler_pipe_2_target EQU $+1
         ld      sp, $0000
 cap_bot_handler_pipe_2_de EQU $+1
@@ -2864,8 +2968,8 @@ cap_bot_handler_pipe_2_de EQU $+1
 cap_bot_handler_pipe_2_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      sp, (cap_saved_caller_sp)
-        ret
+cap_bot_handler_pipe_2_next EQU $+1
+        jp      $0000
 
 ; Per-pipe handler address tables for indexed dispatch in configure_pipe_slots.
 cap_top_handler_addrs:
@@ -2902,6 +3006,14 @@ cap_bot_target_imm_addrs:
         dw      cap_bot_handler_pipe_0_target
         dw      cap_bot_handler_pipe_1_target
         dw      cap_bot_handler_pipe_2_target
+cap_top_next_imm_addrs:
+        dw      cap_top_handler_pipe_0_next
+        dw      cap_top_handler_pipe_1_next
+        dw      cap_top_handler_pipe_2_next
+cap_bot_next_imm_addrs:
+        dw      cap_bot_handler_pipe_0_next
+        dw      cap_bot_handler_pipe_1_next
+        dw      cap_bot_handler_pipe_2_next
 
 ;----------------------------------------------------------------
 ; redraw_pipes_v2: per-frame entry into the flat code-gen renderer.
