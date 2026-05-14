@@ -911,13 +911,13 @@ configure_pipe_slots:
         ld      a, b                    ; A = row
         ld      c, a                    ; C = row (saved for compare)
         ld      a, (cps_gap_y)
-        cp      c                       ; gap_y vs row
+        cp      c                       ; gap_y vs row; carry → gap_y < row
         jp      z, .cps_do_skip         ; row == gap_y → skip
-        jp      c, .cps_do_body         ; gap_y > row → body (carry: gap_y < row false)
-        ; gap_y < row; skip if row < cap_bot_row
+        jp      nc, .cps_do_body        ; gap_y > row → body (row above gap)
+        ; gap_y < row; skip if row < cap_bot_row, body if row > cap_bot_row
         ld      a, (cps_cap_bot_row)
         cp      c                       ; cap_bot_row vs row
-        jp      c, .cps_do_body         ; cap_bot_row < row → body
+        jp      c, .cps_do_body         ; cap_bot_row < row → body (row below gap)
         jp      .cps_do_skip            ; cap_bot_row >= row → skip (row in gap)
 
         ; ── cap_top template ─────────────────────────────────────
@@ -1349,7 +1349,8 @@ init_pipes:
         xor     a
         ld      (phase), a
         call    update_city_cache
-        call    init_pipe_program           ; emit fixed slot grid (also calls init_slot_addr_table internally)
+        call    init_slot_addr_table        ; precompute slot_addr_table[160][3]
+        call    init_pipe_program           ; emit fixed slot grid (reads slot_addr_table)
         ; For each pipe, apply initial cap/skip configuration.
         xor     a                            ; pipe index 0
 .init_cps_lp:
@@ -1369,6 +1370,10 @@ init_pipes:
         inc     a
         cp      NUM_PIPES
         jr      nz, .init_cps_lp
+        ; ACTIVE_COUNT_NEW = 3 * 112 = 336 (used by patch_pipe_targets to walk
+        ; the three per-pipe sublists at ACTIVE_PIPE_0..PIPE_2 contiguously).
+        ld      hl, 336
+        ld      (ACTIVE_COUNT_NEW), hl
         call    redraw_pipes_v2
         ret
 
@@ -1449,20 +1454,7 @@ advance_phase:
         inc     a
         and     7
         ld      (phase), a
-        jr      z, .wrap
-        ; Non-wrap: busy-wait so frame_update has UNIFORM total cycle count,
-        ; otherwise the WHITE end-of-frame band appears at different border
-        ; rows across frames (the flashing the user is seeing).
-        ; wrap_byte_x + apply_pipe_attrs cost ~3500 T-st. Match with djnz nops.
-        push    bc
-        ld      b, 130
-.wait_lp:
-        nop                             ; 4
-        nop                             ; 4
-        nop                             ; 4
-        djnz    .wait_lp                ; 13/8 (130 × 25 ≈ 3250)
-        pop     bc
-        ret
+        ret     nz
 .wrap:
         call    wrap_byte_x
         call    apply_pipe_attrs
@@ -1633,30 +1625,51 @@ update_cap_smc:
 ; ~11 k T-states amortized over 4 frames = 2.7 k per frame.
 ;----------------------------------------------------------------
 patch_pipe_targets:
-        ; Walk ACTIVE_LIST_NEW (built by gen_pipe_program). Uses 16-bit counter
-        ; in BC since active count can exceed 255 (~339 entries for 3 pipes).
-        ld      bc, (ACTIVE_COUNT_NEW)
-        ld      a, b
-        or      c
-        ret     z
-        ld      hl, ACTIVE_LIST_NEW
-.lp:
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        inc     hl
-        ; DE = slot addr; decrement 16-bit value at DE
-        ld      a, (de)
+        ; SP-hijack 4-way unrolled walker. Reads entry addresses via pop hl
+        ; (10T) which is faster than ld e,(hl); inc hl; ld d,(hl); inc hl (26T).
+        ; Each entry's 16-bit target decrement uses the borrow-check fast path
+        ; (~33T avg per entry vs 88T basic version).
+        ;
+        ; Assumes ACTIVE_COUNT = 336 (constant, 3 pipes × 112 active rows).
+        ; 336/4 = 84 djnz iterations.
+        ld      (saved_sp_inner), sp
+        ld      sp, ACTIVE_LIST_NEW
+        ld      b, 84                           ; 336 / 4
+.pt_lp:
+        pop     hl
+        ld      a, (hl)
         sub     1
-        ld      (de), a
-        inc     de
-        ld      a, (de)
-        sbc     a, 0
-        ld      (de), a
-        dec     bc
-        ld      a, b
-        or      c
-        jp      nz, .lp
+        ld      (hl), a
+        jr      nc, .pt_nc1
+        inc     hl
+        dec     (hl)
+.pt_nc1:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_nc2
+        inc     hl
+        dec     (hl)
+.pt_nc2:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_nc3
+        inc     hl
+        dec     (hl)
+.pt_nc3:
+        pop     hl
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pt_nc4
+        inc     hl
+        dec     (hl)
+.pt_nc4:
+        djnz    .pt_lp
+        ld      sp, (saved_sp_inner)
         ret
 
 ;----------------------------------------------------------------
@@ -2949,7 +2962,8 @@ redraw_pipes_v2:
         exx                                   ; A → shadow
         ld      bc, (body_b_bc)
         ld      de, (body_b_de)               ; B → main
-        ; PIPE_PROGRAM has its own prologue (save SP) and epilogue (restore SP + ret)
+        ; Save SP for the slot grid's epilogue (ld sp,(saved_sp); ret) to restore.
+        ld      (saved_sp), sp
         call    PIPE_PROGRAM
         ret
 
