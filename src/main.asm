@@ -1374,6 +1374,11 @@ cps_sublist_base_table:
         dw      ACTIVE_PIPE_1
         dw      ACTIVE_PIPE_2
 
+; Per-city-body-slot cache base addresses. Set by build_city_slot_bases at
+; init and on each recycle. Indexed slot_idx = (row - CITY_TOP) * NUM_PIPES + pipe.
+; 32 city rows x 3 pipes x 2 bytes = 192 bytes.
+city_slot_bases: ds 192, 0
+
 ;----------------------------------------------------------------
 ; init_background: fill bg_buffer with sky + cityscape, then blit
 ; the buffer to the screen
@@ -1478,6 +1483,7 @@ init_pipes:
         inc     a
         cp      NUM_PIPES
         jr      nz, .init_cps_lp
+        call    build_city_slot_bases   ; init city body cache pointer table
         ; ACTIVE_COUNT_NEW = 3 * 112 = 336 (used by patch_pipe_targets to walk
         ; the three per-pipe sublists at ACTIVE_PIPE_0..PIPE_2 contiguously).
         ld      hl, 336
@@ -1538,6 +1544,7 @@ frame_update:
         ld      e, (hl)
         pop     af
         call    configure_pipe_slots
+        call    build_city_slot_bases   ; rebuild city slot bases for new byte_x
 .no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
@@ -3066,19 +3073,10 @@ redraw_pipes_v2:
         exx
         ; Refresh cap and city byte values for current phase
         call    update_cap_imm_v2       ; clobbers BC, DE
-        ; update_city_cache is the per-frame hot path (~25k T-states).
-        ; Optimisation: only rebuild on phase==0 (every 4 frames, aligned with
-        ; byte_x wrap). City pixels are 1-pixel stale on intermediate frames,
-        ; but the 2 px/frame scroll means a 4-frame stale interval is at most
-        ; 8 pixels off — still readable.
-        ld      a, (phase)
-        and     3                       ; refresh every 4 frames (on wrap)
-        jr      nz, .skip_city_cache
-        ld      a, 6                    ; DIAGNOSTIC YELLOW
+        ld      a, 6                    ; YELLOW = city cache addr patching
         out     ($fe), a
-        call    update_city_cache
-.skip_city_cache:
-        ld      a, 3                    ; DIAGNOSTIC MAGENTA
+        call    patch_city_slot_cache_addrs
+        ld      a, 3                    ; MAGENTA = PIPE_PROGRAM
         out     ($fe), a
         ; PIPE_PROGRAM has a leading EXX at every row to alternate A/B variants.
         ; Enter with main = B-pattern, shadow = A-pattern; row 0's EXX swaps to A.
@@ -5231,6 +5229,240 @@ update_city_cache:
         jp      c, .row_lp
 
         ret
+
+;----------------------------------------------------------------
+; build_city_slot_bases: populate city_slot_bases[96] from current pipe_state
+; and cityscape_heights. Called once at init and on each recycle.
+;
+; For each pipe 0..2 and city row 128..159 (row_idx 0..31):
+;   threshold = CITY_BOTTOM - row = 32 - row_idx
+;   h_L = cityscape_heights[byte_x - 1]
+;   h_R = cityscape_heights[byte_x + 2]
+;   if h_L >= threshold OR h_R >= threshold:
+;     base = pipe_bitmap_city_a (even row) or pipe_bitmap_city_b (odd row)
+;   else:
+;     base = pipe_bitmap
+;   city_slot_bases[slot_idx*2] = base (16-bit, LE)
+;   slot_idx = row_idx * 3 + pipe
+;
+; Clobbers AF, BC, DE, HL, IX, IY.
+;----------------------------------------------------------------
+build_city_slot_bases:
+        ; Walk pipe 0..2
+        ld      iy, 0                   ; IY = pipe index (use as counter)
+        ld      ix, city_slot_bases     ; IX = write cursor into city_slot_bases
+
+.bcsb_pipe_lp:
+        ; A = pipe index (low byte of IY)
+        push    iy
+        pop     hl
+        ld      a, l                    ; A = pipe index (0..2)
+
+        ; byte_x = pipe_state[pipe*2]
+        add     a, a                    ; A = pipe*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state
+        add     hl, de
+        ld      a, (hl)                 ; A = byte_x
+
+        ; h_L = cityscape_heights[byte_x - 1]
+        dec     a                       ; A = byte_x - 1 = col_L
+        ld      l, a
+        ld      h, 0
+        ld      de, cityscape_heights
+        add     hl, de
+        ld      c, (hl)                 ; C = h_L
+
+        ; h_R = cityscape_heights[byte_x + 2]
+        ; col_R = byte_x + 2 = col_L + 3
+        ld      a, l
+        add     a, 3                    ; col_L + 3 = byte_x + 2
+        ld      l, a
+        jr      nc, .bcsb_hr_nc
+        inc     h
+.bcsb_hr_nc:
+        ld      b, (hl)                 ; B = h_R
+
+        ; Walk city rows row_idx 0..31 (row 128..159)
+        ; threshold starts at 32 and decrements to 1
+        ld      a, 32                   ; A = threshold (CITY_BOTTOM - CITY_TOP)
+        ; E = row_idx = 0
+        ld      e, 0                    ; E = row_idx
+
+.bcsb_row_lp:
+        ; threshold = 32 - row_idx = A (we count down)
+        ; Check if h_L >= threshold OR h_R >= threshold
+        push    af                      ; save threshold
+        push    bc                      ; save h_L (C), h_R (B)
+        push    de                      ; save row_idx (E)
+
+        ; Check h_L (C) >= threshold (A)
+        ld      d, a                    ; D = threshold
+        ld      a, c                    ; A = h_L
+        cp      d                       ; h_L - threshold; carry set if h_L < threshold
+        jr      nc, .bcsb_city         ; h_L >= threshold → city
+
+        ; Check h_R (B) >= threshold (D)
+        ld      a, b                    ; A = h_R
+        cp      d                       ; h_R - threshold; carry set if h_R < threshold
+        jr      nc, .bcsb_city
+
+        ; Neither side is city; use pipe_bitmap (sky only)
+        ld      hl, pipe_bitmap
+        jr      .bcsb_store
+
+.bcsb_city:
+        ; City side present; pick A or B variant by row parity
+        ; row = 128 + row_idx; parity = row & 1 = row_idx & 1 (128 is even)
+        pop     de
+        push    de                      ; restore/peek row_idx
+        ld      a, e                    ; A = row_idx
+        and     1                       ; 0 = even row (A variant), 1 = odd (B variant)
+        jr      nz, .bcsb_city_b
+        ld      hl, pipe_bitmap_city_a
+        jr      .bcsb_store
+.bcsb_city_b:
+        ld      hl, pipe_bitmap_city_b
+
+.bcsb_store:
+        ; Write base (HL) to city_slot_bases via IX
+        ; IX write position: slot_idx = row_idx*3 + pipe
+        ; We write sequentially per pipe through all rows, so IX just advances +2
+        ld      (ix+0), l
+        ld      (ix+1), h
+        inc     ix
+        inc     ix
+
+        pop     de                      ; restore row_idx (E)
+        pop     bc                      ; restore h_L (C), h_R (B)
+        pop     af                      ; restore threshold (A)
+
+        ; Advance to next row
+        dec     a                       ; threshold--
+        inc     e                       ; row_idx++
+        ld      d, a                    ; save threshold in D temporarily
+        ld      a, e
+        cp      32
+        ld      a, d                    ; restore threshold
+        jr      nz, .bcsb_row_lp
+
+        ; Next pipe
+        push    iy
+        pop     hl
+        inc     l
+        push    hl
+        pop     iy
+        ld      a, l
+        cp      NUM_PIPES
+        jr      nz, .bcsb_pipe_lp
+
+        ret
+
+; city_slot_bases layout: pipe-major order (pipe 0 rows 0..31, pipe 1 rows 0..31,
+; pipe 2 rows 0..31). patch_city_slot_cache_addrs walks in the same order.
+
+;----------------------------------------------------------------
+; patch_city_slot_cache_addrs: per-frame SMC patch of city body slot cache_addrs.
+; For each city slot (pipe 0..2, row_idx 0..31):
+;   base = city_slot_bases[slot_idx]   (pipe-major: slot_idx = pipe*32 + row_idx)
+;   cache_addr = base + phase*4
+;   write cache_addr to slot's ld sp imm (bytes +1, +2)
+;
+; Uses SLOT_ADDR_TABLE to find each slot's address.
+; Per-slot cost ~50T. Total for 96 slots ~5000T.
+; Clobbers AF, BC, DE, HL.
+;----------------------------------------------------------------
+patch_city_slot_cache_addrs:
+        ; phase_offset = phase * 4
+        ld      a, (phase)
+        add     a, a
+        add     a, a                    ; A = phase * 4 (0..28)
+        ld      (pcsca_phase_off), a   ; stash for inner use
+
+        ; Set up HL = city_slot_bases (pipe-major walk)
+        ld      hl, city_slot_bases    ; HL walks city_slot_bases
+
+        ; Walk pipe 0..2 (outer), row_idx 0..31 (inner)
+        ld      c, 0                   ; C = pipe
+
+.pcsca_pipe_lp:
+        ld      b, 0                   ; B = row_idx (0..31)
+
+.pcsca_row_lp:
+        ; Read base from city_slot_bases (HL)
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        inc     hl                     ; DE = base table addr
+
+        ; Add phase offset → cache_addr in DE
+        ld      a, (pcsca_phase_off)
+        add     a, e
+        ld      e, a
+        jr      nc, .pcsca_nc1
+        inc     d
+.pcsca_nc1:
+        ; Now look up slot address from SLOT_ADDR_TABLE
+        ; row = 128 + row_idx (B)
+        ; slot entry index = row*3 + pipe = (128+B)*3 + C
+        ; byte offset in table = ((128+B)*3 + C) * 2
+        push    hl                     ; save city_slot_bases cursor
+        push    de                     ; save cache_addr
+        push    bc                     ; save row_idx (B), pipe (C)
+
+        ; Compute (128+B)*3 + C in HL
+        ld      a, b
+        add     a, 128                 ; A = row (128..159)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                 ; row*2
+        ld      d, h
+        ld      e, l
+        add     hl, hl                 ; row*4
+        add     hl, de                 ; row*6   (= row*3 * 2 — byte offset for pipe 0)
+        ld      a, c                   ; A = pipe
+        add     a, a                   ; pipe*2 (each entry is 2 bytes)
+        add     a, l
+        ld      l, a
+        jr      nc, .pcsca_nc2
+        inc     h
+.pcsca_nc2:
+        ld      de, SLOT_ADDR_TABLE
+        add     hl, de                 ; HL → SLOT_ADDR_TABLE[(row*3+pipe)*2]
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                ; DE = slot first byte address
+
+        ; cache_addr is on stack; slot addr in DE.
+        ; Patch: ld (DE+1), cache_lo ; ld (DE+2), cache_hi
+        pop     bc                     ; restore row_idx (B), pipe (C)
+        pop     hl                     ; HL = cache_addr (was DE)
+        push    bc
+
+        inc     de                     ; DE → slot+1 (lo byte of ld sp imm)
+        ld      a, l
+        ld      (de), a
+        inc     de                     ; DE → slot+2 (hi byte of ld sp imm)
+        ld      a, h
+        ld      (de), a
+
+        pop     bc                     ; restore row_idx (B), pipe (C)
+        pop     hl                     ; restore city_slot_bases cursor
+
+        inc     b                      ; row_idx++
+        ld      a, b
+        cp      32
+        jr      nz, .pcsca_row_lp
+
+        inc     c                      ; pipe++
+        ld      a, c
+        cp      NUM_PIPES
+        jr      nz, .pcsca_pipe_lp
+
+        ret
+
+pcsca_phase_off: db 0                  ; scratch: phase * 4
 
 ;----------------------------------------------------------------
 clear_pipe_col:
