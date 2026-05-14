@@ -497,6 +497,81 @@ paint_attrs:
         ret
 
 ;----------------------------------------------------------------
+; init_slot_addr_table: pre-compute slot_addr_table[row][pipe] = byte address
+; of the (row, pipe) slot's first byte (the byte AFTER the row's leading EXX).
+;
+; Layout:
+;   row in 0..127   →  SLOT_GRID_BASE + row*16 + 1 + pipe*5
+;   row in 128..159 →  SLOT_GRID_CITY_BASE + (row-128)*31 + 1 + pipe*10
+;
+; Entry index: row*3 + pipe (16-bit address per entry).
+; Total table size: 480 × 2 = 960 bytes at SLOT_ADDR_TABLE.
+;----------------------------------------------------------------
+init_slot_addr_table:
+        ld      ix, SLOT_ADDR_TABLE
+        ld      b, 0
+.row_lp:
+        push    bc
+        ld      a, b
+        cp      128
+        jr      nc, .city_row
+
+        ; Normal: DE = SLOT_GRID_NORMAL_BASE + row*16 + 1
+        ld      l, b
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; HL = row × 16
+        ld      de, SLOT_GRID_NORMAL_BASE + 1
+        add     hl, de
+        ex      de, hl                          ; DE = base addr for pipe 0
+        ld      c, NORMAL_SLOT_STRIDE
+        jr      .write_3_pipes
+
+.city_row:
+        ; City: DE = SLOT_GRID_CITY_BASE + (row-128)*31 + 1
+        ld      a, b
+        sub     128
+        ld      l, a
+        ld      h, 0
+        ld      d, h
+        ld      e, l                            ; DE = row - 128
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; HL = (row-128) × 32
+        or      a
+        sbc     hl, de                          ; HL = (row-128) × 31
+        ld      de, SLOT_GRID_CITY_BASE + 1
+        add     hl, de                          ; HL = base addr for pipe 0
+        ex      de, hl                          ; DE = base addr
+        ld      c, CITY_SLOT_STRIDE
+
+.write_3_pipes:
+        ld      b, 3
+.wp_lp:
+        ld      (ix+0), e
+        ld      (ix+1), d
+        inc     ix
+        inc     ix
+        ld      a, e
+        add     a, c
+        ld      e, a
+        jr      nc, .wp_no_carry
+        inc     d
+.wp_no_carry:
+        djnz    .wp_lp
+
+        pop     bc
+        inc     b
+        ld      a, b
+        cp      GROUND_TOP
+        jr      nz, .row_lp
+        ret
+
+;----------------------------------------------------------------
 ; init_background: fill bg_buffer with sky + cityscape, then blit
 ; the buffer to the screen
 ;----------------------------------------------------------------
