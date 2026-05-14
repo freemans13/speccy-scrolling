@@ -1953,6 +1953,140 @@ update_smc:
         ret
 
 ;----------------------------------------------------------------
+; Cap handlers (called by cap_top / cap_bot slots).
+; Each handler:
+;   1. Saves caller SP (so call's return-addr survives the inner SP-hijack)
+;   2. Hijacks SP to the cap's screen target (SMC slot patched by patch_pipe_targets)
+;   3. Loads cap M2/R byte pair into HL via SMC imm, pushes (writes M2/R cells)
+;   4. Loads cap L/M1 byte pair into HL via SMC imm, pushes (writes L/M1 cells)
+;   5. Restores caller SP and returns
+;
+; HL is used (not BC/DE) so the row's main register set survives the call —
+; this preserves A/B row-parity dithering across cap rows.
+;
+; The SMC slots:
+;   *_target  : 2-byte screen address, patched by patch_pipe_targets each wrap
+;   *_bc_imm  : 2-byte L/M1 byte pair (low=L, high=M1), patched by update_cap_imm_v2
+;   *_de_imm  : 2-byte M2/R byte pair (low=M2, high=R), patched by update_cap_imm_v2
+;----------------------------------------------------------------
+
+cap_saved_caller_sp: dw 0
+
+cap_top_handler_pipe_0:
+        ld      (cap_saved_caller_sp), sp
+cap_top_handler_pipe_0_target EQU $+1
+        ld      sp, $0000                       ; SMC: patched by patch_pipe_targets
+cap_top_handler_pipe_0_de EQU $+1
+        ld      hl, $0000                       ; SMC: M2/R pair, patched by update_cap_imm_v2
+        push    hl
+cap_top_handler_pipe_0_bc EQU $+1
+        ld      hl, $0000                       ; SMC: L/M1 pair, patched by update_cap_imm_v2
+        push    hl
+        ld      sp, (cap_saved_caller_sp)
+        ret
+
+cap_top_handler_pipe_1:
+        ld      (cap_saved_caller_sp), sp
+cap_top_handler_pipe_1_target EQU $+1
+        ld      sp, $0000
+cap_top_handler_pipe_1_de EQU $+1
+        ld      hl, $0000
+        push    hl
+cap_top_handler_pipe_1_bc EQU $+1
+        ld      hl, $0000
+        push    hl
+        ld      sp, (cap_saved_caller_sp)
+        ret
+
+cap_top_handler_pipe_2:
+        ld      (cap_saved_caller_sp), sp
+cap_top_handler_pipe_2_target EQU $+1
+        ld      sp, $0000
+cap_top_handler_pipe_2_de EQU $+1
+        ld      hl, $0000
+        push    hl
+cap_top_handler_pipe_2_bc EQU $+1
+        ld      hl, $0000
+        push    hl
+        ld      sp, (cap_saved_caller_sp)
+        ret
+
+cap_bot_handler_pipe_0:
+        ld      (cap_saved_caller_sp), sp
+cap_bot_handler_pipe_0_target EQU $+1
+        ld      sp, $0000
+cap_bot_handler_pipe_0_de EQU $+1
+        ld      hl, $0000
+        push    hl
+cap_bot_handler_pipe_0_bc EQU $+1
+        ld      hl, $0000
+        push    hl
+        ld      sp, (cap_saved_caller_sp)
+        ret
+
+cap_bot_handler_pipe_1:
+        ld      (cap_saved_caller_sp), sp
+cap_bot_handler_pipe_1_target EQU $+1
+        ld      sp, $0000
+cap_bot_handler_pipe_1_de EQU $+1
+        ld      hl, $0000
+        push    hl
+cap_bot_handler_pipe_1_bc EQU $+1
+        ld      hl, $0000
+        push    hl
+        ld      sp, (cap_saved_caller_sp)
+        ret
+
+cap_bot_handler_pipe_2:
+        ld      (cap_saved_caller_sp), sp
+cap_bot_handler_pipe_2_target EQU $+1
+        ld      sp, $0000
+cap_bot_handler_pipe_2_de EQU $+1
+        ld      hl, $0000
+        push    hl
+cap_bot_handler_pipe_2_bc EQU $+1
+        ld      hl, $0000
+        push    hl
+        ld      sp, (cap_saved_caller_sp)
+        ret
+
+; Per-pipe handler address tables for indexed dispatch in configure_pipe_slots.
+cap_top_handler_addrs:
+        dw      cap_top_handler_pipe_0
+        dw      cap_top_handler_pipe_1
+        dw      cap_top_handler_pipe_2
+cap_bot_handler_addrs:
+        dw      cap_bot_handler_pipe_0
+        dw      cap_bot_handler_pipe_1
+        dw      cap_bot_handler_pipe_2
+
+; Per-pipe SMC label tables for update_cap_imm_v2 and configure_pipe_slots.
+cap_top_bc_imm_addrs:
+        dw      cap_top_handler_pipe_0_bc
+        dw      cap_top_handler_pipe_1_bc
+        dw      cap_top_handler_pipe_2_bc
+cap_top_de_imm_addrs:
+        dw      cap_top_handler_pipe_0_de
+        dw      cap_top_handler_pipe_1_de
+        dw      cap_top_handler_pipe_2_de
+cap_bot_bc_imm_addrs:
+        dw      cap_bot_handler_pipe_0_bc
+        dw      cap_bot_handler_pipe_1_bc
+        dw      cap_bot_handler_pipe_2_bc
+cap_bot_de_imm_addrs:
+        dw      cap_bot_handler_pipe_0_de
+        dw      cap_bot_handler_pipe_1_de
+        dw      cap_bot_handler_pipe_2_de
+cap_top_target_imm_addrs:
+        dw      cap_top_handler_pipe_0_target
+        dw      cap_top_handler_pipe_1_target
+        dw      cap_top_handler_pipe_2_target
+cap_bot_target_imm_addrs:
+        dw      cap_bot_handler_pipe_0_target
+        dw      cap_bot_handler_pipe_1_target
+        dw      cap_bot_handler_pipe_2_target
+
+;----------------------------------------------------------------
 ; redraw_pipes_v2: per-frame entry into the flat code-gen renderer.
 ; Loads BC/DE with sky-A pre-shifted body bytes, BC'/DE' with sky-B,
 ; then jumps to the generated program at PIPE_PROGRAM.
