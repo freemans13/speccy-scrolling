@@ -4731,6 +4731,92 @@ update_cap_imm:
         djnz    .lp
         ret
 
+;----------------------------------------------------------------
+; update_cap_imm_v2 — write current phase's cap bytes into the 6
+; cap handler SMC imm slots (cap_top × 3 + cap_bot × 3 pipes).
+; Mirrors update_cap_imm exactly but targets the v2 handler tables.
+; No skip-if-absent check — imms are always written (harmless).
+; Clobbers: AF, BC, DE, HL, IX.
+;----------------------------------------------------------------
+update_cap_imm_v2:
+        ; Cache L, M1, M2, R from cap_rounded_bitmap[phase*4]
+        ld      hl, cap_rounded_bitmap
+        ld      a, (phase)
+        add     a, a
+        add     a, a                    ; A = phase * 4
+        ld      e, a
+        ld      d, 0
+        add     hl, de                  ; HL → cap_rounded_bitmap[phase*4]
+        ld      a, (hl)
+        ld      (cap_L_temp), a         ; L
+        inc     hl
+        ld      a, (hl)
+        ld      (cap_M1_temp), a        ; M1
+        inc     hl
+        ld      a, (hl)
+        ld      (cap_M2_temp), a        ; M2
+        inc     hl
+        ld      a, (hl)
+        ld      (cap_R_temp), a         ; R
+
+        ; Write bc/de pairs into cap_top handlers (pipes 0..2)
+        ld      ix, cap_top_bc_imm_addrs
+        ld      iy, cap_top_de_imm_addrs
+        ld      b, 3
+.top_lp:
+        push    bc
+        ; BC-imm slot: byte at addr = L, byte at addr+1 = M1
+        ld      l, (ix+0)
+        ld      h, (ix+1)
+        ld      a, (cap_L_temp)
+        ld      (hl), a
+        inc     hl
+        ld      a, (cap_M1_temp)
+        ld      (hl), a
+        ; DE-imm slot: byte at addr = M2, byte at addr+1 = R
+        ld      l, (iy+0)
+        ld      h, (iy+1)
+        ld      a, (cap_M2_temp)
+        ld      (hl), a
+        inc     hl
+        ld      a, (cap_R_temp)
+        ld      (hl), a
+        ; Advance table pointers by 2
+        inc     ix
+        inc     ix
+        inc     iy
+        inc     iy
+        pop     bc
+        djnz    .top_lp
+
+        ; Write bc/de pairs into cap_bot handlers (pipes 0..2)
+        ld      ix, cap_bot_bc_imm_addrs
+        ld      iy, cap_bot_de_imm_addrs
+        ld      b, 3
+.bot_lp:
+        push    bc
+        ld      l, (ix+0)
+        ld      h, (ix+1)
+        ld      a, (cap_L_temp)
+        ld      (hl), a
+        inc     hl
+        ld      a, (cap_M1_temp)
+        ld      (hl), a
+        ld      l, (iy+0)
+        ld      h, (iy+1)
+        ld      a, (cap_M2_temp)
+        ld      (hl), a
+        inc     hl
+        ld      a, (cap_R_temp)
+        ld      (hl), a
+        inc     ix
+        inc     ix
+        inc     iy
+        inc     iy
+        pop     bc
+        djnz    .bot_lp
+        ret
+
 city_row_temp:   db 0                  ; current row
 city_pipe_temp:  db 0                  ; current pipe index
 city_bx_temp:    db 0                  ; current pipe byte_x
