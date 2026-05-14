@@ -39,14 +39,27 @@ SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= 
 CITY_TOP        EQU 128                 ; first scan line of cityscape band
 CITY_BOTTOM     EQU 160                 ; first scan line below cityscape
 
-PIPE_PROGRAM        EQU $DB00       ; generated render program (5 KB — bumped from 4 KB to avoid overflow)
+PIPE_PROGRAM        EQU $DB00       ; generated render program (5 KB)
 PIPE_PROGRAM_END    EQU $EF00
-CITY_CACHE          EQU $EF00       ; 32 rows × 3 pipes × 4 bytes = 384 B
+CITY_CACHE          EQU $EF00       ; 32 rows × 3 pipes × 4 bytes = 384 B  (LEGACY; removed in Task 7)
 CITY_CACHE_END      EQU $F080
-TARGET_TABLE        EQU $F080       ; 3 pipes × 320 B
+TARGET_TABLE        EQU $F080       ; 3 pipes × 320 B  (LEGACY)
 TARGET_TABLE_END    EQU $F440
-SLOT_ADDR_TABLE     EQU $F440       ; 3 pipes × 320 B
+SLOT_ADDR_TABLE     EQU $F440       ; 3 pipes × 320 B  (LEGACY)
 SLOT_ADDR_TABLE_END EQU $F800
+; New structures for inline city emit architecture (coexist with legacy until cleanup in Task 7)
+CITY_TABLE          EQU $F800       ; 96 entries × 6 bytes = 576 B
+CITY_TABLE_END      EQU $FA40
+CITY_TABLE_ENTRIES  EQU 96
+CITY_TABLE_STRIDE   EQU 6
+; Reuse existing scratch labels (sky_a_L, sky_a_M1, ... lmask_temp, rmask_temp, cap_L_temp etc.)
+; defined elsewhere in the source; the inline-city architecture references those addresses
+; rather than allocating fresh ones.
+ACTIVE_LIST_NEW     EQU $FA40       ; 288 bytes (max 144 entries × 2 bytes)
+ACTIVE_COUNT_NEW    EQU $FB60       ; 1 byte
+CAP_SLOT_LIST_NEW   EQU $FB61       ; 24 bytes (6 cap rows × 4 byte addrs each)
+CAP_SLOT_COUNT_NEW  EQU $FB79       ; 1 byte
+BIRD_OVERLAP_NEEDED EQU $FB7A       ; 1 byte
 
         ORG $8000
 
