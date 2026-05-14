@@ -28,66 +28,78 @@ Estimated recycle cost: **~12k T-states** (vs. current ~95k). Recycle frame tota
 
 ## 4. Memory layout
 
-### 4.1 Slot grid — mixed-size by row band
+### 4.1 Slot grid — mixed-size by row band, with per-row EXX
 
 `PIPE_PROGRAM_A` at `$DB00`, 4 KB allocation.
 
-| Band | Rows | Slot bytes | Layout | Total |
-|---|---|---|---|---|
-| Normal | 0..127 | 5 | `$DB00 + row*15 + pipe*5` | 1920 B |
-| City | 128..159 | 10 | `$DB00 + 1920 + (row-128)*30 + pipe*10` | 960 B |
-| Epilogue | — | — | `ld sp, (saved_sp); ret` | ~5 B |
-| **Total** | | | | **~2885 B** |
+| Element | Size | Layout |
+|---|---|---|
+| Normal row (rows 0..127) | 16 B | `[EXX 1B][pipe0 5B][pipe1 5B][pipe2 5B]` |
+| City row (rows 128..159) | 31 B | `[EXX 1B][pipe0 10B][pipe1 10B][pipe2 10B]` |
+| Normal band total | 2048 B | 128 × 16 |
+| City band total | 992 B | 32 × 31 |
+| Epilogue | ~5 B | `ld sp, (saved_sp); ret` |
+| **Grand total** | **~3045 B** | |
 
-Slot addresses are pre-computed at init into `slot_addr_table[160][3]` (960 B at `$F140`, reusing the deprecated `ACTIVE_LIST_B` allocation) for O(1) lookup with no per-access branch.
+**Why the per-row EXX byte:** the current renderer uses **A-pattern body bytes on even rows and B-pattern on odd rows** for row-parity dithering on pipe edges (a load-bearing visual feature — see `pipe_bitmap` vs `pipe_bitmap_b` at main.asm:250 and :265). Implementing this in a fixed grid requires alternating BC/DE between A-values and B-values at each row boundary. A single `exx` instruction (1 byte, 4T) at the start of every row swaps main↔shadow register sets, achieving the alternation with zero per-pipe overhead. `redraw_pipes_v2` sets up main=B, shadow=A at PIPE_PROGRAM entry so the first `exx` at row 0 swaps to main=A for the even row.
 
-**Why mixed:** uniform 5-byte cannot hold the city-band emit (10 bytes minimum: `ld sp, cache; pop bc; pop de; ld sp, screen; push de; push bc`). Uniform 10-byte overflows at 4800 B (allocation is 4096 B). Uniform 8-byte still cannot hold the city emit. Mixed is the only fit.
+Slot addresses are pre-computed at init into `slot_addr_table[160][3]` (960 B at `$F140`, reusing the deprecated `ACTIVE_LIST_B` allocation):
+- Normal: `$DB00 + row*16 + 1 + pipe*5`  (the `+1` skips the row's leading EXX byte)
+- City: `$DB00 + 2048 + (row-128)*31 + 1 + pipe*10`
 
-**Execution model:** code falls straight through slot to slot to slot. No row-transition glue. PIPE_PROGRAM is entered with `call PIPE_PROGRAM` from `redraw_pipes_v2`; the epilogue restores SP and returns.
+**Why mixed normal/city slot sizes:** uniform 5-byte cannot hold the city-band emit (10 bytes minimum: `ld sp, cache; pop bc; pop de; ld sp, screen; push de; push bc`). Uniform 10-byte overflows at 4800 B (allocation is 4096 B). Mixed is the only fit.
+
+**Execution model:** code falls straight through. At each row boundary, the EXX byte fires to swap A↔B; the 3 pipe slots in that row push whichever variant is in the main register set. PIPE_PROGRAM is entered with `call PIPE_PROGRAM` from `redraw_pipes_v2`; the epilogue restores SP and returns.
 
 ### 4.2 Slot templates
 
-**Normal band — 5 bytes each:**
+**Normal band — 5 bytes per pipe slot, plus 1 byte EXX at row start:**
 
-| Template | Bytes | Meaning |
+| Element | Bytes | Meaning |
 |---|---|---|
+| row EXX | `D9` | `exx` — swap main↔shadow register sets (A↔B alternation) |
 | body | `31 lo hi D5 C5` | `ld sp, screen_target; push de; push bc` |
 | skip | `00 00 00 00 00` | 5 × NOP |
 | cap_top | `CD lo hi 00 00` | `call cap_top_handler_pipe_N; nop; nop` |
 | cap_bot | `CD lo hi 00 00` | `call cap_bot_handler_pipe_N; nop; nop` |
 
-**City band — 10 bytes each:**
+**City band — 10 bytes per pipe slot, plus 1 byte EXX at row start:**
 
-| Template | Meaning |
+| Element | Meaning |
 |---|---|
-| body | `ld sp, cache_addr; pop bc; pop de; ld sp, screen_target; push de; push bc` |
+| row EXX | `D9` (`exx`) |
+| body | `31 lc hc C1 D1 31 ls hs D5 C5` = `ld sp, cache_addr; pop bc; pop de; ld sp, screen_target; push de; push bc` |
 | skip | 10 × NOP |
-| cap_top | `call cap_top_city_handler_pipe_N; 7 × nop` |
-| cap_bot | `call cap_bot_city_handler_pipe_N; 7 × nop` |
+| cap_top | `CD lo hi 00 00 00 00 00 00 00` = `call cap_top_handler_pipe_N; 7 × nop` |
+| cap_bot | same shape, `call cap_bot_handler_pipe_N; 7 × nop` |
 
 Only `cap_bot` can land in the city band (requires `gap_y + 48 ≥ 128`, i.e. `gap_y ≥ 80`). City `cap_top` templates exist for symmetry of the slot-write path but are never selected in practice.
 
-### 4.3 Cap handlers — 9 routines total (6 normal + 3 city `cap_bot`)
+### 4.3 Cap handlers — 6 routines (HL-only, A/B agnostic)
 
-Placed in code segment after `init_pipe_program`. ~25 B each normal, ~35 B each city. Total ~225 B.
+Placed in code segment after `init_pipe_program`. ~20 B each. Total ~120 B.
 
 ```
 cap_top_handler_pipe_0:
-    ld (saved_caller_sp), sp     ; preserve call's return-address SP
-    ld sp, cap_top_target_pipe_0 ; SMC imm — patched by patch_pipe_targets each wrap
-    ld bc, cap_top_bc_pipe_0     ; SMC imm — patched by update_cap_imm each frame
-    ld de, cap_top_de_pipe_0     ; SMC imm — patched by update_cap_imm each frame
-    push de
-    push bc
-    ld bc, body_bc_const         ; restore body BC/DE for subsequent slots in row
-    ld de, body_de_const
-    ld sp, (saved_caller_sp)
-    ret
+    ld (saved_caller_sp), sp     ; 4B, 20T — preserve call's return-address SP
+cap_top_handler_pipe_0_target:
+    ld sp, $0000                 ; 3B, 10T — SMC imm, patched by patch_pipe_targets each wrap
+cap_top_handler_pipe_0_de:
+    ld hl, $0000                 ; 3B, 10T — SMC imm, patched by update_cap_imm each frame
+    push hl                      ; 1B, 11T — pushes the M2/R cap byte pair
+cap_top_handler_pipe_0_bc:
+    ld hl, $0000                 ; 3B, 10T — SMC imm, patched by update_cap_imm each frame
+    push hl                      ; 1B, 11T — pushes the L/M1 cap byte pair
+    ld sp, (saved_caller_sp)     ; 4B, 20T
+    ret                          ; 1B, 10T
+                                 ; ≈20 B, ≈112T per call
 ```
 
-The `ld sp, ...; ld (...,)sp` pair around the inner SP-hijack is **load-bearing**: the cap slot enters via `call`, which pushes the return address onto the caller's stack. The inner `ld sp, target` clobbers SP, so without explicit save/restore the `ret` would pop garbage.
+**Why HL instead of BC/DE for the cap pushes:** the cap slot may execute in either main=A or main=B state (depending on row parity), but caps themselves have no A/B variant. Using HL keeps BC/DE untouched, so the row's main register set survives the cap call and is correct for subsequent body slots in the same row. This eliminates the need for A/B-paired cap handlers.
 
-City cap_bot handlers additionally OR-mask their byte writes against `bg_buffer` for cells overlapping cityscape (same algorithm as `update_city_cache_fast`'s city-band paint).
+**The `ld (saved_caller_sp), sp; ld sp, target ... ld sp, (saved_caller_sp); ret` envelope is load-bearing:** the cap slot enters via `call`, which pushes the return address onto the caller's stack. The inner `ld sp, target` clobbers SP, so without explicit save/restore the `ret` would pop garbage.
+
+City cap_bot handlers (when `cap_bot` lands in rows 128..159) use the same handler shape. The OR-with-cityscape masking for city caps happens at `update_cap_imm` time when computing the cap byte imms — not in the handler. So no separate city cap handlers are needed.
 
 The cap-handler `ld sp, <target>` immediate is registered in `active_list` and decrements on every wrap alongside body slot targets.
 
@@ -118,7 +130,8 @@ Replaces `gen_pipe_program`. Called from the recycle handler with the recycling 
 
 ```
 1. Read byte_x from pipe_state[pipe].byte_x
-2. Single pass over rows 0..159; for each row r:
+2. Single pass over rows 0..159; for each row r (the row's leading EXX byte
+   is NOT rewritten — it stays $D9 throughout the grid's lifetime):
      determine slot type for (r, new_gap_y):
        r == new_gap_y - 1               → cap_top
        r == new_gap_y + 48              → cap_bot
@@ -158,11 +171,12 @@ Identical shape and count to the current build: 480 slots in row-major order. Bo
 
 `init_pipe_program`, called once at game start after the existing `init_background` etc.:
 
-1. Build `slot_addr_table[160][3]` using the layout formulas.
-2. Emit cap handler routines (9 of them) into code segment.
-3. For every (row, pipe), write the default body template into the slot with target = `line_table[row] + (initial_byte_x - 1)*2 + 4`.
-4. Write epilogue (`ld sp, (saved_sp); ret`) at the end of the slot grid.
-5. For each pipe, call `configure_pipe_slots(pipe, initial_gap_y[pipe])` to apply the initial cap/skip configuration. This also builds each pipe's initial active sublist.
+1. Build `slot_addr_table[160][3]` using the layout formulas (normal vs city bands).
+2. Cap handler routines (6 of them) are assembled at fixed labels in the code segment — no runtime emit needed.
+3. Write a `$D9` (EXX) byte at the start of every row in the grid (160 rows = 160 EXX bytes total).
+4. For every (row, pipe), write the default body template into the slot with target = `line_table[row] + (initial_byte_x - 1)*2 + 4`.
+5. Write epilogue (`ld sp, (saved_sp); ret`) at the end of the slot grid.
+6. For each pipe, call `configure_pipe_slots(pipe, initial_gap_y[pipe])` to apply the initial cap/skip configuration. This also builds each pipe's initial active sublist.
 
 ## 7. Deletions
 
@@ -192,7 +206,9 @@ The following code becomes dead and is removed:
 
 4. **Active list order assumptions in `patch_pipe_targets`.** Per-pipe sublists differ from current interleaved order. *Mitigation:* audit current `patch_pipe_targets` for any order-dependent SMC links; the walker should be order-independent on correctness (decrement is commutative), but the current SMC-chained jp z structure may assume something subtle.
 
-5. **Body BC/DE constants.** Cap handlers restore body BC/DE from fixed memory; these constants depend on pipe color/style which is currently a single global. *Mitigation:* keep a single `body_bc_const` and `body_de_const` pair in memory; cap handlers `ld bc, (body_bc_const)` to restore (3 bytes per load, 13T) — same shape as the current `ld bc, $imm` reload.
+5. **Per-row EXX correctness.** The leading EXX byte at every row depends on PIPE_PROGRAM being entered with `main=B, shadow=A`. `redraw_pipes_v2` must be modified to load B into BC/DE last (not A) before calling PIPE_PROGRAM. *Mitigation:* explicit setup in `redraw_pipes_v2`; verify in Fuse by single-stepping row 0 entry and confirming even-row pushes are A-pattern bytes.
+
+6. **Cap handler does not touch BC/DE.** Using HL avoids the A/B parity split for caps. *Mitigation:* enforced by handler shape; no runtime check needed but verify pattern visually that row-parity dithering survives caps.
 
 ## 10. Test plan
 
