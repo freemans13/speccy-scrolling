@@ -3798,6 +3798,13 @@ sky_b_M2:        db 0
 sky_b_R:         db 0
 lmask_temp:      db 0
 rmask_temp:      db 0
+; Hoisted per-(pipe, cell) and per-row scratch
+heights_table:   ds 12             ; 3 pipes × 4 cells
+colcells_table:  ds 12
+sky_row:         ds 4              ; active variant's L M1 M2 R for current row
+threshold_temp:  db 0
+bg_row_lo:       db 0
+bg_row_hi:       db 0
 
 update_city_cache:
         ; --- HOIST 1: phase byte values for sky-A and sky-B ---
@@ -3841,130 +3848,180 @@ update_city_cache:
         ld      a, (hl)
         ld      (rmask_temp), a
 
-        ld      iy, CITY_CACHE          ; output cursor
-        ld      a, CITY_TOP
-        ld      (city_row_temp), a
-.row_lp:
-        xor     a
-        ld      (city_pipe_temp), a
-.pipe_lp:
-        ; Load this pipe's byte_x -> city_bx_temp
+        ; --- HOIST 3: heights and col_cells per (pipe, cell) ---
+        ld      iy, heights_table
+        ld      ix, colcells_table
+        ld      b, 0                    ; pipe index (0..2)
+.hp_lp:
         ld      hl, pipe_state
-        ld      a, (city_pipe_temp)
-        add     a, a                    ; pipe * 2 (entry stride)
-        ld      e, a
-        ld      d, 0
-        add     hl, de
-        ld      a, (hl)                 ; byte_x
-        ld      (city_bx_temp), a
-
-        xor     a
-        ld      (city_cell_temp), a
-.cell_lp:
-        call    .fill_one_cell          ; writes 1 byte at IY, advances IY
-        inc     iy
-        ld      a, (city_cell_temp)
-        inc     a
-        ld      (city_cell_temp), a
-        cp      4
-        jr      c, .cell_lp
-
-        ld      a, (city_pipe_temp)
-        inc     a
-        ld      (city_pipe_temp), a
-        cp      NUM_PIPES
-        jr      c, .pipe_lp
-
-        ld      a, (city_row_temp)
-        inc     a
-        ld      (city_row_temp), a
-        cp      GROUND_TOP              ; = CITY_BOTTOM = 160
-        jr      c, .row_lp
-        ret
-
-.fill_one_cell:
-        ; --- Compute col_cell = byte_x + cell - 1 ---
-        ld      a, (city_bx_temp)
-        ld      hl, city_cell_temp
-        add     a, (hl)
-        dec     a
-        ld      e, a                    ; E = col_cell
-
-        ; --- Pick HOISTED sky-variant byte for this (row parity, cell) ---
-        ld      a, (city_row_temp)
-        and     1
-        jr      nz, .use_b
-        ld      hl, sky_a_L
-        jr      .have_bitmap
-.use_b:
-        ld      hl, sky_b_L
-.have_bitmap:
-        ld      a, (city_cell_temp)
-        ld      c, a
-        ld      b, 0
-        add     hl, bc                  ; HL -> sky_X[cell]
-        ld      a, (hl)
-        ld      b, a                    ; B = pipe byte (sky variant)
-
-        ; --- Decide if cell is in front of a building ---
-        ld      d, 0
-        ld      hl, cityscape_heights
-        add     hl, de
-        ld      a, (hl)
-        ld      c, a                    ; C = height
-        ld      a, CITY_BOTTOM
-        ld      hl, city_row_temp
-        sub     (hl)
-        cp      c
-        jr      z, .is_city
-        jr      c, .is_city
-
-.write_b:
-        ld      (iy+0), b
-        ret
-
-.is_city:
-        ld      a, (city_cell_temp)
-        or      a
-        jr      z, .city_L
-        cp      3
-        jr      z, .city_R
-        ; M1 or M2: fully inside pipe, no OR
-        ld      (iy+0), b
-        ret
-
-.city_L:
-        ld      a, (lmask_temp)
-        jr      .or_masked_bg
-.city_R:
-        ld      a, (rmask_temp)
-.or_masked_bg:
-        ld      c, a                    ; C = mask
-        ld      a, (city_row_temp)
+        ld      a, b
+        add     a, a
+        add     a, l
         ld      l, a
+        ld      a, (hl)                 ; A = byte_x
+        ld      d, a                    ; D = byte_x (preserved)
+        ld      e, 0                    ; E = cell index
+.hc_lp:
+        ld      a, d
+        add     a, e
+        dec     a                       ; A = col_cell
+        ld      (ix+0), a               ; store col_cell
+        ld      l, a
+        ld      h, 0
+        push    de
+        ld      de, cityscape_heights
+        add     hl, de
+        pop     de
+        ld      a, (hl)
+        ld      (iy+0), a               ; store height
+        inc     iy
+        inc     ix
+        inc     e
+        ld      a, e
+        cp      4
+        jr      c, .hc_lp
+        inc     b
+        ld      a, b
+        cp      NUM_PIPES
+        jr      c, .hp_lp
+
+        ; --- WALK ROWS: flat, hoisted, no per-cell call ---
+        ld      iy, CITY_CACHE          ; output cursor
+        ld      b, CITY_TOP             ; B = row
+.row_lp:
+        ; threshold = CITY_BOTTOM - row
+        ld      a, CITY_BOTTOM
+        sub     b
+        ld      (threshold_temp), a
+
+        ; bg_buffer row base (low/high stored as 2 consecutive bytes for ld de,(nn))
+        ld      l, b
         ld      h, 0
         add     hl, hl
         ld      de, line_table
         add     hl, de
         ld      a, (hl)
-        ld      e, a
+        ld      (bg_row_lo), a
         inc     hl
         ld      a, (hl)
         or      $80
-        ld      d, a                    ; DE = bg_buffer row base
-        ld      a, (city_bx_temp)
-        ld      hl, city_cell_temp
-        add     a, (hl)
-        dec     a                       ; A = col_cell
-        add     a, e
-        ld      e, a
-        jr      nc, .no_carry
-        inc     d
-.no_carry:
-        ld      a, (de)
-        and     c
-        or      b
+        ld      (bg_row_hi), a
+
+        ; Pick sky variant by row parity, copy 4 bytes into sky_row
+        ld      a, b
+        and     1
+        jr      nz, .pick_b
+        ld      hl, sky_a_L
+        jr      .have_pick
+.pick_b:
+        ld      hl, sky_b_L
+.have_pick:
+        ld      de, sky_row
+        push    bc                      ; preserve B (row), C unused
+        ldi
+        ldi
+        ldi
+        ldi
+        pop     bc
+
+        ; Walk 3 pipes inline (IX = heights, HL = col_cells, advance by 4 per pipe)
+        ld      ix, heights_table
+        ld      hl, colcells_table
+        ld      c, 0                    ; C = pipe (0..2)
+.r_pipe_lp:
+        ; --- Cell 0 (L) ---
+        ld      a, (ix+0)
+        ld      d, a                    ; D = height_L
+        ld      a, (threshold_temp)
+        cp      d
+        jr      z, .c0_city
+        jr      c, .c0_city
+        ld      a, (sky_row+0)
         ld      (iy+0), a
+        jr      .c0_done
+.c0_city:
+        ld      a, (hl)                 ; col_cell_L
+        push    hl
+        ld      l, a
+        ld      h, 0
+        ld      de, (bg_row_lo)         ; DE = bg_row_base (16-bit load: E=lo, D=hi)
+        add     hl, de
+        ld      a, (hl)                 ; bg byte
+        ld      d, a
+        ld      a, (lmask_temp)
+        and     d                       ; A = mask & bg
+        ld      d, a
+        ld      a, (sky_row+0)
+        or      d                       ; A = pipe | masked bg
+        ld      (iy+0), a
+        pop     hl
+.c0_done:
+        inc     iy
+
+        ; --- Cell 1 (M1): always sky byte (no OR, no height check) ---
+        ld      a, (sky_row+1)
+        ld      (iy+0), a
+        inc     iy
+
+        ; --- Cell 2 (M2): always sky byte ---
+        ld      a, (sky_row+2)
+        ld      (iy+0), a
+        inc     iy
+
+        ; --- Cell 3 (R) ---
+        ld      a, (ix+3)
+        ld      d, a                    ; D = height_R
+        ld      a, (threshold_temp)
+        cp      d
+        jr      z, .c3_city
+        jr      c, .c3_city
+        ld      a, (sky_row+3)
+        ld      (iy+0), a
+        jr      .c3_done
+.c3_city:
+        push    hl
+        inc     hl
+        inc     hl
+        inc     hl                      ; HL → col_cells_R for this pipe
+        ld      a, (hl)
+        pop     hl
+        push    hl
+        ld      l, a
+        ld      h, 0
+        ld      de, (bg_row_lo)
+        add     hl, de
+        ld      a, (hl)
+        ld      d, a
+        ld      a, (rmask_temp)
+        and     d
+        ld      d, a
+        ld      a, (sky_row+3)
+        or      d
+        ld      (iy+0), a
+        pop     hl
+.c3_done:
+        inc     iy
+
+        ; Advance IX and HL by 4 (next pipe's heights/colcells)
+        inc     ix
+        inc     ix
+        inc     ix
+        inc     ix
+        inc     hl
+        inc     hl
+        inc     hl
+        inc     hl
+
+        inc     c
+        ld      a, c
+        cp      NUM_PIPES
+        jp      c, .r_pipe_lp
+
+        inc     b
+        ld      a, b
+        cp      GROUND_TOP
+        jp      c, .row_lp
+
         ret
 
 ;----------------------------------------------------------------
