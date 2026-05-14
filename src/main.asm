@@ -1169,17 +1169,15 @@ gen_pipe_program:
         ld      de, 11
         add     iy, de
 
-        ; --- If cap_bot, emit BC/DE restore (8 more bytes) ---
-        ld      a, (.cap_idx_temp)
-        cp      4
-        jp      nz, .pipe_done          ; cap_top — no restore needed
-
-        ; ld bc, (body_a_bc) — opcode ED 4B nn nn
+        ; --- ALWAYS emit BC/DE restore (8 bytes) for both cap_top and cap_bot. ---
+        ; The cap emit clobbered BC and DE. Subsequent pipes' body emits on the
+        ; SAME row use BC/DE (push de/push bc); without this restore they would
+        ; push cap bytes instead of body bytes, producing the visible artifact
+        ; where pipes after a clobbering pipe show cap pixels in their body.
         ld      (iy+0), $ED
         ld      (iy+1), $4B
         ld      (iy+2), low body_a_bc
         ld      (iy+3), high body_a_bc
-        ; ld de, (body_a_de) — opcode ED 5B nn nn
         ld      (iy+4), $ED
         ld      (iy+5), $5B
         ld      (iy+6), low body_a_de
@@ -1328,6 +1326,21 @@ gen_pipe_program:
         ld      (iy+8), $D5
         ld      (iy+9), $C5
         ld      de, 10
+        add     iy, de
+
+        ; --- Emit BC/DE restore (8 bytes) after city emit. ---
+        ; City emit's pop bc / pop de clobbers BC/DE. Subsequent pipes' body
+        ; emits on the SAME row would push cache bytes; restore here so the
+        ; main register set holds sky-A body bytes again.
+        ld      (iy+0), $ED
+        ld      (iy+1), $4B
+        ld      (iy+2), low body_a_bc
+        ld      (iy+3), high body_a_bc
+        ld      (iy+4), $ED
+        ld      (iy+5), $5B
+        ld      (iy+6), low body_a_de
+        ld      (iy+7), high body_a_de
+        ld      de, 8
         add     iy, de
         jp      .pipe_done
 
