@@ -784,6 +784,488 @@ init_pipe_program:
 ipp_byte_x: ds 3, 0                    ; scratch: byte_x per pipe (3 bytes)
 
 ;----------------------------------------------------------------
+; configure_pipe_slots(A=pipe 0..2, E=new_gap_y 1..111)
+;
+; Re-templates all 160 slots for one pipe based on new_gap_y:
+;   row == new_gap_y - 1                  → cap_top  template
+;   row == new_gap_y + PIPE_GAP           → cap_bot  template
+;   new_gap_y <= row < new_gap_y+PIPE_GAP → skip     template
+;   otherwise                             → body     template
+;
+; Also rebuilds that pipe's active sublist (ACTIVE_PIPE_N).
+; After the row loop, patches cap_top/cap_bot handler target imms.
+; Finally stores new_gap_y → pipe_state[pipe*2 + 1].
+;
+; Scratch memory: cps_pipe, cps_gap_y, cps_byte_x, cps_cap_top_row,
+;   cps_cap_bot_row, cps_cap_top_handler_addr, cps_cap_bot_handler_addr.
+;----------------------------------------------------------------
+configure_pipe_slots:
+        ; ── Save args ────────────────────────────────────────────
+        ld      (cps_pipe), a
+        ld      a, e
+        ld      (cps_gap_y), a
+
+        ; ── Cache byte_x for this pipe ───────────────────────────
+        ; pipe_state layout: db byte_x, gap_y  (2B per pipe)
+        ld      a, (cps_pipe)
+        add     a, a                    ; pipe*2
+        ld      hl, pipe_state
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_bx_nc
+        inc     h
+.cps_bx_nc:
+        ld      a, (hl)                 ; A = byte_x for this pipe
+        ld      (cps_byte_x), a
+
+        ; ── Pre-compute cap rows ──────────────────────────────────
+        ld      a, (cps_gap_y)
+        dec     a
+        ld      (cps_cap_top_row), a    ; cap_top_row = gap_y - 1
+        ld      a, (cps_gap_y)
+        add     a, PIPE_GAP
+        ld      (cps_cap_bot_row), a    ; cap_bot_row = gap_y + 48
+
+        ; ── Load cap_top handler address ─────────────────────────
+        ld      a, (cps_pipe)
+        add     a, a                    ; pipe*2
+        ld      hl, cap_top_handler_addrs
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_th_nc
+        inc     h
+.cps_th_nc:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (cps_cap_top_handler_addr), de
+
+        ; ── Load cap_bot handler address ─────────────────────────
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      hl, cap_bot_handler_addrs
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_bh_nc
+        inc     h
+.cps_bh_nc:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (cps_cap_bot_handler_addr), de
+
+        ; ── Load active sublist base ──────────────────────────────
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      hl, cps_sublist_base_table
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_sl_nc
+        inc     h
+.cps_sl_nc:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = active sublist write cursor
+
+        ; ── Main row loop: B = row 0..159 ────────────────────────
+        ld      b, 0
+.cps_row_lp:
+        push    bc                      ; save B=row
+        push    de                      ; save active-list cursor
+
+        ; ── Look up slot address: SLOT_ADDR_TABLE[(row*3+pipe)*2] ──
+        ld      l, b
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      d, h
+        ld      e, l                    ; DE_tmp = row*2
+        add     hl, hl                  ; row*4
+        add     hl, de                  ; row*6
+        ld      a, (cps_pipe)
+        add     a, a                    ; pipe*2
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_tbl_nc
+        inc     h
+.cps_tbl_nc:
+        ld      de, SLOT_ADDR_TABLE
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = slot address
+        push    de
+        pop     iy                      ; IY = slot base
+
+        ; ── Determine slot type via clean comparisons ─────────────
+        ; Priority: cap_top → cap_bot → skip (gap range) → body
+        ld      a, (cps_cap_top_row)
+        cp      b
+        jp      z, .cps_do_cap_top
+
+        ld      a, (cps_cap_bot_row)
+        cp      b
+        jp      z, .cps_do_cap_bot
+
+        ; skip if gap_y <= row < cap_bot_row
+        ld      a, b                    ; A = row
+        ld      c, a                    ; C = row (saved for compare)
+        ld      a, (cps_gap_y)
+        cp      c                       ; gap_y vs row
+        jp      z, .cps_do_skip         ; row == gap_y → skip
+        jp      c, .cps_do_body         ; gap_y > row → body (carry: gap_y < row false)
+        ; gap_y < row; skip if row < cap_bot_row
+        ld      a, (cps_cap_bot_row)
+        cp      c                       ; cap_bot_row vs row
+        jp      c, .cps_do_body         ; cap_bot_row < row → body
+        jp      .cps_do_skip            ; cap_bot_row >= row → skip (row in gap)
+
+        ; ── cap_top template ─────────────────────────────────────
+.cps_do_cap_top:
+        ld      a, b
+        cp      CITY_TOP
+        jr      nc, .cps_ct_city
+        ld      hl, (cps_cap_top_handler_addr)
+        ld      (iy+0), $CD
+        ld      (iy+1), l
+        ld      (iy+2), h
+        ld      (iy+3), $00
+        ld      (iy+4), $00
+        jr      .cps_ct_emit_active
+.cps_ct_city:
+        ld      hl, (cps_cap_top_handler_addr)
+        ld      (iy+0), $CD
+        ld      (iy+1), l
+        ld      (iy+2), h
+        ld      (iy+3), $00
+        ld      (iy+4), $00
+        ld      (iy+5), $00
+        ld      (iy+6), $00
+        ld      (iy+7), $00
+        ld      (iy+8), $00
+        ld      (iy+9), $00
+.cps_ct_emit_active:
+        ; Active entry = cap_top_target_imm_addrs[pipe] (2 bytes)
+        pop     de                      ; restore sublist cursor
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      hl, cap_top_target_imm_addrs
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_ct_imm_nc
+        inc     h
+.cps_ct_imm_nc:
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        inc     hl
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        push    de
+        jp      .cps_row_done
+
+        ; ── cap_bot template ─────────────────────────────────────
+.cps_do_cap_bot:
+        ld      a, b
+        cp      CITY_TOP
+        jr      nc, .cps_cb_city
+        ld      hl, (cps_cap_bot_handler_addr)
+        ld      (iy+0), $CD
+        ld      (iy+1), l
+        ld      (iy+2), h
+        ld      (iy+3), $00
+        ld      (iy+4), $00
+        jr      .cps_cb_emit_active
+.cps_cb_city:
+        ld      hl, (cps_cap_bot_handler_addr)
+        ld      (iy+0), $CD
+        ld      (iy+1), l
+        ld      (iy+2), h
+        ld      (iy+3), $00
+        ld      (iy+4), $00
+        ld      (iy+5), $00
+        ld      (iy+6), $00
+        ld      (iy+7), $00
+        ld      (iy+8), $00
+        ld      (iy+9), $00
+.cps_cb_emit_active:
+        pop     de
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      hl, cap_bot_target_imm_addrs
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_cb_imm_nc
+        inc     h
+.cps_cb_imm_nc:
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        inc     hl
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        push    de
+        jp      .cps_row_done
+
+        ; ── skip template ────────────────────────────────────────
+.cps_do_skip:
+        ld      a, b
+        cp      CITY_TOP
+        jr      nc, .cps_skip_city
+        ld      (iy+0), $00
+        ld      (iy+1), $00
+        ld      (iy+2), $00
+        ld      (iy+3), $00
+        ld      (iy+4), $00
+        jr      .cps_skip_done
+.cps_skip_city:
+        ld      (iy+0), $00
+        ld      (iy+1), $00
+        ld      (iy+2), $00
+        ld      (iy+3), $00
+        ld      (iy+4), $00
+        ld      (iy+5), $00
+        ld      (iy+6), $00
+        ld      (iy+7), $00
+        ld      (iy+8), $00
+        ld      (iy+9), $00
+.cps_skip_done:
+        pop     de                      ; no active list entry for skip
+        push    de
+        jp      .cps_row_done
+
+        ; ── body template ────────────────────────────────────────
+.cps_do_body:
+        ld      a, b
+        cp      CITY_TOP
+        jp      nc, .cps_body_city
+
+        ; Normal body: 31 lo hi D5 C5
+        ; screen_target = line_table[row] + byte_x + 3
+        ld      l, b
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = line_addr
+        ld      a, (cps_byte_x)
+        add     a, 3
+        add     a, e
+        ld      l, a
+        ld      h, d
+        jr      nc, .cps_nb_nc
+        inc     h
+.cps_nb_nc:
+        ld      (iy+0), $31
+        ld      (iy+1), l
+        ld      (iy+2), h
+        ld      (iy+3), $D5
+        ld      (iy+4), $C5
+        ; Active entry: slot_addr + 1 (target imm lo byte)
+        pop     de
+        push    iy
+        pop     hl                      ; HL = slot base
+        inc     hl                      ; HL = slot_addr + 1
+        ld      a, l
+        ld      (de), a
+        inc     de
+        ld      a, h
+        ld      (de), a
+        inc     de
+        push    de
+        jp      .cps_row_done
+
+.cps_body_city:
+        ; City body: 31 cache_lo cache_hi C1 D1 31 screen_lo screen_hi D5 C5
+        ; cache_addr = CITY_CACHE + (row - CITY_TOP)*12 + pipe*4
+        ld      a, b
+        sub     CITY_TOP                ; A = row - 128
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; *2
+        add     hl, hl                  ; *4
+        ld      d, h
+        ld      e, l                    ; DE = (row-CITY_TOP)*4
+        add     hl, hl                  ; *8
+        add     hl, de                  ; *12
+        ld      de, CITY_CACHE
+        add     hl, de                  ; HL = CITY_CACHE + (row-CITY_TOP)*12
+        ld      a, (cps_pipe)
+        add     a, a
+        add     a, a                    ; pipe*4
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_cbc_nc
+        inc     h
+.cps_cbc_nc:
+        ; HL = cache_addr
+        ld      (iy+0), $31
+        ld      (iy+1), l
+        ld      (iy+2), h
+        ld      (iy+3), $C1             ; pop bc
+        ld      (iy+4), $D1             ; pop de
+        ; screen_target = line_table[row] + byte_x + 3
+        ld      a, b
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = line_addr
+        ld      a, (cps_byte_x)
+        add     a, 3
+        add     a, e
+        ld      l, a
+        ld      h, d
+        jr      nc, .cps_cbs_nc
+        inc     h
+.cps_cbs_nc:
+        ld      (iy+5), $31
+        ld      (iy+6), l
+        ld      (iy+7), h
+        ld      (iy+8), $D5
+        ld      (iy+9), $C5
+        ; Active entry: slot_addr + 6 (screen target lo byte)
+        pop     de
+        push    iy
+        pop     hl                      ; HL = slot base
+        ld      a, l
+        add     a, 6
+        ld      l, a
+        jr      nc, .cps_cba_nc
+        inc     h
+.cps_cba_nc:
+        ld      a, l
+        ld      (de), a
+        inc     de
+        ld      a, h
+        ld      (de), a
+        inc     de
+        push    de
+
+.cps_row_done:
+        pop     de                      ; restore sublist cursor
+        pop     bc                      ; restore B=row
+        inc     b
+        ld      a, b
+        cp      GROUND_TOP              ; 160
+        jp      nz, .cps_row_lp
+
+        ; ── Patch cap_top handler target imm ─────────────────────
+        ; target = line_table[cap_top_row] + byte_x + 3
+        ld      a, (cps_cap_top_row)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; row*2
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = line_addr
+        ld      a, (cps_byte_x)
+        add     a, 3
+        add     a, e
+        ld      l, a
+        ld      h, d
+        jr      nc, .cps_ct_patch_nc
+        inc     h
+.cps_ct_patch_nc:
+        ; HL = screen target; write to cap_top_target_imm_addrs[pipe]
+        push    hl                      ; save target
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      de, cap_top_target_imm_addrs
+        add     a, e
+        ld      e, a
+        jr      nc, .cps_ctw_nc
+        inc     d
+.cps_ctw_nc:
+        ld      a, (de)
+        ld      c, a
+        inc     de
+        ld      a, (de)
+        ld      b, a                    ; BC = address of imm lo byte in handler
+        pop     hl                      ; restore target
+        ld      a, l
+        ld      (bc), a                 ; write lo byte
+        inc     bc
+        ld      a, h
+        ld      (bc), a                 ; write hi byte
+
+        ; ── Patch cap_bot handler target imm ─────────────────────
+        ld      a, (cps_cap_bot_row)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      a, (cps_byte_x)
+        add     a, 3
+        add     a, e
+        ld      l, a
+        ld      h, d
+        jr      nc, .cps_cb_patch_nc
+        inc     h
+.cps_cb_patch_nc:
+        push    hl
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      de, cap_bot_target_imm_addrs
+        add     a, e
+        ld      e, a
+        jr      nc, .cps_cbw_nc
+        inc     d
+.cps_cbw_nc:
+        ld      a, (de)
+        ld      c, a
+        inc     de
+        ld      a, (de)
+        ld      b, a
+        pop     hl
+        ld      a, l
+        ld      (bc), a
+        inc     bc
+        ld      a, h
+        ld      (bc), a
+
+        ; ── Store new_gap_y → pipe_state[pipe*2 + 1] ─────────────
+        ld      a, (cps_pipe)
+        add     a, a                    ; pipe*2
+        inc     a                       ; pipe*2 + 1
+        ld      hl, pipe_state
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_store_nc
+        inc     h
+.cps_store_nc:
+        ld      a, (cps_gap_y)
+        ld      (hl), a
+        ret
+
+; ── Scratch variables for configure_pipe_slots ───────────────────
+cps_pipe:               db 0
+cps_gap_y:              db 0
+cps_byte_x:             db 0
+cps_cap_top_row:        db 0
+cps_cap_bot_row:        db 0
+cps_cap_top_handler_addr: dw 0
+cps_cap_bot_handler_addr: dw 0
+
+; ── Per-pipe active sublist base table ───────────────────────────
+cps_sublist_base_table:
+        dw      ACTIVE_PIPE_0
+        dw      ACTIVE_PIPE_1
+        dw      ACTIVE_PIPE_2
+
+;----------------------------------------------------------------
 ; init_background: fill bg_buffer with sky + cityscape, then blit
 ; the buffer to the screen
 ;----------------------------------------------------------------
