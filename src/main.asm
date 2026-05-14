@@ -5440,12 +5440,20 @@ patch_city_slot_cache_addrs:
         pop     hl                     ; HL = cache_addr (was DE)
         push    bc
 
+        ; If slot's first byte is NOT $31 (ld sp,nn city-body opcode), this
+        ; row is a cap (JP $C3) or skip slot — DO NOT patch, doing so would
+        ; clobber the cap's JP-target imm and break dispatch.
+        ld      a, (de)
+        cp      $31
+        jr      nz, .pcsca_skip_patch
+
         inc     de                     ; DE → slot+1 (lo byte of ld sp imm)
         ld      a, l
         ld      (de), a
         inc     de                     ; DE → slot+2 (hi byte of ld sp imm)
         ld      a, h
         ld      (de), a
+.pcsca_skip_patch:
 
         pop     bc                     ; restore row_idx (B), pipe (C)
         pop     hl                     ; restore city_slot_bases cursor
