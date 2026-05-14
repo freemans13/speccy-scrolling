@@ -65,6 +65,15 @@ CITY_OVERLAY_END       EQU $F140
 SLOT_ADDR_TABLE        EQU $F440       ; 480 entries × 2 B = 960 B
 SLOT_ADDR_TABLE_END    EQU $F800
 
+; ─── City base look-up table ──────────────────────────────────────
+; Placed at BG_BUFFER ($C000) — that memory is written at init_background
+; and read back only during redraw; after init_city_base_lut overwrites the
+; first 1856 bytes the LUT is static for the whole game.
+; Layout: byte_x-major, 29 × 32 × 2 bytes = 1856 bytes.
+;   city_base_lut[(byte_x-1)*64 + row_idx*2]  →  2-byte LE bitmap base addr
+; $C000 + 1856 = $C740; BACKUP_ATTRS at $D800 — no conflict.
+CITY_BASE_LUT          EQU $C000       ; 1856 B  ($C000..$C73F)
+
 ; ─── Legacy unchanged ────────────────────────────────────────────
 TARGET_TABLE           EQU $F080       ; 3 pipes × 320 B  (LEGACY)
 TARGET_TABLE_END       EQU $F440
@@ -93,6 +102,7 @@ start:
         call    init_background
         call    refill_base_attrs       ; convert row 16..19 to sky + per-cell city
         call    backup_base_attrs       ; snapshot ATTRS → BACKUP_ATTRS (no pipes)
+        call    init_city_base_lut      ; pre-compute city_base_lut[29×32] at $C000
         call    init_pipes              ; draws pipes (pixels) — attrs still base
         call    init_bird
         call    apply_pipe_attrs        ; overlay ATTR_PIPE at initial pipe positions
@@ -1487,12 +1497,106 @@ init_pipes:
         inc     a
         cp      NUM_PIPES
         jr      nz, .init_cps_lp
-        call    build_city_slot_bases   ; init city body cache pointer table
+        ; city_base_lut was pre-built by init_city_base_lut before init_pipes.
         ; ACTIVE_COUNT_NEW = 3 * 112 = 336 (used by patch_pipe_targets to walk
         ; the three per-pipe sublists at ACTIVE_PIPE_0..PIPE_2 contiguously).
         ld      hl, 336
         ld      (ACTIVE_COUNT_NEW), hl
         call    redraw_pipes_v2
+        ret
+
+;----------------------------------------------------------------
+; init_city_base_lut: pre-compute city_base_lut[byte_x=1..29][row_idx=0..31].
+;
+; For every (byte_x, row_idx) pair:
+;   col_L     = byte_x - 1
+;   col_R     = byte_x + 2
+;   threshold = 32 - row_idx          (= CITY_BOTTOM - (CITY_TOP + row_idx))
+;   has_city  = (heights[col_L] >= threshold) OR (heights[col_R] >= threshold)
+;   parity    = row_idx & 1
+;   base      = parity ? pipe_bitmap_city_b
+;             : has_city ? pipe_bitmap_city_a
+;             : pipe_bitmap              (sky)
+;   if NOT has_city: base = pipe_bitmap  (sky, regardless of parity)
+;
+; Result stored at CITY_BASE_LUT + (byte_x-1)*64 + row_idx*2 (LE 16-bit).
+; Total 29*32*2 = 1856 bytes at $C000..$C73F — inside BG_BUFFER which is
+; freed after init_background/init_city_base_lut; no overlap with BACKUP_ATTRS
+; ($D800+) or SLOT_GRID_BASE ($DB00+).
+;
+; Clobbers AF, BC, DE, HL, IX.
+;----------------------------------------------------------------
+init_city_base_lut:
+        ; IX = write cursor into LUT
+        ld      ix, CITY_BASE_LUT
+
+        ld      b, 1                    ; B = byte_x (1..29)
+.icbl_bx_lp:
+        ; col_L = byte_x - 1 (B-1); col_R = byte_x + 2 (B+2)
+        ; Read h_L = cityscape_heights[byte_x-1]
+        ld      a, b
+        dec     a                       ; A = col_L
+        ld      l, a
+        ld      h, 0
+        ld      de, cityscape_heights
+        add     hl, de
+        ld      c, (hl)                 ; C = h_L
+
+        ; Read h_R = cityscape_heights[byte_x+2]
+        ld      a, b
+        add     a, 2                    ; A = col_R
+        ld      l, a
+        ld      h, 0
+        ld      de, cityscape_heights
+        add     hl, de
+        ld      d, (hl)                 ; D = h_R
+
+        ; Inner loop: row_idx 0..31
+        ; threshold starts at 32 and decrements
+        ld      e, 32                   ; E = threshold (32-row_idx), starts at 32
+
+.icbl_row_lp:
+        ; Check has_city = (h_L >= threshold) OR (h_R >= threshold)
+        ld      a, c                    ; A = h_L
+        cp      e                       ; h_L - threshold; nc if h_L >= threshold
+        jr      nc, .icbl_city
+
+        ld      a, d                    ; A = h_R
+        cp      e
+        jr      nc, .icbl_city
+
+        ; No city: base = pipe_bitmap
+        ld      hl, pipe_bitmap
+        jr      .icbl_store
+
+.icbl_city:
+        ; has_city: pick variant by parity = (32-E) & 1 = E & 1 (same parity)
+        ; row_idx = 32 - E; parity = row_idx & 1 = (32-E) & 1 = E & 1 (32 even)
+        ld      a, e
+        and     1
+        jr      nz, .icbl_city_b        ; E odd → row_idx odd → B variant
+        ld      hl, pipe_bitmap_city_a
+        jr      .icbl_store
+.icbl_city_b:
+        ld      hl, pipe_bitmap_city_b
+
+.icbl_store:
+        ; Write HL (base addr) LE at (IX)
+        ld      (ix+0), l
+        ld      (ix+1), h
+        inc     ix
+        inc     ix
+
+        ; Advance: threshold--; stop when threshold reaches 0 (row_idx = 32)
+        dec     e
+        jr      nz, .icbl_row_lp
+
+        ; Next byte_x
+        inc     b
+        ld      a, b
+        cp      30                      ; byte_x in 1..29 → stop when B reaches 30
+        jr      nz, .icbl_bx_lp
+
         ret
 
 ;----------------------------------------------------------------
@@ -1548,8 +1652,7 @@ frame_update:
         ld      e, (hl)
         pop     af
         call    configure_pipe_slots
-        ld      a, (recycled_pipe_idx)
-        call    build_city_slot_bases_pipe   ; rebuild only this pipe's 32 entries (~3k vs ~10k T)
+        ; city_base_lut is static (built once at init) — no rebuild needed here.
 .no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
@@ -5648,42 +5751,156 @@ bcsb_pipe_limit: db NUM_PIPES  ; outer loop limit (NUM_PIPES = all, pipe+1 = sin
 
 ;----------------------------------------------------------------
 ; patch_city_slot_cache_addrs: per-frame SMC patch of city body slot cache_addrs.
-; Walks city_patch_table (96 × 4-byte entries) via SP-hijack (pop).
-; Each entry: target (slot+1 addr), base (bitmap base).
-; Computes cache_addr = base + phase*4, writes lo/hi at (target)/(target+1).
-; Cap slots have target=city_patch_scratch, base=0 → write is harmless.
 ;
-; Per-slot cost ~72T. Total for 96 slots ~7000T (was ~12000T).
+; NEW implementation — uses city_base_lut (pre-built at $C000) instead of the
+; stale city_patch_table populated by build_city_slot_bases.
+;
+; For each pipe (0..2):
+;   byte_x = pipe_state[pipe*2]
+;   lut_ptr = CITY_BASE_LUT + (byte_x-1)*64    ; row cursor into LUT
+;   For each row_idx (0..31):
+;     base  = (lut_ptr)  (LE 16-bit)           ; pipe_bitmap / city_a / city_b
+;     cache = base + phase*4
+;     sat_idx = (128+row_idx)*3 + pipe          ; SLOT_ADDR_TABLE entry
+;     slot_addr = SLOT_ADDR_TABLE[sat_idx*2]
+;     if (slot_addr) == $31:                    ; body slot?
+;       (slot_addr+1)   = cache_lo
+;       (slot_addr+2)   = cache_hi             ; +2 because slot is ld sp,nn
+;     lut_ptr += 2
+;
+; Per-slot cost ~80T (LUT read + cache calc + SAT lookup + opcode check + write).
+; Total for 96 slots ~7700T; per-pipe LUT setup ~50T extra.  Total ~7850T.
+; Eliminates stale city_patch_table bug (byte_x drift between recycles).
+;
 ; Clobbers AF, BC, DE, HL. Saves/restores SP.
 ;----------------------------------------------------------------
 patch_city_slot_cache_addrs:
+        ; Phase offset: C = phase * 4
         ld      a, (phase)
         add     a, a
-        add     a, a                    ; A = phase * 4 (0..28)
-        ld      c, a                    ; C = phase_offset
+        add     a, a                    ; A = phase * 4
+        ld      (pcsca_phase_off), a    ; stash — C used differently inside loops
 
-        ld      (pcsca_saved_sp), sp
-        ld      sp, city_patch_table    ; SP-hijack: pop walks the table
-        ld      b, 96                   ; 96 entries
+        ld      b, 0                    ; B = pipe index (0..2)
+.pcsca_pipe_lp:
+        ; ------ per-pipe setup: compute lut_row_ptr ------
+        ; byte_x = pipe_state[pipe*2]
+        ld      a, b
+        add     a, a                    ; A = pipe*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state
+        add     hl, de
+        ld      a, (hl)                 ; A = byte_x
 
-.pcsca_lp:
-        pop     hl                      ; HL = target addr (slot+1) — 10T
-        pop     de                      ; DE = base addr              — 10T
-        ; cache_addr = base + phase_offset
-        ld      a, e
-        add     a, c                    ; A = base_lo + phase_off     — 4T+4T
-        ld      e, a                    ; E = cache_lo                — 4T
+        ; lut_ptr = CITY_BASE_LUT + (byte_x-1)*64
+        dec     a                       ; A = byte_x-1
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; *2
+        add     hl, hl                  ; *4
+        add     hl, hl                  ; *8
+        add     hl, hl                  ; *16
+        add     hl, hl                  ; *32
+        add     hl, hl                  ; *64
+        ld      de, CITY_BASE_LUT
+        add     hl, de                  ; HL = lut_ptr (first row_idx=0 entry)
+        ld      (pcsca_lut_ptr), hl
+
+        ; ------ inner loop: row_idx 0..31 ------
+        ; C = row_idx
+        ld      c, 0
+.pcsca_row_lp:
+        ; Read base address from LUT (LE 16-bit)
+        ld      hl, (pcsca_lut_ptr)
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        inc     hl
+        ld      (pcsca_lut_ptr), hl     ; advance cursor by 2
+
+        ; cache = base + phase_offset
+        ld      a, (pcsca_phase_off)
+        add     a, e                    ; cache_lo = base_lo + phase_off
+        ld      e, a
         ld      a, d
-        adc     a, 0                    ; A = base_hi + carry         — 4T+7T
-        ld      d, a                    ; D = cache_hi                — 4T
-        ; Write cache_lo at (HL), cache_hi at (HL+1)
-        ld      (hl), e                 ; write cache_lo              — 7T
-        inc     hl                      ;                             — 6T
-        ld      (hl), d                 ; write cache_hi              — 7T
-        djnz    .pcsca_lp               ; 13T taken / 8T not taken
+        adc     a, 0                    ; cache_hi = base_hi + carry
+        ld      d, a                    ; DE = cache_addr
 
-        ld      sp, (pcsca_saved_sp)
+        ; SAT lookup: entry_idx = (128 + row_idx)*3 + pipe
+        ; byte_offset = entry_idx * 2
+        ; row = 128 + C; row*3 = row*2 + row; then + pipe*2 → * 2 overall
+        ; (row * 3 + pipe) * 2 = row*6 + pipe*2
+        push    bc                      ; save pipe(B), row_idx(C)
+        push    de                      ; save cache_addr
+
+        ld      a, c
+        add     a, 128                  ; A = row (128..159)
+        ld      l, a
+        ld      h, 0                    ; HL = row
+        add     hl, hl                  ; HL = row*2
+        ld      (pcsca_row2_tmp), hl    ; save row*2
+        add     hl, hl                  ; HL = row*4
+        ld      de, (pcsca_row2_tmp)
+        add     hl, de                  ; HL = row*6  (= row*4 + row*2)
+
+        pop     de                      ; restore cache_addr
+        pop     bc                      ; restore pipe(B), row_idx(C)
+        push    bc
+        push    de
+
+        ; Add pipe*2
+        ld      a, b
+        add     a, a                    ; A = pipe*2
+        add     a, l
+        ld      l, a
+        jr      nc, .pcsca_sat_nc
+        inc     h
+.pcsca_sat_nc:
+        ; HL = (row*3 + pipe)*2 → byte offset into SLOT_ADDR_TABLE
+        ld      de, SLOT_ADDR_TABLE
+        add     hl, de                  ; HL → SLOT_ADDR_TABLE entry
+
+        ; DE = slot_first_byte_addr (read LE word)
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = slot_first_byte_addr
+
+        pop     hl                      ; restore cache_addr into HL
+        pop     bc                      ; restore pipe(B), row_idx(C)
+
+        ; Check opcode: is (DE) == $31 (ld sp,nn — body slot)?
+        ld      a, (de)
+        cp      $31
+        jr      nz, .pcsca_skip         ; not a body slot → skip
+
+        ; Write cache_addr at slot+1 (LE 16-bit)
+        ; HL = cache_addr, DE = slot_first_byte_addr
+        inc     de                      ; DE = slot+1 (cache_lo byte)
+        ld      a, l
+        ld      (de), a                 ; write cache_lo
+        inc     de
+        ld      a, h
+        ld      (de), a                 ; write cache_hi
+
+.pcsca_skip:
+        ; Advance row_idx; loop 32 rows
+        inc     c
+        ld      a, c
+        cp      32
+        jr      nz, .pcsca_row_lp
+
+        ; Next pipe
+        inc     b
+        ld      a, b
+        cp      NUM_PIPES
+        jr      nz, .pcsca_pipe_lp
+
         ret
+
+pcsca_phase_off:  db 0         ; phase*4 stashed across inner loops
+pcsca_lut_ptr:    dw 0         ; current row cursor in city_base_lut
+pcsca_row2_tmp:   dw 0         ; scratch: row*2 during SAT offset calc
 
 ;----------------------------------------------------------------
 clear_pipe_col:
