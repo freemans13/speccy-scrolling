@@ -2091,27 +2091,28 @@ paint_restore:
         srl     b
         srl     b                       ; B = line groups of 4
         ret     z                       ; (caller never passes B<4 in practice)
+        ld      e, 0                    ; pre-load sky byte once; clear via ld (hl), e (7T) vs ld (hl), 0 (10T)
 .lp:
         pop     hl                      ; line N
         ld      a, c
         add     a, l
         ld      l, a
-        ld      (hl), 0
+        ld      (hl), e
         pop     hl                      ; line N+1
         ld      a, c
         add     a, l
         ld      l, a
-        ld      (hl), 0
+        ld      (hl), e
         pop     hl                      ; line N+2
         ld      a, c
         add     a, l
         ld      l, a
-        ld      (hl), 0
+        ld      (hl), e
         pop     hl                      ; line N+3
         ld      a, c
         add     a, l
         ld      l, a
-        ld      (hl), 0
+        ld      (hl), e
         djnz    .lp
         ld      sp, (saved_sp)
         ret
