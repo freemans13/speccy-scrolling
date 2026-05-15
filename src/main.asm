@@ -1,17 +1,12 @@
         DEVICE  ZXSPECTRUM48
 
 ;----------------------------------------------------------------
-; Speccy Flappy Bird — step 7: static cityscape behind pipes
+; Speccy Flappy Bird — sky/pipes/ground/scoreboard rendering at 50Hz.
 ;
-; - bg_buffer at $C000-$D7FF mirrors the pristine background
-;   (sky zeros + cityscape building columns)
-; - At init: paint attrs, build bg_buffer, copy to screen, draw pipes
-; - When a pipe column needs clearing on scroll, paint_restore
-;   copies the bg_buffer byte back instead of writing zero — so the
-;   cityscape persists as pipes pass through
-; - Cityscape band attribute = bright cyan paper + white ink, so
-;   the buildings show white and pipes turning green→white as they
-;   cross the band's char rows (Spectrum attribute clash, by design)
+; Per frame: PIPE_PROGRAM (SMC slot grid at $DB00) emits all 160 pipe-band
+; scan lines via stack-blast pushes, then bird + ground + scoreboard.
+; Pipes scroll by 2 px per frame; on each phase wrap, byte_x decrements
+; and per-pipe slot templates are reconfigured.
 ;----------------------------------------------------------------
 
 NUM_PIPES   EQU 3
@@ -20,65 +15,49 @@ PIPE_GAP    EQU 48
 BIRD_X      EQU 8                       ; fixed col (= 64 px from left)
 BIRD_LINES  EQU 16
 GRAVITY     EQU 64                      ; vy += GRAVITY per frame (16-bit fixed-point)
-FLAP_VY     EQU $FD80                   ; signed -640 — single flap rises ~14 px (was -1024 / 34 px, overshot 48 px pipe gap)
+FLAP_VY     EQU $FD80                   ; signed -640 — single flap rises ~14 px
 
 ATTRS           EQU $5800
 BG_BUFFER       EQU $C000
 BACKUP_ATTRS    EQU $D800               ; mirror of ATTRS without pipe overlay (768 B)
 
 ATTR_SKY        EQU $28                 ; paper cyan + ink black
-ATTR_CITY       EQU $38                 ; paper white + ink black (skyscraper windows)
 ATTR_GROUND     EQU $20                 ; paper green + ink black (ground band, row 20)
 ATTR_SCOREBOARD EQU $07                 ; paper black + ink white (rows 21..23)
 ATTR_PIPE       EQU $20                 ; paper green + ink black (dynamic, inner pipe cells)
-ATTR_BIRD       EQU $70                 ; bright yellow paper + black ink — bird's main char rows
+ATTR_BIRD       EQU $70                 ; bright yellow paper + black ink
 ATTR_BUFFER     EQU $2D                 ; paper cyan + ink cyan — invisible buffer cols (0-3, 28-31)
 GROUND_TOP      EQU 160                 ; first scan line of ground band — pipes stop here
 SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= ground+8)
 
-CITY_TOP        EQU 160                 ; cityscape removed; all rows < 160 treated as non-city
-CITY_BOTTOM     EQU 160                 ; first scan line below cityscape
-
 ; ─── Slot grid layout (fixed-slot dispatch) ──────────────────────
-SLOT_GRID_BASE         EQU $DB00       ; 3045 B total grid
-SLOT_GRID_NORMAL_BASE  EQU SLOT_GRID_BASE              ; rows 0..127
-SLOT_GRID_NORMAL_SIZE  EQU 128 * 16                    ; 2048 B
-SLOT_GRID_CITY_BASE    EQU SLOT_GRID_BASE + SLOT_GRID_NORMAL_SIZE  ; $E300
-SLOT_GRID_CITY_SIZE    EQU 32 * 34                     ; 1088 B  (was 32*31=992)
-SLOT_GRID_END          EQU SLOT_GRID_CITY_BASE + SLOT_GRID_CITY_SIZE  ; $E740
+; All 160 rows use a 5-byte normal slot template:
+;   ld sp,target ; push de ; push bc
+; The epilogue sits immediately after row 159's last slot so PIPE_PROGRAM
+; falls straight through into `ld sp,(saved_sp) ; ret` with no NOP slide.
+SLOT_GRID_BASE         EQU $DB00
+SLOT_GRID_END          EQU SLOT_GRID_BASE + 160 * 16   ; $E500
 PIPE_PROGRAM           EQU SLOT_GRID_BASE              ; entry point alias
 
-NORMAL_ROW_STRIDE      EQU 16          ; 1 (exx) + 3*5
-CITY_ROW_STRIDE        EQU 34          ; 1 (exx) + 3*11  (was 31 = 1+3*10)
-NORMAL_SLOT_STRIDE     EQU 5
-CITY_SLOT_STRIDE       EQU 11          ; was 10; ld sp,(nn) = 4B vs 3B
+SLOT_ROW_STRIDE        EQU 16          ; 1 (exx) + 3*5
+SLOT_STRIDE            EQU 5
 
-; ─── Cityscape data (unchanged) ──────────────────────────────────
-CITY_BG_TABLE          EQU $EB00       ; 1024 B
-CITY_BG_TABLE_END      EQU $EF00
-CITY_CACHE             EQU $EF00       ; 384 B
-CITY_CACHE_END         EQU $F080
-CITY_OVERLAY           EQU $F080       ; 192 B
-CITY_OVERLAY_END       EQU $F140
+; ─── Slot-grid template store (init-time, then read-only) ─────────
+; Single cap_block content is identical for every gap_y (only the
+; stamp offset varies), so we share one 250-byte block. Total store:
+;   BODY_TEMPLATE       800 bytes  (160 rows × 5 bytes, byte_x=29 body slots)
+;   CAP_BLOCK           250 bytes  (50 rows × 5 bytes: cap_top + 48 skip + cap_bot)
+;   CAP_TARGET_TABLE     48 bytes  (12 gap_y entries × 4 bytes:
+;                                    word(cap_top_target), word(cap_bot_target))
+TEMPLATE_BASE          EQU $C000
+BODY_TEMPLATE          EQU TEMPLATE_BASE                  ; $C000..$C31F
+CAP_BLOCK              EQU BODY_TEMPLATE + 800            ; $C320..$C419
+CAP_TARGET_TABLE       EQU CAP_BLOCK + 250                ; $C41A..$C449
+TEMPLATE_END           EQU CAP_TARGET_TABLE + 48          ; $C44A
 
 ; ─── Pre-computed slot addresses ─────────────────────────────────
 SLOT_ADDR_TABLE        EQU $F440       ; 480 entries × 2 B = 960 B
 SLOT_ADDR_TABLE_END    EQU $F800
-
-; ─── City base look-up table ──────────────────────────────────────
-; Placed at BG_BUFFER ($C000) — that memory is written at init_background
-; and read back only during redraw; after init_city_base_lut overwrites the
-; first 1856 bytes the LUT is static for the whole game.
-; Layout: byte_x-major, 29 × 32 × 2 bytes = 1856 bytes.
-;   city_base_lut[(byte_x-1)*64 + row_idx*2]  →  2-byte LE bitmap base addr
-; $C000 + 1856 = $C740; BACKUP_ATTRS at $D800 — no conflict.
-CITY_BASE_LUT          EQU $C000       ; 1856 B  ($C000..$C73F)
-
-; ─── Legacy unchanged ────────────────────────────────────────────
-TARGET_TABLE           EQU $F080       ; 3 pipes × 320 B  (LEGACY)
-TARGET_TABLE_END       EQU $F440
-CITY_TABLE             EQU $F800       ; legacy unused
-CITY_TABLE_END         EQU $FA40
 
 ; ─── Active list (per-pipe sublists) ─────────────────────────────
 ACTIVE_PIPE_0          EQU $FA40       ; 112 entries × 2 B = 224 B
@@ -87,9 +66,8 @@ ACTIVE_PIPE_2          EQU ACTIVE_PIPE_1 + 224
 ACTIVE_LIST_END        EQU ACTIVE_PIPE_2 + 224       ; $FD10
 ACTIVE_COUNT           EQU 336         ; constant; all three sublists × 112
 
-; (Legacy alias kept until cleanup task; patch_pipe_targets currently reads it)
 ACTIVE_LIST_NEW        EQU ACTIVE_PIPE_0
-ACTIVE_COUNT_NEW       EQU $FD10       ; 2 B counter (will become an EQU)
+ACTIVE_COUNT_NEW       EQU $FD10       ; 2 B counter
 
         ORG $8000
 
@@ -98,11 +76,10 @@ start:
         ld      sp, $8000
         ld      a, 5
         out     ($fe), a
-        call    paint_attrs             ; initial base attrs (rows 16..19 all city)
+        call    paint_attrs
         call    init_background
-        call    refill_base_attrs       ; convert row 16..19 to sky + per-cell city
+        call    refill_base_attrs
         call    backup_base_attrs       ; snapshot ATTRS → BACKUP_ATTRS (no pipes)
-        call    init_city_base_lut      ; pre-compute city_base_lut[29×32] at $C000
         call    init_pipes              ; draws pipes (pixels) — attrs still base
         call    init_bird
         call    apply_pipe_attrs        ; overlay ATTR_PIPE at initial pipe positions
@@ -128,93 +105,14 @@ saved_sp_inner: dw 0                    ; second save slot — inner CALL inside
                                         ; back to caller stack so the return
                                         ; address doesn't overwrite line_table.
 ground_iy_save: dw 0
-paint_LMMR_start_line: db 0             ; scratch — start line saved across SP-hijack
-
-; Cached city-tile L/R byte values for the current phase. update_smc and
-; update_cap_smc fill these at end-of-frame; the line loop in redraw_pipes_
-; linemajor patches its body+cap L/R SMC slots from these caches as each
-; pipe crosses its column's building-top row (per-pipe city transition).
-;   _a slots = A variant (even rows, $FF solid-bar bg, A pipe pattern)
-;   _b slots = B variant (odd rows,  $99 windows  bg, B pipe pattern)
-city_aL_cache:  db 0
-city_aR_cache:  db 0
-city_bL_cache:  db 0
-city_bR_cache:  db 0
-city_cL_cache:  db 0
-city_cR_cache:  db 0
-
-; ── Joffa-style SMC-unrolled per-cell city transitions ───────────────
-; SIX pre-compiled patch blocks — one per (pipe, cell) — at fixed code
-; addresses (patch_block_PXY below). At wrap, patch_pipe_smc:
-;   1. Computes each cell's row (CITY_BOTTOM - cityscape_heights[col]).
-;   2. Bubble-sorts the (row, block_addr) pairs ASC.
-;   3. SMC-patches each block's chain links (next row, next block addr)
-;      and exit links, so block #0 falls through to block #1 if their rows
-;      match the current B, etc. Last sorted block has next row=$FF.
-;   4. Stores the FIRST sorted block's (row, addr) in dispatch_first_*_init.
-;
-; Per-frame, at B==CITY_TOP, the arming code copies dispatch_first_*_init
-; into the line loop's SMC check (`cp <row>` and `jp <block_addr>`).
-;
-; Each block runs ~91 T-st of direct-SMC patches (4 slot writes from cached
-; phase bytes) + ~21 T-st chain check + (one block only) ~80 T-st exit code.
-; Total dispatch when all 4 visible cells fire at same row: ~504 T-st vs
-; ~1500 T-st for the indirect-dispatch design. No BC clobber → no SP swap.
-
-NUM_DISPATCH_BLOCKS   EQU 6
-
-; (row, block_addr) tuples to sort. Each entry: 1 byte row, 2 bytes addr.
-; Sentinel at index 6 keeps the sort+chain finalisation simple — the LAST
-; sorted block's chain points HERE so a "miss" never reads garbage.
-dispatch_sort:
-        db $FF                          ; row (patched at runtime)
-        dw patch_block_P1L
-        db $FF
-        dw patch_block_P1R
-        db $FF
-        dw patch_block_P2L
-        db $FF
-        dw patch_block_P2R
-        db $FF
-        dw patch_block_P3L
-        db $FF
-        dw patch_block_P3R
-dispatch_sort_sentinel:
-        db $FF                          ; row that never matches B in [0,158]
-        dw dispatch_sentinel_block      ; harmless target if ever JPed to
-
-; First sorted (row, addr) — line loop's arming reads these on each frame.
-dispatch_first_row_init:    db $FF
-dispatch_first_block_init:  dw dispatch_sentinel_block
-
-; Bubble-sort early-exit flag. Set by each inner pass when a swap happens;
-; if a full pass completes with zero swaps, the array is already sorted.
-dispatch_sort_swapped:      db 0
 
 pipe_state:
         ; 3 pipes distributed around the 29-step byte_x cycle (byte_x ∈ [1,29]).
-        ; byte_x always uses paint_LMMR variant — buffer cols 0-3 and 28-31
-        ; have attr with ink=paper so pipe parts there are invisible.
-        ; Spacing ~10 cells. Initial gap_y values arbitrary (randomised on wrap).
+        ; Buffer cols 0-3 and 28-31 have attr ink=paper so pipe parts there
+        ; render invisibly. Initial gap_y values arbitrary (randomised on wrap).
         db 29, 64                       ; pipe just entering from right buffer
         db 19, 40
         db  9, 88
-
-pipe_target_base:
-        dw      TARGET_TABLE + 0 * 320
-        dw      TARGET_TABLE + 1 * 320
-        dw      TARGET_TABLE + 2 * 320
-
-pipe_slot_base:
-        dw      SLOT_ADDR_TABLE + 0 * 320
-        dw      SLOT_ADDR_TABLE + 1 * 320
-        dw      SLOT_ADDR_TABLE + 2 * 320
-
-; cap_slot_table: addresses of bc-imm and de-imm slots per cap-row per pipe.
-; Layout per cap-row (4 bytes): [bc_imm_lo_addr, bc_imm_hi_addr, de_imm_lo_addr, de_imm_hi_addr]
-; Per pipe: 2 cap-rows × 4 bytes = 8 bytes (cap_top at +0, cap_bot at +4)
-; Per 3 pipes: 24 bytes total. Zero = cap row not present.
-cap_slot_table: ds 24
 
 ; Scratch words for cap_bot's BC/DE restore. Populated by redraw_pipes_v2 at frame entry.
 body_a_bc:      dw 0
@@ -222,14 +120,7 @@ body_a_de:      dw 0
 body_b_bc:      dw 0
 body_b_de:      dw 0
 
-; Three global city-slot indirect pointers. Updated once per frame in redraw_pipes_v2.
-; Each city body slot does ld sp,(current_X_ptr) to load its 4-byte bitmap row;
-; only these 3 words change per frame (was 96 cache_addr patches = ~8k T-states).
-current_sky_ptr:    dw 0     ; = pipe_bitmap + phase*4
-current_city_a_ptr: dw 0     ; = pipe_bitmap_city_a + phase*4
-current_city_b_ptr: dw 0     ; = pipe_bitmap_city_b + phase*4
-
-; Scratch bytes for update_cap_imm's phase-shifted cap values
+; Scratch bytes for update_cap_imm_v2's phase-shifted cap values
 cap_L_temp:     db 0
 cap_M1_temp:    db 0
 cap_M2_temp:    db 0
@@ -243,7 +134,7 @@ score_last:   dw $FFFF                  ; force first render
 pipe_scored:  db 0, 0, 0
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
 wrap_pending:  db 0                      ; set when a wrap happened this frame
-pending_regen: db 0                      ; set when a recycle happened; gen_pipe_program deferred
+pending_regen: db 0                      ; set when a recycle happened; configure_pipe_slots deferred
 patch_pending: db 0                      ; set by wrap_byte_x when byte_x changed; cleared after patch_pipe_targets runs
 recycled_pipe_idx: db 0
 
@@ -269,9 +160,6 @@ pipe_bitmap:
 
 ; Body bitmap B — pattern $EA $00 $AB pre-shifted. Alternates with A on
 ; byte 2 AND byte 3 → 1-row checker dither on the pipe's right side.
-; Green paper extends to byte_x+2 cell (3-cell green attr) so the byte 3
-; alternation lands on green paper → reads as checker on green, NOT as
-; diagonal stripes on white at cityscape rows.
 pipe_bitmap_b:
         db $00, $EA, $00, $AB           ; phase 0
         db $01, $D4, $01, $56           ; phase 1
@@ -281,66 +169,6 @@ pipe_bitmap_b:
         db $1D, $40, $15, $60           ; phase 5
         db $3A, $80, $2A, $C0           ; phase 6
         db $75, $00, $55, $80           ; phase 7
-
-; Outside-the-pipe pixel masks per phase. The 24-px pipe sits at pixels
-; phase..phase+23 within the 32-px LMMR window, so:
-;   L_out_mask(phase) selects bits 7..8-phase of L cell (the padding left
-;   of the pipe — $FF for phase 0 grows toward $80 for phase 7).
-;   R_out_mask(phase) selects bits phase-1..0 of R cell (the padding right
-;   of the pipe — $00 for phase 0 grows toward $7F for phase 7).
-; Used by paint_LMMR_city to mask the bg_buffer byte so cityscape pattern
-; appears only in pixels outside the pipe shape, never inside it.
-l_out_masks:
-        db $FF, $FE, $FC, $F8, $F0, $E0, $C0, $80
-r_out_masks:
-        db $00, $01, $03, $07, $0F, $1F, $3F, $7F
-
-; Cityscape pattern bg bytes that appear beneath pipes in rows 128..159.
-; cityscape_pattern alternates $FF (solid bar, even rows) and $99 (windows,
-; odd rows). The dual-row line loop renders A variant on even rows and B
-; variant on odd rows; each variant carries the matching bg so the pipe
-; edges read identical to the cityscape buildings flanking them.
-PIPE_CITY_BG_A  EQU $FF                 ; even-row bg = solid bar (matches $FF row)
-PIPE_CITY_BG_B  EQU $99                 ; odd-row bg  = windows  (matches $99 row)
-
-; Pre-rendered "pipe-on-cityscape" tiles. Each byte is `pipe | (mask & bg)`
-; where mask is l_out_mask / r_out_mask for L / R cells and bg picks the
-; appropriate row-parity cityscape pattern. M1, M2 stay as sky values
-; because the 24-px pipe fully covers those cells.
-;
-; A variant (even body rows, A pipe pattern, $FF bg):
-pipe_bitmap_city_a:
-        ; phase, L_city, M1, M2, R_city (4 bytes/phase, parallel to pipe_bitmap)
-        db $00 | ($FF & PIPE_CITY_BG_A), $EA, $00, $57 | ($00 & PIPE_CITY_BG_A)
-        db $01 | ($FE & PIPE_CITY_BG_A), $D4, $00, $AE | ($01 & PIPE_CITY_BG_A)
-        db $03 | ($FC & PIPE_CITY_BG_A), $A8, $01, $5C | ($03 & PIPE_CITY_BG_A)
-        db $07 | ($F8 & PIPE_CITY_BG_A), $50, $02, $B8 | ($07 & PIPE_CITY_BG_A)
-        db $0E | ($F0 & PIPE_CITY_BG_A), $A0, $05, $70 | ($0F & PIPE_CITY_BG_A)
-        db $1D | ($E0 & PIPE_CITY_BG_A), $40, $0A, $E0 | ($1F & PIPE_CITY_BG_A)
-        db $3A | ($C0 & PIPE_CITY_BG_A), $80, $15, $C0 | ($3F & PIPE_CITY_BG_A)
-        db $75 | ($80 & PIPE_CITY_BG_A), $00, $0B, $80 | ($7F & PIPE_CITY_BG_A)
-
-; B variant (odd body rows, B pipe pattern, $99 bg):
-pipe_bitmap_city_b:
-        db $00 | ($FF & PIPE_CITY_BG_B), $EA, $00, $AB | ($00 & PIPE_CITY_BG_B)
-        db $01 | ($FE & PIPE_CITY_BG_B), $D4, $01, $56 | ($01 & PIPE_CITY_BG_B)
-        db $03 | ($FC & PIPE_CITY_BG_B), $A8, $02, $AC | ($03 & PIPE_CITY_BG_B)
-        db $07 | ($F8 & PIPE_CITY_BG_B), $50, $05, $58 | ($07 & PIPE_CITY_BG_B)
-        db $0E | ($F0 & PIPE_CITY_BG_B), $A0, $0A, $B0 | ($0F & PIPE_CITY_BG_B)
-        db $1D | ($E0 & PIPE_CITY_BG_B), $40, $15, $60 | ($1F & PIPE_CITY_BG_B)
-        db $3A | ($C0 & PIPE_CITY_BG_B), $80, $2A, $C0 | ($3F & PIPE_CITY_BG_B)
-        db $75 | ($80 & PIPE_CITY_BG_B), $00, $55, $80 | ($7F & PIPE_CITY_BG_B)
-
-; Cap rim — single variant; cap rows are sparse so we use the A-style bg.
-cap_rounded_bitmap_city:
-        db $00 | ($FF & PIPE_CITY_BG_A), $7F, $FF, $FE | ($00 & PIPE_CITY_BG_A)
-        db $00 | ($FE & PIPE_CITY_BG_A), $FF, $FF, $FC | ($01 & PIPE_CITY_BG_A)
-        db $01 | ($FC & PIPE_CITY_BG_A), $FF, $FF, $F8 | ($03 & PIPE_CITY_BG_A)
-        db $03 | ($F8 & PIPE_CITY_BG_A), $FF, $FF, $F0 | ($07 & PIPE_CITY_BG_A)
-        db $07 | ($F0 & PIPE_CITY_BG_A), $FF, $FF, $E0 | ($0F & PIPE_CITY_BG_A)
-        db $0F | ($E0 & PIPE_CITY_BG_A), $FF, $FF, $C0 | ($1F & PIPE_CITY_BG_A)
-        db $1F | ($C0 & PIPE_CITY_BG_A), $FF, $FF, $80 | ($3F & PIPE_CITY_BG_A)
-        db $3F | ($80 & PIPE_CITY_BG_A), $FF, $FF, $00 | ($7F & PIPE_CITY_BG_A)
 
 ; Cap design: body pattern for most rows + 1 rim line at the gap-facing edge.
 ; The rim is pattern $7F $FF $FE — 24-px solid black bar with 1-px chamfered
@@ -392,10 +220,10 @@ bird_sprite_ptr:    dw bird_sprite_f1
 ;
 ; Stored as 4 bytes/row interleaved: inv_maskL, spriteL, inv_maskR, spriteR.
 ; draw_bird does  screen = (screen AND inv_mask) OR sprite.
-; Body silhouette has inv_mask=0 (interior cleared then OR'd) so cityscape /
-; pipe pixels don't bleed through — bird interior reads as paper (yellow in
-; the ATTR_BIRD char row, sky cyan above/below). Beak bars and tail stripes
-; use inv_mask=1 so they OR onto the background as floating black lines.
+; Body silhouette has inv_mask=0 (interior cleared then OR'd) so pipe pixels
+; don't bleed through — bird interior reads as paper (yellow in the ATTR_BIRD
+; char row, sky cyan above/below). Beak bars and tail stripes use inv_mask=1
+; so they OR onto the background as floating black lines.
 
 bird_sprite_f0:                         ; wing UP — wing box rows 8–11
         db $FF, $00, $FF, $00           ; row  0  ................
@@ -451,16 +279,6 @@ bird_sprite_f2:                         ; wing DOWN — wing box rows 10–13
         db $C0, $3F, $1F, $E0           ; row 14  bottom curve
         db $FF, $00, $FF, $00
 
-; Skyline silhouette — building height (in scan lines, multiples of 8) per col.
-; Each value / 8 = number of 8-row skyscraper tiles. Multiples of 8 keep tiles
-; aligned to char-row boundaries so the per-cell ATTR_CITY (white paper) only
-; covers the building cells, not the whole row.
-cityscape_heights:
-        ; Cityscape removed — all heights 0 so init_background draws no
-        ; city pixels and paint_city_attrs paints nothing.
-        db  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
-        db  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
-
 ; Ground tiles — 8x8 pattern, 4 phases of horizontal scroll.
 ;   Row 0: $FF — solid black top edge.
 ;   Rows 1..6: "/" diagonal (period 4 horizontally).
@@ -472,33 +290,12 @@ ground_tiles:
         db $FF, $44, $88, $11, $22, $44, $88, $AA   ; phase 2 (shifted left 2px)
         db $FF, $88, $11, $22, $44, $88, $11, $55   ; phase 3 (shifted left 3px)
 
-; Skyscraper tile — 8x8 px, used as building texture under ATTR_CITY
-; (paper white + ink black). Bit set = black ink = wall; bit clear = white
-; paper = window.
-;   Row 0 ($FF): floor / roof edge.
-;   Row 1 ($99): window row — wall, 2-px window, 2-px wall, 2-px window, wall.
-;   Rows 2..7: alternating floor + window pattern.
-; 32-byte pattern = tile repeated 4 times so a building at any line within the
-; 32-line city band (lines 128..159) can index by (start_y - CITY_TOP + iter).
-cityscape_pattern:
-        db $FF, $99, $FF, $99, $FF, $99, $FF, $99
-        db $FF, $99, $FF, $99, $FF, $99, $FF, $99
-        db $FF, $99, $FF, $99, $FF, $99, $FF, $99
-        db $FF, $99, $FF, $99, $FF, $99, $FF, $99
-
 ;----------------------------------------------------------------
 paint_attrs:
         ld      hl, ATTRS
         ld      de, ATTRS + 1
         ld      (hl), ATTR_SKY
-        ld      bc, 16 * 32 - 1         ; 16 char rows of sky
-        ldir
-        inc     hl
-        ld      (hl), ATTR_CITY
-        ld      d, h
-        ld      e, l
-        inc     de
-        ld      bc, 4 * 32 - 1          ; 4 char rows of cityscape
+        ld      bc, 20 * 32 - 1         ; 20 char rows of sky (rows 0..19)
         ldir
         inc     hl
         ld      (hl), ATTR_GROUND
@@ -520,9 +317,7 @@ paint_attrs:
 ; init_slot_addr_table: pre-compute slot_addr_table[row][pipe] = byte address
 ; of the (row, pipe) slot's first byte (the byte AFTER the row's leading EXX).
 ;
-; Layout:
-;   row in 0..127   →  SLOT_GRID_BASE + row*16 + 1 + pipe*5
-;   row in 128..159 →  SLOT_GRID_CITY_BASE + (row-128)*31 + 1 + pipe*10
+; Layout: SLOT_GRID_BASE + row*16 + 1 + pipe*5 for all 160 rows.
 ;
 ; Entry index: row*3 + pipe (16-bit address per entry).
 ; Total table size: 480 × 2 = 960 bytes at SLOT_ADDR_TABLE.
@@ -532,18 +327,16 @@ init_slot_addr_table:
         ld      b, 0
 .row_lp:
         push    bc
-        ; Uniform normal layout for all 160 rows (cityscape removed).
-        ; DE = SLOT_GRID_NORMAL_BASE + row*16 + 1
         ld      l, b
         ld      h, 0
         add     hl, hl
         add     hl, hl
         add     hl, hl
         add     hl, hl                          ; HL = row × 16
-        ld      de, SLOT_GRID_NORMAL_BASE + 1
+        ld      de, SLOT_GRID_BASE + 1
         add     hl, de
         ex      de, hl                          ; DE = base addr for pipe 0
-        ld      c, NORMAL_SLOT_STRIDE
+        ld      c, SLOT_STRIDE
 
 .write_3_pipes:
         ld      b, 3
@@ -576,7 +369,7 @@ init_slot_addr_table:
 ;   - Reads slot[row][0] address from SLOT_ADDR_TABLE (entry index
 ;     row*3, 2-byte little-endian address).
 ;   - Writes $D9 (EXX) at (slot[row][0] - 1).
-;   - Writes 3 body templates (5 B normal / 10 B city) for pipes 0-2.
+;   - Writes 3 × 5-byte body templates for pipes 0-2.
 ;
 ; After the loop writes the 5-byte epilogue at SLOT_GRID_END:
 ;   ED 7B lo hi C9  =  ld sp,(saved_sp) ; ret
@@ -631,19 +424,11 @@ init_pipe_program:
         push    de
         pop     iy                      ; IY = write cursor at slot[row][0]
 
-        ; ── Dispatch on band ─────────────────────────────────────
-        ld      a, b
-        cp      CITY_TOP                ; 128
-        jp      nc, .ipp_city_row
-
-        ; ──────────────────────────────────────────────────────────
-        ; Normal row (0..127): 3 × 5-byte body template
+        ; All 160 rows: 3 × 5-byte body template
         ;   $31 lo hi $D5 $C5  =  ld sp,target ; push de ; push bc
-        ; ──────────────────────────────────────────────────────────
         ld      c, 0                    ; pipe index
-.ipp_normal_pipe_lp:
+.ipp_pipe_lp:
         ; Compute screen_target = line_table[B] + byte_x[C] + 3
-        ; Step 1: line_addr = line_table[B]  (B preserved on stack)
         ld      a, b
         ld      l, a
         ld      h, 0
@@ -654,7 +439,6 @@ init_pipe_program:
         inc     hl
         ld      d, (hl)                 ; DE = line_addr
 
-        ; Step 2: byte_x = ipp_byte_x[C]
         ld      hl, ipp_byte_x
         ld      a, c
         add     a, l
@@ -668,131 +452,18 @@ init_pipe_program:
         ld      h, 0
         add     hl, de                  ; HL = screen_target
 
-        ; Emit 5 bytes at IY
         ld      (iy+0), $31
         ld      (iy+1), l
         ld      (iy+2), h
         ld      (iy+3), $D5             ; push de
         ld      (iy+4), $C5             ; push bc
-        ld      de, NORMAL_SLOT_STRIDE  ; = 5
-        add     iy, de                  ; advance cursor to next slot
+        ld      de, SLOT_STRIDE
+        add     iy, de
 
         inc     c
         ld      a, c
-        cp      NUM_PIPES               ; 3
-        jr      nz, .ipp_normal_pipe_lp
-        jp      .ipp_row_done
-
-        ; ──────────────────────────────────────────────────────────
-        ; City row (128..159): 3 × 11-byte city body template
-        ;   $ED $7B ptr_lo ptr_hi $C1 $D1 $31 screen_lo screen_hi $D5 $C5
-        ;   (ld sp,(nn) ; pop bc ; pop de ; ld sp,screen ; push de ; push bc)
-        ; ptr = one of current_sky_ptr / current_city_a_ptr / current_city_b_ptr
-        ; ──────────────────────────────────────────────────────────
-.ipp_city_row:
-        ld      c, 0                    ; pipe index
-.ipp_city_pipe_lp:
-        ; Look up ptr address via CITY_BASE_LUT[(byte_x-1)*64 + row_idx*2].
-        ; The LUT stores the bitmap base address; we map it to one of 3 ptr vars.
-        ; row_idx = B - CITY_TOP  (B preserved on outer stack)
-        ld      a, b
-        sub     CITY_TOP                ; A = row_idx (0..31)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; row_idx * 2  (2 bytes per LUT entry)
-        ld      (ipp_row_idx_off), hl   ; save for this pipe
-
-        ; byte_x for pipe C
-        ld      hl, ipp_byte_x
-        ld      a, c
-        add     a, l
-        ld      l, a
-        jr      nc, .ipp_cp2_nc
-        inc     h
-.ipp_cp2_nc:
-        ld      a, (hl)                 ; A = byte_x
-        dec     a                       ; A = byte_x - 1
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                  ; HL = (byte_x-1) * 64
-        ld      de, (ipp_row_idx_off)
-        add     hl, de                  ; HL = (byte_x-1)*64 + row_idx*2
-        ld      de, CITY_BASE_LUT
-        add     hl, de                  ; HL → LUT entry
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = bitmap base address
-
-        ; Map DE (bitmap base) → ptr variable address
-        ; pipe_bitmap → current_sky_ptr
-        ; pipe_bitmap_city_a → current_city_a_ptr
-        ; pipe_bitmap_city_b → current_city_b_ptr
-        ld      hl, pipe_bitmap_city_b
-        or      a
-        sbc     hl, de
-        jr      z, .ipp_ptr_city_b
-        ld      hl, pipe_bitmap_city_a
-        or      a
-        sbc     hl, de
-        jr      z, .ipp_ptr_city_a
-        ld      hl, current_sky_ptr
-        jr      .ipp_ptr_done
-.ipp_ptr_city_a:
-        ld      hl, current_city_a_ptr
-        jr      .ipp_ptr_done
-.ipp_ptr_city_b:
-        ld      hl, current_city_b_ptr
-.ipp_ptr_done:
-        ; HL = address of the correct global ptr variable
-        ; Emit 11-byte slot: ED 7B ptr_lo ptr_hi C1 D1 31 screen_lo screen_hi D5 C5
-        ld      (iy+0), $ED
-        ld      (iy+1), $7B
-        ld      (iy+2), l               ; ptr_lo
-        ld      (iy+3), h               ; ptr_hi
-        ld      (iy+4), $C1             ; pop bc
-        ld      (iy+5), $D1             ; pop de
-
-        ; Compute screen_target = line_table[B] + byte_x[C] + 3
-        ld      a, b
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; row*2
-        ld      de, line_table
-        add     hl, de                  ; HL → line_table[row]
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = line_addr
-        ld      hl, ipp_byte_x
-        ld      a, c
-        add     a, l
-        ld      l, a
-        jr      nc, .ipp_cp_nc
-        inc     h
-.ipp_cp_nc:
-        ld      a, (hl)                 ; A = byte_x[C]
-        add     a, 3
-        ld      l, a
-        ld      h, 0
-        add     hl, de                  ; HL = screen_target
-
-        ; Emit last 5 bytes at IY+6: ld sp,screen_target ; push de ; push bc
-        ld      (iy+6), $31
-        ld      (iy+7), l
-        ld      (iy+8), h
-        ld      (iy+9), $D5             ; push de
-        ld      (iy+10), $C5            ; push bc
-        ld      de, CITY_SLOT_STRIDE    ; = 11
-        add     iy, de                  ; advance cursor to next slot
-
-        inc     c
-        ld      a, c
-        cp      NUM_PIPES               ; 3
-        jp      nz, .ipp_city_pipe_lp
+        cp      NUM_PIPES
+        jr      nz, .ipp_pipe_lp
 
 .ipp_row_done:
         pop     bc                      ; restore B=row
@@ -816,7 +487,6 @@ init_pipe_program:
         ret
 
 ipp_byte_x:     ds 3, 0                 ; scratch: byte_x per pipe (3 bytes)
-ipp_row_idx_off: dw 0                  ; scratch: row_idx*2 saved during city pipe loop
 
 ;----------------------------------------------------------------
 ; configure_pipe_slots(A=pipe 0..2, E=new_gap_y 1..111)
@@ -834,36 +504,43 @@ ipp_row_idx_off: dw 0                  ; scratch: row_idx*2 saved during city pi
 ; Scratch memory: cps_pipe, cps_gap_y, cps_byte_x, cps_cap_top_row,
 ;   cps_cap_bot_row, cps_cap_top_handler_addr, cps_cap_bot_handler_addr.
 ;----------------------------------------------------------------
+; configure_pipe_slots(A=pipe, E=gap_y, B=row_start, C=row_end)
+; Reconfigures slots for [row_start, row_end) of the given pipe.
+; - row_start == 0:        fresh active list (cursor from cps_sublist_base_table)
+; - row_start > 0:         continues from cps_active_save (set by prior call)
+; - row_end == GROUND_TOP: runs post-loop cap-imm patching + writes new gap_y
+; Single-shot call uses B=0, C=GROUND_TOP. Split callers pass 0/80 then 80/160.
 configure_pipe_slots:
-        ; ── Save args ────────────────────────────────────────────
         ld      (cps_pipe), a
+        ld      a, b
+        ld      (cps_row_start), a
+        ld      a, c
+        ld      (cps_row_end), a
         ld      a, e
         ld      (cps_gap_y), a
 
-        ; ── Cache byte_x for this pipe ───────────────────────────
-        ; pipe_state layout: db byte_x, gap_y  (2B per pipe)
+        ; cap_top_row = gap_y - 1; cap_bot_row = gap_y + PIPE_GAP
+        dec     a
+        ld      (cps_cap_top_row), a
+        ld      a, e
+        add     a, PIPE_GAP
+        ld      (cps_cap_bot_row), a
+
+        ; byte_x = pipe_state[pipe*2]
         ld      a, (cps_pipe)
-        add     a, a                    ; pipe*2
+        add     a, a
         ld      hl, pipe_state
         add     a, l
         ld      l, a
         jr      nc, .cps_bx_nc
         inc     h
 .cps_bx_nc:
-        ld      a, (hl)                 ; A = byte_x for this pipe
+        ld      a, (hl)
         ld      (cps_byte_x), a
 
-        ; ── Pre-compute cap rows ──────────────────────────────────
-        ld      a, (cps_gap_y)
-        dec     a
-        ld      (cps_cap_top_row), a    ; cap_top_row = gap_y - 1
-        ld      a, (cps_gap_y)
-        add     a, PIPE_GAP
-        ld      (cps_cap_bot_row), a    ; cap_bot_row = gap_y + 48
-
-        ; ── Load cap_top handler address ─────────────────────────
+        ; Cache cap_top / cap_bot handler addresses for this pipe.
         ld      a, (cps_pipe)
-        add     a, a                    ; pipe*2
+        add     a, a
         ld      hl, cap_top_handler_addrs
         add     a, l
         ld      l, a
@@ -875,7 +552,6 @@ configure_pipe_slots:
         ld      d, (hl)
         ld      (cps_cap_top_handler_addr), de
 
-        ; ── Load cap_bot handler address ─────────────────────────
         ld      a, (cps_pipe)
         add     a, a
         ld      hl, cap_bot_handler_addrs
@@ -889,211 +565,198 @@ configure_pipe_slots:
         ld      d, (hl)
         ld      (cps_cap_bot_handler_addr), de
 
-        ; ── Load active sublist base ──────────────────────────────
+        ; IY = slot[row_start][pipe] = SLOT_GRID_BASE + 1 + row_start*16 + pipe*5
+        ld      a, (cps_row_start)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; HL = row_start * 16
+        ld      a, (cps_pipe)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        add     hl, de
+        add     hl, de
+        add     hl, de
+        add     hl, de                  ; + pipe*5
+        ld      de, SLOT_GRID_BASE + 1
+        add     hl, de
+        push    hl
+        pop     iy
+
+        ; IX = active list cursor.
+        ;   row_start == 0 → cursor = cps_sublist_base_table[pipe]
+        ;   otherwise     → cursor = cps_active_save (continuing from prior half)
+        ld      a, (cps_row_start)
+        or      a
+        jr      nz, .cps_ix_resume
         ld      a, (cps_pipe)
         add     a, a
         ld      hl, cps_sublist_base_table
         add     a, l
         ld      l, a
-        jr      nc, .cps_sl_nc
+        jr      nc, .cps_ix_nc
         inc     h
-.cps_sl_nc:
+.cps_ix_nc:
         ld      e, (hl)
         inc     hl
-        ld      d, (hl)                 ; DE = active sublist write cursor
-
-        ; ── Initialize slot walk pointer ──────────────────────────
-        ; cps_slot_walk_ptr = SLOT_ADDR_TABLE + pipe*2  (points at row 0's
-        ; entry for this pipe; advances by 6 per row to skip other pipes).
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, SLOT_ADDR_TABLE
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_swp_nc
-        inc     h
-.cps_swp_nc:
-        ld      (cps_slot_walk_ptr), hl
-
-        ; ── Main row loop: B = row 0..159 ────────────────────────
-        ld      b, 0
-.cps_row_lp:
-        push    bc                      ; save B=row
-        push    de                      ; save active-list cursor
-
-        ; ── Read slot address from walk pointer (no indexing) ─────
-        ld      hl, (cps_slot_walk_ptr)
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = slot address
-        ; Advance walk pointer by 5 (one inc above, +5 more = +6 stride)
-        ld      a, l
-        add     a, 5
-        ld      l, a
-        jr      nc, .cps_walk_nc
-        inc     h
-.cps_walk_nc:
-        ld      (cps_slot_walk_ptr), hl
+        ld      d, (hl)
+        jr      .cps_ix_set
+.cps_ix_resume:
+        ld      de, (cps_active_save)
+.cps_ix_set:
         push    de
-        pop     iy                      ; IY = slot base
+        pop     ix
 
-        ; ── Determine slot type via clean comparisons ─────────────
-        ; Priority: cap_top → cap_bot → skip (gap range) → body
+        ; C = current row (starts at row_start).
+        ld      a, (cps_row_start)
+        ld      c, a
+
+        ; ─── Band 1: body, while C < min(cap_top_row, row_end) ────
         ld      a, (cps_cap_top_row)
+        ld      b, a
+        ld      a, (cps_row_end)
         cp      b
-        jp      z, .cps_do_cap_top
-
-        ld      a, (cps_cap_bot_row)
+        jr      nc, .b1_limit_set       ; row_end ≥ cap_top_row → keep cap_top_row
+        ld      b, a                    ; else limit = row_end
+.b1_limit_set:
+        ld      a, c
         cp      b
-        jp      z, .cps_do_cap_bot
+        jp      nc, .band2
+.band1_lp:
+        call    cps_emit_body
+        ld      de, SLOT_ROW_STRIDE
+        add     iy, de
+        inc     c
+        ld      a, c
+        cp      b
+        jp      c, .band1_lp
 
-        ; skip if gap_y <= row < cap_bot_row
-        ld      a, b                    ; A = row
-        ld      c, a                    ; C = row (saved for compare)
-        ld      a, (cps_gap_y)
-        cp      c                       ; gap_y vs row; carry → gap_y < row
-        jp      z, .cps_do_skip         ; row == gap_y → skip
-        jp      nc, .cps_do_body        ; gap_y > row → body (row above gap)
-        ; gap_y < row; skip if row < cap_bot_row, body if row > cap_bot_row
-        ld      a, (cps_cap_bot_row)
-        cp      c                       ; cap_bot_row vs row
-        jp      c, .cps_do_body         ; cap_bot_row < row → body (row below gap)
-        jp      .cps_do_skip            ; cap_bot_row >= row → skip (row in gap)
-
-        ; ── cap_top template ─────────────────────────────────────
-.cps_do_cap_top:
+.band2:
+        ; ─── Band 2: cap_top, if C == cap_top_row and C < row_end ─
+        ld      a, (cps_cap_top_row)
+        cp      c
+        jp      nz, .band3
+        ld      a, (cps_row_end)
+        cp      c
+        jp      z, .save_and_done
+        jp      c, .save_and_done
         ld      hl, (cps_cap_top_handler_addr)
         ld      (iy+0), $C3
         ld      (iy+1), l
         ld      (iy+2), h
-        ld      (iy+3), $00
-        ld      (iy+4), $00
-.cps_ct_emit_active:
-        ; Active entry = cap_top_target_imm_addrs[pipe] (2 bytes)
-        pop     de                      ; restore sublist cursor
+        ld      (iy+3), 0
+        ld      (iy+4), 0
         ld      a, (cps_pipe)
         add     a, a
         ld      hl, cap_top_target_imm_addrs
         add     a, l
         ld      l, a
-        jr      nc, .cps_ct_imm_nc
+        jr      nc, .cps_ct_act_nc
         inc     h
-.cps_ct_imm_nc:
+.cps_ct_act_nc:
         ld      a, (hl)
-        ld      (de), a
-        inc     de
+        ld      (ix+0), a
         inc     hl
         ld      a, (hl)
-        ld      (de), a
-        inc     de
-        push    de
-        jp      .cps_row_done
+        ld      (ix+1), a
+        inc     ix
+        inc     ix
+        ld      de, SLOT_ROW_STRIDE
+        add     iy, de
+        inc     c
 
-        ; ── cap_bot template ─────────────────────────────────────
-.cps_do_cap_bot:
+.band3:
+        ; ─── Band 3: skip, while C < min(cap_bot_row, row_end) ────
+        ld      a, (cps_cap_bot_row)
+        ld      b, a
+        ld      a, (cps_row_end)
+        cp      b
+        jr      nc, .b3_limit_set
+        ld      b, a
+.b3_limit_set:
+        ld      a, c
+        cp      b
+        jp      nc, .band4
+.band3_lp:
+        ld      (iy+0), 0
+        ld      (iy+1), 0
+        ld      (iy+2), 0
+        ld      (iy+3), 0
+        ld      (iy+4), 0
+        ld      de, SLOT_ROW_STRIDE
+        add     iy, de
+        inc     c
+        ld      a, c
+        cp      b
+        jp      c, .band3_lp
+
+.band4:
+        ; ─── Band 4: cap_bot, if C == cap_bot_row and C < row_end ─
+        ld      a, (cps_cap_bot_row)
+        cp      c
+        jp      nz, .band5
+        ld      a, (cps_row_end)
+        cp      c
+        jp      z, .save_and_done
+        jp      c, .save_and_done
         ld      hl, (cps_cap_bot_handler_addr)
         ld      (iy+0), $C3
         ld      (iy+1), l
         ld      (iy+2), h
-        ld      (iy+3), $00
-        ld      (iy+4), $00
-.cps_cb_emit_active:
-        pop     de
+        ld      (iy+3), 0
+        ld      (iy+4), 0
         ld      a, (cps_pipe)
         add     a, a
         ld      hl, cap_bot_target_imm_addrs
         add     a, l
         ld      l, a
-        jr      nc, .cps_cb_imm_nc
+        jr      nc, .cps_cb_act_nc
         inc     h
-.cps_cb_imm_nc:
+.cps_cb_act_nc:
         ld      a, (hl)
-        ld      (de), a
-        inc     de
+        ld      (ix+0), a
         inc     hl
         ld      a, (hl)
-        ld      (de), a
-        inc     de
-        push    de
-        jp      .cps_row_done
+        ld      (ix+1), a
+        inc     ix
+        inc     ix
+        ld      de, SLOT_ROW_STRIDE
+        add     iy, de
+        inc     c
 
-        ; ── skip template ────────────────────────────────────────
-.cps_do_skip:
-        ld      (iy+0), $00
-        ld      (iy+1), $00
-        ld      (iy+2), $00
-        ld      (iy+3), $00
-        ld      (iy+4), $00
-.cps_skip_done:
-        pop     de                      ; no active list entry for skip
-        push    de
-        jp      .cps_row_done
+.band5:
+        ; ─── Band 5: body, while C < row_end ──────────────────────
+        ld      a, (cps_row_end)
+        ld      b, a
+        ld      a, c
+        cp      b
+        jp      nc, .save_and_done
+.band5_lp:
+        call    cps_emit_body
+        ld      de, SLOT_ROW_STRIDE
+        add     iy, de
+        inc     c
+        ld      a, c
+        cp      b
+        jp      c, .band5_lp
 
-        ; ── body template ────────────────────────────────────────
-.cps_do_body:
-        ; Body: 31 lo hi D5 C5
-        ; Look up precomputed screen target (byte_x=29 baseline).
-        ; Only valid when cps_byte_x == 29 (the recycle case). For sync (init)
-        ; configure with non-29 byte_x, fall back to computed path.
-        ld      a, (cps_byte_x)
-        cp      29
-        jr      nz, .cps_body_compute
-        ; Fast: read from screen_target_table_29[row]
-        ld      l, b
-        ld      h, 0
-        add     hl, hl                  ; row*2
-        ld      de, screen_target_table_29
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        ld      h, d
-        ld      l, e
-        jr      .cps_body_emit
-.cps_body_compute:
-        ; Slow path: compute line_table[row] + byte_x + 3
-        ld      l, b
-        ld      h, 0
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        ld      a, (cps_byte_x)
-        add     a, 3
-        add     a, e
-        ld      l, a
-        ld      h, d
-        jr      nc, .cps_body_emit
-        inc     h
-.cps_body_emit:
-        ld      (iy+0), $31
-        ld      (iy+1), l
-        ld      (iy+2), h
-        ld      (iy+3), $D5
-        ld      (iy+4), $C5
-        ; Active entry: slot_addr + 1 (target imm lo byte)
-        pop     de
-        push    iy
-        pop     hl                      ; HL = slot base
-        inc     hl                      ; HL = slot_addr + 1
-        ld      a, l
-        ld      (de), a
-        inc     de
-        ld      a, h
-        ld      (de), a
-        inc     de
-        push    de
-        jp      .cps_row_done
+.save_and_done:
+        ; Save active cursor in case a second half follows.
+        push    ix
+        pop     hl
+        ld      (cps_active_save), hl
 
-.cps_row_done:
-        pop     de                      ; restore sublist cursor
-        pop     bc                      ; restore B=row
-        inc     b
-        ld      a, b
-        cp      GROUND_TOP              ; 160
-        jp      nz, .cps_row_lp
+        ; Post-loop must run on BOTH halves. If first half emits cap_top, the
+        ; cap_top_handler's _next SMC imm still points at the OLD slot address
+        ; until post_loop patches it. PIPE_PROGRAM on the interim frame would
+        ; fire the cap handler, jp to the OLD _next (BEFORE the new cap_top
+        ; row), loop back into cap_top, and freeze. Cap-imm writes are
+        ; idempotent so running the patch on both halves is safe.
+
+.cps_post_loop:
 
         ; ── Patch cap_top handler target imm ─────────────────────
         ; target = line_table[cap_top_row] + byte_x + 3
@@ -1238,6 +901,58 @@ configure_pipe_slots:
         ret
 
 ;----------------------------------------------------------------
+; cps_emit_body — body-slot emit helper used by configure_pipe_slots's band
+; loops. In: C = current row, IY = slot cursor, IX = active list cursor.
+; Writes 5 body bytes at IY; appends slot+1 to active list at IX; advances IX.
+; Clobbers AF, DE, HL.
+;----------------------------------------------------------------
+cps_emit_body:
+        ld      a, (cps_byte_x)
+        cp      29
+        jr      nz, .body_compute
+        ; Fast: target = screen_target_table_29[C]
+        ld      l, c
+        ld      h, 0
+        add     hl, hl
+        ld      de, screen_target_table_29
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        jr      .body_emit
+.body_compute:
+        ld      l, c
+        ld      h, 0
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      a, (cps_byte_x)
+        add     a, 3
+        add     a, e
+        ld      e, a
+        jr      nc, .body_emit
+        inc     d
+.body_emit:
+        ; DE = screen target. Emit $31 / lo / hi / $D5 / $C5.
+        ld      (iy+0), $31
+        ld      (iy+1), e
+        ld      (iy+2), d
+        ld      (iy+3), $D5
+        ld      (iy+4), $C5
+        ; Active list entry = slot_addr + 1 (= IY+1).
+        push    iy
+        pop     hl
+        inc     hl
+        ld      (ix+0), l
+        ld      (ix+1), h
+        inc     ix
+        inc     ix
+        ret
+
+;----------------------------------------------------------------
 ; compute_next_slot: given a cap row and the current pipe, return the address
 ; of the next slot to execute after the cap handler finishes.
 ;
@@ -1303,12 +1018,12 @@ cps_gap_y:              db 0
 cps_byte_x:             db 0
 cps_cap_top_row:        db 0
 cps_cap_bot_row:        db 0
+cps_row_start:          db 0
+cps_row_end:            db 0
 cps_cap_top_handler_addr: dw 0
 cps_cap_bot_handler_addr: dw 0
-; Walk cursor into SLOT_ADDR_TABLE for the currently-configured pipe.
-; Set in prologue to (SLOT_ADDR_TABLE + pipe*2); advanced by 6 per row.
-; Replaces the per-row indexed lookup (saves ~80T per row × 160 = ~13k).
-cps_slot_walk_ptr:      dw 0
+; Active-list cursor saved between split halves of configure_pipe_slots.
+cps_active_save:        dw 0
 
 ; ── Per-pipe active sublist base table ───────────────────────────
 cps_sublist_base_table:
@@ -1316,104 +1031,24 @@ cps_sublist_base_table:
         dw      ACTIVE_PIPE_1
         dw      ACTIVE_PIPE_2
 
-; Combined city patch table. Set by build_city_slot_bases at init and on
-; each recycle. 96 entries × 4 bytes = 384 bytes.
-; Each entry (pipe-major order): target_lo, target_hi, base_lo, base_hi
-;   target = slot+1 addr (where cache_lo is written); base = bitmap base addr.
-;   For cap slots: target = city_patch_scratch, base = 0 (write is harmless).
-city_patch_table: ds 384, 0
-city_patch_scratch: dw 0            ; harmless write target for cap slots
-pcsca_saved_sp: dw 0               ; SP save/restore for SP-hijack patch
-
-; Per-(pipe, row) slot+1 address. 96 entries × 2 bytes = 192 bytes.
-; Layout: pipe-major (pipe 0 rows 0..31, pipe 1 rows 0..31, pipe 2 rows 0..31).
-; For body slots: stores slot_first_byte + 1 (where cache_lo gets written).
-; For cap slots (non-$31 first byte): stores address of pcsca_scratch.
-slot_targets: ds 192, 0
-
-pcsca_scratch: dw 0   ; safe write target for cap slots (harmless)
-
 ; Precomputed screen targets for byte_x=29 baseline (recycle byte_x).
 ; targets[row] = line_table[row] + 32 (= byte_x=29 + 3). Populated at init.
 ; Used by configure_pipe_slots body emit to skip the line_table+byte_x add.
 screen_target_table_29: ds 320, 0       ; 160 entries × 2 bytes
 
 ;----------------------------------------------------------------
-; init_background: fill bg_buffer with sky + cityscape, then blit
-; the buffer to the screen
+; init_background: zero bg_buffer (all-sky) then blit to screen pixels.
 ;----------------------------------------------------------------
 init_background:
         ld      hl, BG_BUFFER
         ld      de, BG_BUFFER + 1
         ld      (hl), 0
         ld      bc, $17FF
-        ldir                            ; bg = all zero (sky)
-
-        ld      iy, cityscape_heights
-        ld      c, 0
-.cs:
-        ld      a, (iy+0)
-        or      a
-        jr      z, .cs_skip
-        ld      b, a                    ; line count = height
-        ld      d, a
-        ld      a, CITY_BOTTOM
-        sub     d                       ; A = start_line
-        push    iy
-        call    draw_bg_column
-        pop     iy
-.cs_skip:
-        inc     iy
-        inc     c                       ; advance col counter
-        ld      a, c
-        cp      32
-        jr      nz, .cs
-
+        ldir
         ld      hl, BG_BUFFER
         ld      de, $4000
         ld      bc, $1800
-        ldir                            ; copy bg → screen
-        ret
-
-;----------------------------------------------------------------
-; draw_bg_column: write cityscape_pattern bytes to bg_buffer at column C,
-; lines A..A+B-1. Pattern indexed by (start_line - CITY_TOP + iter) so
-; the skyscraper tile aligns globally across all building columns.
-; All stack work happens BEFORE SP-hijack (otherwise pop reads line_table).
-;----------------------------------------------------------------
-draw_bg_column:
-        ; Compute DE = cityscape_pattern + (A - CITY_TOP)
-        push    af                       ; save A
-        sub     CITY_TOP
-        ld      de, cityscape_pattern
-        add     a, e
-        ld      e, a
-        jr      nc, .no_carry
-        inc     d
-.no_carry:
-        pop     af                       ; restore A = start line
-        ; Compute HL = line_table + A*2 (preserving DE)
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        push    de
-        ld      de, line_table
-        add     hl, de
-        pop     de
-        ; SP-hijack — from here on, no push/pop on caller's stack
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        set     7, h                    ; HL → bg_buffer
-        ld      a, (de)
-        ld      (hl), a
-        inc     de
-        djnz    .lp
-        ld      sp, (saved_sp)
+        ldir
         ret
 
 ;----------------------------------------------------------------
@@ -1443,15 +1078,13 @@ init_screen_target_table:
 init_pipes:
         xor     a
         ld      (phase), a
-        call    update_city_cache
         call    init_slot_addr_table        ; precompute slot_addr_table[160][3]
         call    init_screen_target_table    ; precompute screen_target_table_29[160]
         call    init_pipe_program           ; emit fixed slot grid (reads slot_addr_table)
-        ; For each pipe, apply initial cap/skip configuration.
+        ; For each pipe, apply initial cap/skip configuration (full pass).
         xor     a                            ; pipe index 0
 .init_cps_lp:
         push    af
-        ; E = pipe_state[pipe*2 + 1] = initial gap_y
         ld      l, a
         ld      h, 0
         add     hl, hl                       ; pipe * 2
@@ -1461,112 +1094,18 @@ init_pipes:
         ld      e, (hl)                      ; E = initial gap_y
         pop     af
         push    af
+        ld      b, 0                         ; row_start = 0
+        ld      c, GROUND_TOP                ; row_end = 160 (full pass)
         call    configure_pipe_slots
         pop     af
         inc     a
         cp      NUM_PIPES
         jr      nz, .init_cps_lp
-        ; city_base_lut was pre-built by init_city_base_lut before init_pipes.
-        call    build_slot_targets      ; pre-compute slot_targets from SAT
         ; ACTIVE_COUNT_NEW = 3 * 112 = 336 (used by patch_pipe_targets to walk
         ; the three per-pipe sublists at ACTIVE_PIPE_0..PIPE_2 contiguously).
         ld      hl, 336
         ld      (ACTIVE_COUNT_NEW), hl
         call    redraw_pipes_v2
-        ret
-
-;----------------------------------------------------------------
-; init_city_base_lut: pre-compute city_base_lut[byte_x=1..29][row_idx=0..31].
-;
-; For every (byte_x, row_idx) pair:
-;   col_L     = byte_x - 1
-;   col_R     = byte_x + 2
-;   threshold = 32 - row_idx          (= CITY_BOTTOM - (CITY_TOP + row_idx))
-;   has_city  = (heights[col_L] >= threshold) OR (heights[col_R] >= threshold)
-;   parity    = row_idx & 1
-;   base      = parity ? pipe_bitmap_city_b
-;             : has_city ? pipe_bitmap_city_a
-;             : pipe_bitmap              (sky)
-;   if NOT has_city: base = pipe_bitmap  (sky, regardless of parity)
-;
-; Result stored at CITY_BASE_LUT + (byte_x-1)*64 + row_idx*2 (LE 16-bit).
-; Total 29*32*2 = 1856 bytes at $C000..$C73F — inside BG_BUFFER which is
-; freed after init_background/init_city_base_lut; no overlap with BACKUP_ATTRS
-; ($D800+) or SLOT_GRID_BASE ($DB00+).
-;
-; Clobbers AF, BC, DE, HL, IX.
-;----------------------------------------------------------------
-init_city_base_lut:
-        ; IX = write cursor into LUT
-        ld      ix, CITY_BASE_LUT
-
-        ld      b, 1                    ; B = byte_x (1..29)
-.icbl_bx_lp:
-        ; col_L = byte_x - 1 (B-1); col_R = byte_x + 2 (B+2)
-        ; Read h_L = cityscape_heights[byte_x-1]
-        ld      a, b
-        dec     a                       ; A = col_L
-        ld      l, a
-        ld      h, 0
-        ld      de, cityscape_heights
-        add     hl, de
-        ld      c, (hl)                 ; C = h_L
-
-        ; Read h_R = cityscape_heights[byte_x+2]
-        ld      a, b
-        add     a, 2                    ; A = col_R
-        ld      l, a
-        ld      h, 0
-        ld      de, cityscape_heights
-        add     hl, de
-        ld      d, (hl)                 ; D = h_R
-
-        ; Inner loop: row_idx 0..31
-        ; threshold starts at 32 and decrements
-        ld      e, 32                   ; E = threshold (32-row_idx), starts at 32
-
-.icbl_row_lp:
-        ; Check has_city = (h_L >= threshold) OR (h_R >= threshold)
-        ld      a, c                    ; A = h_L
-        cp      e                       ; h_L - threshold; nc if h_L >= threshold
-        jr      nc, .icbl_city
-
-        ld      a, d                    ; A = h_R
-        cp      e
-        jr      nc, .icbl_city
-
-        ; No city: base = pipe_bitmap
-        ld      hl, pipe_bitmap
-        jr      .icbl_store
-
-.icbl_city:
-        ; has_city: pick variant by parity = (32-E) & 1 = E & 1 (same parity)
-        ; row_idx = 32 - E; parity = row_idx & 1 = (32-E) & 1 = E & 1 (32 even)
-        ld      a, e
-        and     1
-        jr      nz, .icbl_city_b        ; E odd → row_idx odd → B variant
-        ld      hl, pipe_bitmap_city_a
-        jr      .icbl_store
-.icbl_city_b:
-        ld      hl, pipe_bitmap_city_b
-
-.icbl_store:
-        ; Write HL (base addr) LE at (IX)
-        ld      (ix+0), l
-        ld      (ix+1), h
-        inc     ix
-        inc     ix
-
-        ; Advance: threshold--; stop when threshold reaches 0 (row_idx = 32)
-        dec     e
-        jr      nz, .icbl_row_lp
-
-        ; Next byte_x
-        inc     b
-        ld      a, b
-        cp      30                      ; byte_x in 1..29 → stop when B reaches 30
-        jr      nz, .icbl_bx_lp
-
         ret
 
 ;----------------------------------------------------------------
@@ -1603,32 +1142,6 @@ frame_update:
         ld      (wrap_pending), a
         call    restore_trailing_pipe_attrs
 .skip_restore:
-        ; Deferred configure_pipe_slots dispatch (WHITE band, ~20k headroom
-        ; on non-wrap frames). Keeps vblank pre-MAGENTA at ~3k so MAGENTA
-        ; always reaches before raster.
-        ;   pending_regen states: 0 = nothing, 2 = wait one more frame, 1 = run.
-        ld      a, (pending_regen)
-        or      a
-        jr      z, .no_regen
-        cp      1
-        jr      z, .fu_do_regen
-        dec     a
-        ld      (pending_regen), a
-        jr      .no_regen
-.fu_do_regen:
-        xor     a
-        ld      (pending_regen), a
-        ld      a, (recycled_pipe_idx)
-        push    af
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        ld      de, pipe_state
-        add     hl, de
-        inc     hl
-        ld      e, (hl)
-        pop     af
-        call    configure_pipe_slots
 .no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
@@ -1682,7 +1195,7 @@ draw_ground:
 .line_lp:
         ; CRITICAL: reset SP to caller stack BEFORE any push. After the SP
         ; hijack in iter N, SP sits in screen RAM at line_addr_N; an unsafe
-        ; push iy/push bc would write into the interleaved cityscape row 19.
+        ; push iy/push bc would write into screen pixel memory.
         ld      sp, (saved_sp)
         ; Tile byte for line D = (IY + (D mod 8))
         ld      a, d
@@ -1732,96 +1245,6 @@ draw_ground:
         ld      sp, (saved_sp)
         ret
 
-;----------------------------------------------------------------
-; update_cap_smc: load pre-shifted rounded-rim bytes into all 7 cap variants.
-;----------------------------------------------------------------
-; update_cap_smc: only LMMR / LMMR_city slots, since byte_x ∈ [1, 29] always.
-;----------------------------------------------------------------
-update_cap_smc:
-        ld      a, (phase)
-        add     a, a
-        add     a, a                    ; phase * 4
-        ld      c, a
-        ld      b, 0
-        ld      hl, cap_rounded_bitmap
-        add     hl, bc
-        ld      a, (hl)                  ; byte 0 → L
-        ld      (paint_cap_rounded_LMMR.smc_l + 1), a
-        ld      (paint_cap_rounded_LMMR_city.smc_l + 1), a
-        ld      (redraw_pipes_linemajor.lm_p1_cL), a
-        ld      (redraw_pipes_linemajor.lm_p2_cL), a
-        ld      (redraw_pipes_linemajor.lm_p3_cL), a
-        ld      (redraw_pipes_linemajor.lm_p1_cL_b), a
-        ld      (redraw_pipes_linemajor.lm_p2_cL_b), a
-        ld      (redraw_pipes_linemajor.lm_p3_cL_b), a
-        inc     hl
-        ld      a, (hl)                  ; byte 1 → M1
-        ld      (paint_cap_rounded_LMMR.smc_m1 + 1), a
-        ld      (paint_cap_rounded_LMMR_city.smc_m1 + 1), a
-        ld      (redraw_pipes_linemajor.lm_p1_cM1), a
-        ld      (redraw_pipes_linemajor.lm_p2_cM1), a
-        ld      (redraw_pipes_linemajor.lm_p3_cM1), a
-        ld      (redraw_pipes_linemajor.lm_p1_cM1_b), a
-        ld      (redraw_pipes_linemajor.lm_p2_cM1_b), a
-        ld      (redraw_pipes_linemajor.lm_p3_cM1_b), a
-        inc     hl
-        ld      a, (hl)                  ; byte 2 → M2
-        ld      (paint_cap_rounded_LMMR.smc_m2 + 1), a
-        ld      (paint_cap_rounded_LMMR_city.smc_m2 + 1), a
-        ld      (redraw_pipes_linemajor.lm_p1_cM2), a
-        ld      (redraw_pipes_linemajor.lm_p2_cM2), a
-        ld      (redraw_pipes_linemajor.lm_p3_cM2), a
-        ld      (redraw_pipes_linemajor.lm_p1_cM2_b), a
-        ld      (redraw_pipes_linemajor.lm_p2_cM2_b), a
-        ld      (redraw_pipes_linemajor.lm_p3_cM2_b), a
-        inc     hl
-        ld      a, (hl)                  ; byte 3 → R
-        ld      (paint_cap_rounded_LMMR.smc_r + 1), a
-        ld      (paint_cap_rounded_LMMR_city.smc_r + 1), a
-        ld      (redraw_pipes_linemajor.lm_p1_cR), a
-        ld      (redraw_pipes_linemajor.lm_p2_cR), a
-        ld      (redraw_pipes_linemajor.lm_p3_cR), a
-        ld      (redraw_pipes_linemajor.lm_p1_cR_b), a
-        ld      (redraw_pipes_linemajor.lm_p2_cR_b), a
-        ld      (redraw_pipes_linemajor.lm_p3_cR_b), a
-
-        ; Outmasks for cap city variant.
-        ld      a, (phase)
-        ld      c, a
-        ld      b, 0
-        ld      hl, l_out_masks
-        add     hl, bc
-        ld      a, (hl)
-        ld      (paint_cap_rounded_LMMR_city.smc_l_outmask + 1), a
-        ld      hl, r_out_masks
-        add     hl, bc
-        ld      a, (hl)
-        ld      (paint_cap_rounded_LMMR_city.smc_r_outmask + 1), a
-
-        ; Cache "cap-on-cityscape" L and R tile bytes for this phase.
-        ld      a, (phase)
-        add     a, a
-        add     a, a
-        ld      c, a
-        ld      b, 0
-        ld      hl, cap_rounded_bitmap_city
-        add     hl, bc                  ; HL → city cap L byte for this phase
-        ld      a, (hl)
-        ld      (city_cL_cache), a
-        inc     hl
-        inc     hl
-        inc     hl                      ; skip M1, M2 → R byte
-        ld      a, (hl)
-        ld      (city_cR_cache), a
-        ret
-
-;----------------------------------------------------------------
-; patch_pipe_targets: called after wrap_byte_x. For each of 3 pipes,
-; walks 160 rows; for each row whose slot_addr_table entry is non-zero,
-; decrements target_table[row] (since byte_x dropped by 1) and writes
-; the new 16-bit target into the ld sp,nn immediate slot at slot_addr.
-;
-; ~11 k T-states amortized over 4 frames = 2.7 k per frame.
 ;----------------------------------------------------------------
 patch_pipe_targets:
         ; SP-hijack 4-way unrolled walker. Reads entry addresses via pop hl
@@ -2015,622 +1438,12 @@ patch_pipe_targets:
         ret
 
 ;----------------------------------------------------------------
-; patch_pipe_city_slots: A = pipe (0..2), C = mode (0=city, 1=sky).
-; Rewrites the 16-bit (nn) operand of each of pipe's 32 city body slots
-; (rows 128..159) so PIPE_PROGRAM's `ld sp, (nn)` reads from the right
-; global bitmap ptr:
-;   sky mode (byte_x in buffer cols): all 32 → current_sky_ptr
-;   city mode (byte_x in visible cols, uniform cityscape): even row_idx →
-;       current_city_a_ptr, odd row_idx → current_city_b_ptr.
-;
-; Called from wrap_byte_x on byte_x transitions 29→28 (enter visible,
-; mode=city) and 2→1 (exit visible, mode=sky). With uniform cityscape
-; heights these are the only two transitions where the slot ptr choice
-; changes; in between, ptrs are stable.
-;
-; Cost ~1k T-states per call; ~once per ~30 wraps per pipe so amortized
-; negligible.
-; Clobbers: A, B, DE, HL.
-;----------------------------------------------------------------
-patch_pipe_city_slots:
-        ld      hl, SLOT_ADDR_TABLE + 128 * 6   ; row 128 base
-        add     a, a                            ; pipe * 2
-        add     a, l
-        ld      l, a
-        jr      nc, .ppcs_base_nc
-        inc     h
-.ppcs_base_nc:
-        ld      b, 32                           ; 32 city rows
-.ppcs_lp:
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = slot address
-        push    hl
-        ; Only patch CITY BODY slots ($ED $7B = ld sp, (nn)). Cap slots in the
-        ; city band start with $C3 (jp), skip slots with $00. Writing slot+2
-        ; on those would clobber the cap handler's JP target hi byte (crash)
-        ; or write a benign-looking-but-wrong opcode into skip slots.
-        ld      a, (de)
-        cp      $ED
-        jr      nz, .ppcs_skip_slot
-        inc     de
-        inc     de                              ; DE = slot+2 = (nn) lo byte
-        bit     0, c                            ; mode: sky?
-        jr      nz, .ppcs_write_sky
-        ; city mode: A variant if B even, B variant if B odd
-        bit     0, b
-        jr      nz, .ppcs_write_city_b
-        ld      a, low current_city_a_ptr
-        ld      (de), a
-        inc     de
-        ld      a, high current_city_a_ptr
-        ld      (de), a
-        jr      .ppcs_next
-.ppcs_write_city_b:
-        ld      a, low current_city_b_ptr
-        ld      (de), a
-        inc     de
-        ld      a, high current_city_b_ptr
-        ld      (de), a
-        jr      .ppcs_next
-.ppcs_write_sky:
-        ld      a, low current_sky_ptr
-        ld      (de), a
-        inc     de
-        ld      a, high current_sky_ptr
-        ld      (de), a
-.ppcs_next:
-.ppcs_skip_slot:
-        pop     hl
-        ld      a, l
-        add     a, 5
-        ld      l, a
-        jr      nc, .ppcs_nc
-        inc     h
-.ppcs_nc:
-        djnz    .ppcs_lp
-        ret
-
-;----------------------------------------------------------------
-; gen_pipe_program: full regenerate of the flat render program.
-; Walks rows 0..159; for each pipe, classifies row and emits the
-; appropriate template at IY (output cursor in pipe_program).
-; Records slot addresses into slot_addr_table[pipe][row] and screen
-; targets into target_table[pipe][row].
-;
-; TASK 5: sky body only. Cap/city emit added later.
-;----------------------------------------------------------------
-gen_pipe_program:
-        ; Zero the slot_addr_table so unused rows are marked inactive.
-        ld      hl, SLOT_ADDR_TABLE
-        ld      de, SLOT_ADDR_TABLE + 1
-        ld      (hl), 0
-        ld      bc, SLOT_ADDR_TABLE_END - SLOT_ADDR_TABLE - 1
-        ldir
-
-        ld      iy, PIPE_PROGRAM
-        ; Emit prologue: ld (saved_sp), sp  (4 bytes: ED 73 lo hi)
-        ld      (iy+0), $ED
-        ld      (iy+1), $73
-        ld      (iy+2), low saved_sp
-        ld      (iy+3), high saved_sp
-        ld      de, 4
-        add     iy, de
-        ld      b, 0                    ; row counter
-.row_lp:
-        ld      c, 0                    ; pipe counter
-.pipe_lp:
-        push    bc
-        ; Classify row B for pipe C → decide template
-        ;   body row     : row < gap_y_C - 1
-        ;   cap top      : row == gap_y_C - 1
-        ;   in gap       : gap_y_C <= row < gap_y_C + PIPE_GAP
-        ;   cap bot      : row == gap_y_C + PIPE_GAP
-        ;   body bot     : gap_y_C + PIPE_GAP < row < GROUND_TOP
-        ld      hl, pipe_state
-        ld      a, c
-        add     a, a
-        add     a, l
-        ld      l, a                    ; HL → pipe_state[pipe*2]
-        ld      a, (hl)                 ; A = byte_x
-        ld      e, a                    ; E = byte_x
-        inc     hl
-        ld      a, (hl)                 ; A = gap_y
-        ld      d, a                    ; D = gap_y
-
-        ; row in (gap_y .. gap_y+PIPE_GAP-1)?  in_gap if true.
-        ld      a, b
-        cp      d
-        jr      c, .not_in_gap          ; row < gap_y
-        ld      a, d
-        add     a, PIPE_GAP
-        ld      l, a                    ; L = gap_y + PIPE_GAP
-        ld      a, b
-        cp      l
-        jr      nc, .not_in_gap         ; row >= gap_y+PIPE_GAP
-        ; In gap — skip.
-        jp      .pipe_done
-.not_in_gap:
-        ; Cap-top check: row B == gap_y D - 1
-        ld      a, d                    ; D = gap_y
-        dec     a
-        cp      b
-        jp      z, .emit_cap_top
-        ; Cap-bot check: row B == gap_y D + PIPE_GAP
-        ld      a, d
-        add     a, PIPE_GAP
-        cp      b
-        jp      z, .emit_cap_bot
-        ; Otherwise: sky-body row — check for city band first
-.emit_sky_body:
-        ld      a, b
-        cp      CITY_TOP
-        jp      nc, .emit_city_body     ; row >= 128 → city template
-        ; --- Emit: ld sp, line_table[row]+byte_x+3 ; push de ; push bc ---
-        ;   ld sp, nn       opcode = $31, then nn lo, nn hi (3 bytes)
-        ;   push de         opcode = $D5                    (1 byte)
-        ;   push bc         opcode = $C5                    (1 byte)
-        ;
-        ; Even row uses BC/DE (sky-A); odd row prepends exx + appends exx (sky-B).
-        ld      a, b
-        and     1
-        jr      z, .emit_a
-        ld      (iy+0), $D9             ; exx (prepend)
-        inc     iy
-.emit_a:
-        ; Record slot addr → slot_addr_table[pipe][row] = address of "ld sp" immediate (= IY+1)
-        push    iy
-        pop     hl
-        inc     hl                      ; HL = address of nn-lo byte of "ld sp,nn"
-        push    hl                      ; save slot-immediate addr
-        ld      a, c
-        add     a, a                    ; pipe * 2 (16-bit entry stride)
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_slot_base
-        add     hl, de
-        ld      a, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, a                    ; HL = SLOT_ADDR_TABLE base for this pipe
-        ex      de, hl                  ; DE = base
-        ld      h, 0
-        ld      l, b
-        add     hl, hl                  ; HL = row*2 (16-bit, no overflow)
-        add     hl, de                  ; HL = base + row*2
-        pop     de                      ; DE = slot-immediate addr (= original IY+1)
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-
-        ; --- Compute screen_target = line_table[row] + byte_x + 3 ---
-        ld      a, b
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; row*2
-        ld      de, line_table
-        add     hl, de                  ; HL → line_table[row]
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = line_addr
-        ; Reload byte_x for pipe C (E was clobbered earlier inside this row)
-        ld      hl, pipe_state
-        ld      a, c
-        add     a, a
-        add     a, l
-        ld      l, a
-        ld      a, (hl)                 ; A = byte_x
-        add     a, 3                    ; +3 for stack-blast offset
-        ld      l, a
-        ld      h, 0
-        add     hl, de                  ; HL = line_addr + byte_x + 3
-        push    hl                      ; save target
-
-        ; Save into target_table[pipe][row]
-        ld      a, c
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_target_base
-        add     hl, de
-        ld      a, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, a                    ; HL = target_table base for pipe
-        ex      de, hl                  ; DE = base
-        ld      h, 0
-        ld      l, b
-        add     hl, hl                  ; HL = row*2 (16-bit, no overflow)
-        add     hl, de                  ; HL = base + row*2
-        pop     de                      ; DE = target
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-
-        ; --- Emit the actual 5 bytes at IY ---
-        ld      (iy+0), $31             ; ld sp, nn
-        ld      (iy+1), e               ; lo
-        ld      (iy+2), d               ; hi
-        ld      (iy+3), $D5             ; push de
-        ld      (iy+4), $C5             ; push bc
-        ld      de, 5
-        add     iy, de
-
-        ; If odd row, append exx to swap back
-        ld      a, b
-        and     1
-        jp      z, .pipe_done
-        ld      (iy+0), $D9             ; exx
-        inc     iy
-        jp      .pipe_done
-
-.emit_cap_top:
-        xor     a                       ; cap_idx_within_pipe = 0 (cap_top)
-        jp      .do_cap
-.emit_cap_bot:
-        ld      a, 4                    ; cap_idx_within_pipe = 4 (cap_bot)
-.do_cap:
-        ld      (.cap_idx_temp), a      ; remember which cap this is for restore decision
-
-        ; --- Emit "ld bc, 0, 0" at IY+0..IY+2 (cap L/M1 placeholder) ---
-        ld      (iy+0), $01             ; ld bc, nn
-        ld      (iy+1), 0
-        ld      (iy+2), 0
-        ; bc-imm slot address = IY+1. Record into cap_slot_table[pipe*8 + cap_idx + 0..1].
-        ld      a, c                    ; pipe (0..2)
-        add     a, a
-        add     a, a
-        add     a, a                    ; pipe * 8
-        ld      l, a
-        ld      h, 0
-        ld      de, cap_slot_table
-        add     hl, de                  ; HL → cap_slot_table[pipe*8]
-        ld      a, (.cap_idx_temp)
-        ld      e, a
-        ld      d, 0
-        add     hl, de                  ; HL → cap_slot_table[pipe*8 + cap_idx]
-        push    iy
-        pop     de
-        inc     de                      ; DE = IY+1 = bc-imm slot
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-        inc     hl                      ; HL → de-imm slot ptr position
-
-        ; --- Emit "ld de, 0, 0" at IY+3..IY+5 (cap M2/R placeholder) ---
-        ld      (iy+3), $11             ; ld de, nn
-        ld      (iy+4), 0
-        ld      (iy+5), 0
-        ; de-imm slot address = IY+4. Record at HL.
-        push    iy
-        pop     de
-        inc     de
-        inc     de
-        inc     de
-        inc     de                      ; DE = IY+4 = de-imm slot
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-
-        ; --- Compute screen_target = line_table[row] + byte_x + 3 ---
-        ld      a, b                    ; row
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; row*2
-        ld      de, line_table
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = line_addr
-        ld      hl, pipe_state
-        ld      a, c
-        add     a, a
-        add     a, l
-        ld      l, a
-        ld      a, (hl)                 ; A = byte_x
-        add     a, 3                    ; +3 for stack-blast offset
-        ld      l, a
-        ld      h, 0
-        add     hl, de                  ; HL = line_addr + byte_x + 3 = target
-        push    hl                      ; save target
-
-        ; --- Save target to target_table[pipe][row] ---
-        ld      a, c
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_target_base
-        add     hl, de
-        ld      a, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, a                    ; HL = target_table base for pipe
-        ex      de, hl                  ; DE = base
-        ld      h, 0
-        ld      l, b
-        add     hl, hl                  ; HL = row*2 (16-bit)
-        add     hl, de                  ; HL = base + row*2
-        pop     de                      ; DE = target
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-
-        ; --- Emit "ld sp, target ; push de ; push bc" at IY+6..IY+10 ---
-        ld      (iy+6), $31             ; ld sp, nn
-        ld      (iy+7), e               ; lo
-        ld      (iy+8), d               ; hi
-        ld      (iy+9), $D5             ; push de
-        ld      (iy+10), $C5            ; push bc
-
-        ; --- Record slot_addr_table[pipe][row] = address of ld sp imm (= IY+7) ---
-        push    iy
-        pop     hl
-        ld      de, 7
-        add     hl, de                  ; HL = IY+7
-        push    hl                      ; save slot-imm addr
-        ld      a, c
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_slot_base
-        add     hl, de
-        ld      a, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, a                    ; HL = slot_addr_table base for pipe
-        ex      de, hl                  ; DE = base
-        ld      h, 0
-        ld      l, b
-        add     hl, hl                  ; HL = row*2 (16-bit)
-        add     hl, de                  ; HL = base + row*2
-        pop     de                      ; DE = IY+7
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-
-        ; --- Advance IY past the 11 emitted bytes ---
-        ld      de, 11
-        add     iy, de
-
-        ; --- ALWAYS emit BC/DE restore (8 bytes) for both cap_top and cap_bot. ---
-        ; The cap emit clobbered BC and DE. Subsequent pipes' body emits on the
-        ; SAME row use BC/DE (push de/push bc); without this restore they would
-        ; push cap bytes instead of body bytes, producing the visible artifact
-        ; where pipes after a clobbering pipe show cap pixels in their body.
-        ld      (iy+0), $ED
-        ld      (iy+1), $4B
-        ld      (iy+2), low body_a_bc
-        ld      (iy+3), high body_a_bc
-        ld      (iy+4), $ED
-        ld      (iy+5), $5B
-        ld      (iy+6), low body_a_de
-        ld      (iy+7), high body_a_de
-        ld      de, 8
-        add     iy, de
-        jp      .pipe_done
-
-.cap_idx_temp:  db 0
-
-.emit_city_body:
-        ; City template (10 bytes total):
-        ;   ld sp, $imm_city_cache_slot   ; $31 + 2 bytes (3 bytes)
-        ;   pop bc                        ; $C1           (1)
-        ;   pop de                        ; $D1           (1)
-        ;   ld sp, $imm_screen_target     ; $31 + 2 bytes (3)
-        ;   push de                       ; $D5           (1)
-        ;   push bc                       ; $C5           (1)
-
-        ; Compute city_cache slot addr = CITY_CACHE + (row - CITY_TOP) * 12 + pipe * 4
-        ld      a, b
-        sub     CITY_TOP
-        ; A = row offset (0..31). Multiply by 12.
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; *2
-        add     hl, hl                  ; *4
-        ld      d, h
-        ld      e, l                    ; DE = row_offset * 4
-        add     hl, hl                  ; *8
-        add     hl, de                  ; *12
-        ld      de, CITY_CACHE
-        add     hl, de                  ; HL = CITY_CACHE + row_offset * 12
-        ld      a, c                    ; A = pipe
-        add     a, a
-        add     a, a                    ; pipe * 4
-        add     a, l
-        ld      l, a
-        jr      nc, .city_nc1
-        inc     h
-.city_nc1:
-        ; HL = city_cache slot addr for (row, pipe)
-        ; Emit "ld sp, HL" at IY+0..IY+2
-        ld      (iy+0), $31
-        ld      (iy+1), l
-        ld      (iy+2), h
-        ld      (iy+3), $C1             ; pop bc
-        ld      (iy+4), $D1             ; pop de
-
-        ; --- Compute screen_target = line_table[row] + byte_x + 3 ---
-        ld      a, b                    ; row
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; row*2
-        ld      de, line_table
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = line_addr
-        ld      hl, pipe_state
-        ld      a, c
-        add     a, a
-        add     a, l
-        ld      l, a
-        ld      a, (hl)
-        add     a, 3
-        ld      l, a
-        ld      h, 0
-        add     hl, de                  ; HL = target
-        push    hl                      ; save target
-
-        ; --- Save target to target_table[pipe][row] ---
-        ld      a, c
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_target_base
-        add     hl, de
-        ld      a, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, a                    ; HL = target_table base for pipe
-        ex      de, hl                  ; DE = base
-        ld      h, 0
-        ld      l, b
-        add     hl, hl                  ; HL = row*2 (16-bit)
-        add     hl, de                  ; HL = base + row*2
-        pop     de                      ; DE = target
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-
-        ; --- Record slot_addr_table[pipe][row] = IY+6 (the screen-target imm) ---
-        push    iy
-        pop     hl
-        inc     hl
-        inc     hl
-        inc     hl
-        inc     hl
-        inc     hl
-        inc     hl                      ; HL = IY+6
-        push    hl                      ; save IY+6 addr
-        ld      a, c
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_slot_base
-        add     hl, de
-        ld      a, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, a                    ; HL = slot_addr_table base for pipe
-        ex      de, hl                  ; DE = base
-        ld      h, 0
-        ld      l, b
-        add     hl, hl                  ; HL = row*2 (16-bit)
-        add     hl, de                  ; HL = base + row*2
-        pop     de                      ; DE = IY+6 = screen-target imm addr
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-
-        ; --- Reload target from target_table[pipe][row] and emit IY+5..IY+9 ---
-        ld      a, c
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_target_base
-        add     hl, de
-        ld      a, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, a                    ; HL = target_table base for pipe
-        ex      de, hl                  ; DE = base
-        ld      h, 0
-        ld      l, b
-        add     hl, hl                  ; HL = row*2 (16-bit)
-        add     hl, de                  ; HL = base + row*2
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = target
-
-        ld      (iy+5), $31
-        ld      (iy+6), e
-        ld      (iy+7), d
-        ld      (iy+8), $D5
-        ld      (iy+9), $C5
-        ld      de, 10
-        add     iy, de
-
-        ; --- Emit BC/DE restore (8 bytes) after city emit. ---
-        ; City emit's pop bc / pop de clobbers BC/DE. Subsequent pipes' body
-        ; emits on the SAME row would push cache bytes; restore here so the
-        ; main register set holds sky-A body bytes again.
-        ld      (iy+0), $ED
-        ld      (iy+1), $4B
-        ld      (iy+2), low body_a_bc
-        ld      (iy+3), high body_a_bc
-        ld      (iy+4), $ED
-        ld      (iy+5), $5B
-        ld      (iy+6), low body_a_de
-        ld      (iy+7), high body_a_de
-        ld      de, 8
-        add     iy, de
-        jp      .pipe_done
-
-.pipe_done:
-        pop     bc                      ; restore pipe loop state
-        inc     c
-        ld      a, c
-        cp      NUM_PIPES
-        jp      c, .pipe_lp
-
-        inc     b
-        ld      a, b
-        cp      GROUND_TOP
-        jp      c, .row_lp
-
-        ; Emit "ld sp, (saved_sp) ; ret" — restores caller SP (which was
-        ; clobbered by the last row's ld sp,target) before the RET pops the
-        ; real return address. 5 bytes total.
-        ld      (iy+0), $ED
-        ld      (iy+1), $7B
-        ld      (iy+2), low saved_sp
-        ld      (iy+3), high saved_sp
-        ld      (iy+4), $C9
-
-        ; Build ACTIVE_LIST_NEW from non-zero slot_addr_table entries.
-        ; This lets patch_pipe_targets walk only active rows (~120) instead of
-        ; all 480 slots, cutting wrap-frame cost from ~25k to ~6k T-states.
-        ; Cost runs only on gen (init + recycle), not on per-wrap patch.
-        call    build_active_list_new
-        ret
-
-build_active_list_new:
-        ; Walk SLOT_ADDR_TABLE (480 entries). For each non-zero entry, append
-        ; its 16-bit value to ACTIVE_LIST_NEW and bump ACTIVE_COUNT_NEW (16-bit).
-        xor     a
-        ld      (ACTIVE_COUNT_NEW), a
-        ld      (ACTIVE_COUNT_NEW + 1), a
-        ld      c, NUM_PIPES
-        ld      hl, SLOT_ADDR_TABLE
-        ld      iy, ACTIVE_LIST_NEW
-.bal_pipe:
-        ld      b, 160
-.bal_row:
-        ld      a, (hl)
-        inc     hl
-        ld      e, a
-        ld      a, (hl)
-        inc     hl
-        ld      d, a
-        or      e
-        jr      z, .bal_skip
-        ld      (iy+0), e
-        ld      (iy+1), d
-        inc     iy
-        inc     iy
-        ; 16-bit increment of ACTIVE_COUNT_NEW
-        push    hl
-        ld      hl, (ACTIVE_COUNT_NEW)
-        inc     hl
-        ld      (ACTIVE_COUNT_NEW), hl
-        pop     hl
-.bal_skip:
-        djnz    .bal_row
-        dec     c
-        jp      nz, .bal_pipe
-        ret
-
+; wrap_byte_x: scroll all pipes left by one byte (8 px). For each pipe:
+;   - clear the old trailing column (paint_restore) if it is in visible playfield
+;   - decrement byte_x; on byte_x == 1 → recycle (random gap_y, byte_x = 29,
+;     defer slot regen by 2 frames via pending_regen)
+; Tail-call patch_pipe_targets to decrement every active body slot's screen
+; target by ROW_OFFSET (= 1) so they walk to the next column.
 ;----------------------------------------------------------------
 wrap_byte_x:
         ld      iy, pipe_state
@@ -2661,9 +1474,7 @@ wrap_byte_x:
         call    random_gap_y            ; A = new random gap_y; IY/BC preserved
         ld      (iy+1), a
         ld      a, 2
-        ld      (pending_regen), a      ; defer configure_pipe_slots by 2 frames
-                                        ; (1: this frame N already at limit with patch_city;
-                                        ;  N+1 runs deferred patch; N+2 runs configure)
+        ld      (pending_regen), a      ; defer 1 frame, then run full configure
         ; Record which pipe recycled — B counts down from NUM_PIPES to 1, so index = NUM_PIPES - B.
         ld      a, NUM_PIPES
         sub     b
@@ -2679,521 +1490,6 @@ wrap_byte_x:
         ; WHITE is partially hidden in bottom blanking, so this is less visible
         ; than running it in RED at top of next frame.
         call    patch_pipe_targets
-        ; (With uniform cityscape heights, city/sky decision per slot is fixed;
-        ;  no per-wrap patch_city_slot_ptrs needed.)
-        ret
-
-patch_pipe_smc:
-        ; Patch ALL variant slots — sky A, sky B, city A, city B — for each
-        ; pipe's offb/offc/capt/capb/capb_plus_1. Pipe state is identical
-        ; across all four physical emit blocks; we just have four copies.
-        ld      a, (pipe_state + 0)
-        dec     a
-        ld      (redraw_pipes_linemajor.lm_p1_offb), a
-        ld      (redraw_pipes_linemajor.lm_p1_offc), a
-        ld      (redraw_pipes_linemajor.lm_p1_offb_b), a
-        ld      (redraw_pipes_linemajor.lm_p1_offc_b), a
-        ld      a, (pipe_state + 1)
-        dec     a
-        ld      (redraw_pipes_linemajor.lm_p1_capt), a
-        ld      (redraw_pipes_linemajor.lm_p1_capt_b), a
-        add     a, PIPE_GAP + 1
-        ld      (redraw_pipes_linemajor.lm_p1_capb), a
-        ld      (redraw_pipes_linemajor.lm_p1_capb_b), a
-        inc     a
-        ld      (redraw_pipes_linemajor.lm_p1_capb_plus_1), a
-        ld      (redraw_pipes_linemajor.lm_p1_capb_plus_1_b), a
-
-        ld      a, (pipe_state + 2)
-        dec     a
-        ld      (redraw_pipes_linemajor.lm_p2_offb), a
-        ld      (redraw_pipes_linemajor.lm_p2_offc), a
-        ld      (redraw_pipes_linemajor.lm_p2_offb_b), a
-        ld      (redraw_pipes_linemajor.lm_p2_offc_b), a
-        ld      a, (pipe_state + 3)
-        dec     a
-        ld      (redraw_pipes_linemajor.lm_p2_capt), a
-        ld      (redraw_pipes_linemajor.lm_p2_capt_b), a
-        add     a, PIPE_GAP + 1
-        ld      (redraw_pipes_linemajor.lm_p2_capb), a
-        ld      (redraw_pipes_linemajor.lm_p2_capb_b), a
-        inc     a
-        ld      (redraw_pipes_linemajor.lm_p2_capb_plus_1), a
-        ld      (redraw_pipes_linemajor.lm_p2_capb_plus_1_b), a
-
-        ld      a, (pipe_state + 4)
-        dec     a
-        ld      (redraw_pipes_linemajor.lm_p3_offb), a
-        ld      (redraw_pipes_linemajor.lm_p3_offc), a
-        ld      (redraw_pipes_linemajor.lm_p3_offb_b), a
-        ld      (redraw_pipes_linemajor.lm_p3_offc_b), a
-        ld      a, (pipe_state + 5)
-        dec     a
-        ld      (redraw_pipes_linemajor.lm_p3_capt), a
-        ld      (redraw_pipes_linemajor.lm_p3_capt_b), a
-        add     a, PIPE_GAP + 1
-        ld      (redraw_pipes_linemajor.lm_p3_capb), a
-        ld      (redraw_pipes_linemajor.lm_p3_capb_b), a
-        inc     a
-        ld      (redraw_pipes_linemajor.lm_p3_capb_plus_1), a
-        ld      (redraw_pipes_linemajor.lm_p3_capb_plus_1_b), a
-
-        ; ── Per-cell SMC-block dispatch setup ─────────────────────────
-        ; Compute each cell's transition row, write into dispatch_sort entry
-        ; (entries are pre-laid out with their patch_block_PXY addresses, in
-        ; pipe order). After computing all 6 rows, bubble-sort by row ASC,
-        ; then walk the sorted list to SMC-link each block's chain row /
-        ; chain block / exit row / exit block to the NEXT sorted block.
-        ;
-        ; Column for cell:
-        ;   L cell column = byte_x - 1
-        ;   R cell column = byte_x + 2
-
-        ld      a, (pipe_state + 0)
-        dec     a
-        call    .compute_row
-        ld      (dispatch_sort + 0 * 3), a
-
-        ld      a, (pipe_state + 0)
-        add     a, 2
-        call    .compute_row
-        ld      (dispatch_sort + 1 * 3), a
-
-        ld      a, (pipe_state + 2)
-        dec     a
-        call    .compute_row
-        ld      (dispatch_sort + 2 * 3), a
-
-        ld      a, (pipe_state + 2)
-        add     a, 2
-        call    .compute_row
-        ld      (dispatch_sort + 3 * 3), a
-
-        ld      a, (pipe_state + 4)
-        dec     a
-        call    .compute_row
-        ld      (dispatch_sort + 4 * 3), a
-
-        ld      a, (pipe_state + 4)
-        add     a, 2
-        call    .compute_row
-        ld      (dispatch_sort + 5 * 3), a
-
-        ; ── Bubble-sort with early-exit. Most wraps leave row order
-        ; unchanged (byte_x decreases by 1, heights at new col are often
-        ; the same as old col since cityscape_heights has long runs of
-        ; identical values), so the first pass typically finds the array
-        ; already sorted → bail in ~75 T-st instead of ~2500.
-        ld      b, 5                    ; outer pass count
-.sort_outer:
-        ld      c, 5                    ; inner pair count
-        ld      hl, dispatch_sort
-        xor     a
-        ld      (dispatch_sort_swapped), a  ; clear "any-swap-this-pass" flag
-.sort_inner:
-        ld      e, l
-        ld      d, h
-        inc     de
-        inc     de
-        inc     de                       ; DE → entry[k+1].row
-        ld      a, (de)
-        cp      (hl)                     ; entry[k+1].row vs entry[k].row
-        jr      nc, .sort_no_swap        ; >= → in order
-        ; Out of order — swap 3 bytes (HL) ↔ (DE)
-        ld      a, 1
-        ld      (dispatch_sort_swapped), a
-        ld      a, (hl)
-        ex      af, af'
-        ld      a, (de)
-        ld      (hl), a
-        ex      af, af'
-        ld      (de), a
-        inc     hl
-        inc     de
-        ld      a, (hl)
-        ex      af, af'
-        ld      a, (de)
-        ld      (hl), a
-        ex      af, af'
-        ld      (de), a
-        inc     hl
-        inc     de
-        ld      a, (hl)
-        ex      af, af'
-        ld      a, (de)
-        ld      (hl), a
-        ex      af, af'
-        ld      (de), a
-        inc     hl                       ; HL → entry[k+1].row (= original position)
-        jr      .sort_inner_continue
-.sort_no_swap:
-        inc     hl
-        inc     hl
-        inc     hl
-.sort_inner_continue:
-        dec     c
-        jr      nz, .sort_inner
-        ; Check early-exit flag — if no swaps this pass, array is sorted.
-        ld      a, (dispatch_sort_swapped)
-        or      a
-        jr      z, .sort_done
-        djnz    .sort_outer
-.sort_done:
-
-        ; ── Link the sorted blocks into a chain via SMC ────────────────
-        ; For each sorted entry i (0..5): block_i's chain links point to
-        ; entry i+1 (next sorted block / sentinel). HL walks dispatch_sort;
-        ; IX is loaded with each block's base address so (ix+nn) addressing
-        ; can SMC-patch the four chain/exit slots in one shot.
-        ld      hl, dispatch_sort        ; HL → entry 0 row
-        ld      b, NUM_DISPATCH_BLOCKS
-.link_lp:
-        inc     hl                       ; skip current entry's row
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        inc     hl                       ; DE = block_i addr; HL → entry i+1's row
-        push    de
-        pop     ix                       ; IX = block_i addr
-        ld      a, (hl)                  ; A = row of entry i+1
-        inc     hl
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                  ; DE = addr of entry i+1's block
-        dec     hl
-        dec     hl                       ; HL back at entry i+1's row (= next iter's start)
-        ld      (ix+patch_block_P1L.smc_chain_row - patch_block_P1L), a
-        ld      (ix+patch_block_P1L.smc_chain_block - patch_block_P1L), e
-        ld      (ix+patch_block_P1L.smc_chain_block - patch_block_P1L + 1), d
-        ld      (ix+patch_block_P1L.smc_exit_row - patch_block_P1L), a
-        ld      (ix+patch_block_P1L.smc_exit_block - patch_block_P1L), e
-        ld      (ix+patch_block_P1L.smc_exit_block - patch_block_P1L + 1), d
-        djnz    .link_lp
-
-        ; First sorted (row, addr) → arming initialisers.
-        ld      a, (dispatch_sort + 0)
-        ld      (dispatch_first_row_init), a
-        ld      hl, (dispatch_sort + 1)
-        ld      (dispatch_first_block_init), hl
-        ret
-
-.compute_row:
-        ; in: A = column index (0..31)
-        ; out: A = transition row (CITY_BOTTOM - height, rounded up to even),
-        ;      or $FF if column has no cityscape (height = 0).
-        ; clobbers: HL, DE
-        ld      h, 0
-        ld      l, a
-        ld      de, cityscape_heights
-        add     hl, de
-        ld      a, (hl)                 ; A = height
-        or      a
-        jr      nz, .compute_has_city
-        ld      a, $FF
-        ret
-.compute_has_city:
-        ld      e, a
-        ld      a, CITY_TOP + 32        ; = CITY_BOTTOM = GROUND_TOP = 160
-        sub     e
-        inc     a                       ; round up to next even — A-iter only
-        and     $FE
-        ret
-
-;----------------------------------------------------------------
-; SMC-unrolled per-cell patch blocks. Each is reached by direct JP from the
-; line loop's cursor check (no CALL → no SP-swap needed; no BC clobber →
-; B/C survive intact). On entry, B holds the current line, smc_cursor_row
-; already matched it.
-;
-; Layout per block (≈30 bytes):
-;   1. Four direct-SMC writes: body_A, body_B, cap_A, cap_B
-;      (cap_A and cap_B share the same source byte — one ld a, then two writes)
-;   2. Chain check: ld a, b / cp <next_row> / jp z, <next_block> — falls
-;      through to the next sorted cell if its row also matches B.
-;   3. Exit path: arm smc_cursor_row and smc_first_block for the NEXT
-;      dispatch call, then jp back to the line loop.
-;
-; patch_pipe_smc SMC-patches the chain row/block immediates on wrap so the
-; blocks are linked in row-ascending order. The last sorted block's chain
-; target is the sentinel block (row=$FF, jp z never fires).
-;----------------------------------------------------------------
-
-; Sentinel block — JPed at "no next" exits. Just arms the line loop's
-; cursor for next frame (row=$FF) and returns to the loop.
-dispatch_sentinel_block:
-        ld      a, $FF
-        ld      (redraw_pipes_linemajor.smc_cursor_row), a
-        jp      redraw_pipes_linemajor.dispatch_back
-
-patch_block_P1L:
-        ld      a, (city_aL_cache)
-        ld      (redraw_pipes_linemajor.lm_p1_aL), a
-        ld      a, (city_bL_cache)
-        ld      (redraw_pipes_linemajor.lm_p1_aL_b), a
-        ld      a, (city_cL_cache)
-        ld      (redraw_pipes_linemajor.lm_p1_cL), a
-        ld      (redraw_pipes_linemajor.lm_p1_cL_b), a
-        ld      a, b
-        cp      $FF
-.smc_chain_row: equ $-1
-        jp      z, dispatch_sentinel_block
-.smc_chain_block: equ $-2
-        ld      a, $FF
-.smc_exit_row: equ $-1
-        ld      (redraw_pipes_linemajor.smc_cursor_row), a
-        ld      hl, dispatch_sentinel_block
-.smc_exit_block: equ $-2
-        ld      (redraw_pipes_linemajor.smc_first_block), hl
-        jp      redraw_pipes_linemajor.dispatch_back
-
-patch_block_P1R:
-        ld      a, (city_aR_cache)
-        ld      (redraw_pipes_linemajor.lm_p1_aR), a
-        ld      a, (city_bR_cache)
-        ld      (redraw_pipes_linemajor.lm_p1_aR_b), a
-        ld      a, (city_cR_cache)
-        ld      (redraw_pipes_linemajor.lm_p1_cR), a
-        ld      (redraw_pipes_linemajor.lm_p1_cR_b), a
-        ld      a, b
-        cp      $FF
-.smc_chain_row: equ $-1
-        jp      z, dispatch_sentinel_block
-.smc_chain_block: equ $-2
-        ld      a, $FF
-.smc_exit_row: equ $-1
-        ld      (redraw_pipes_linemajor.smc_cursor_row), a
-        ld      hl, dispatch_sentinel_block
-.smc_exit_block: equ $-2
-        ld      (redraw_pipes_linemajor.smc_first_block), hl
-        jp      redraw_pipes_linemajor.dispatch_back
-
-patch_block_P2L:
-        ld      a, (city_aL_cache)
-        ld      (redraw_pipes_linemajor.lm_p2_aL), a
-        ld      a, (city_bL_cache)
-        ld      (redraw_pipes_linemajor.lm_p2_aL_b), a
-        ld      a, (city_cL_cache)
-        ld      (redraw_pipes_linemajor.lm_p2_cL), a
-        ld      (redraw_pipes_linemajor.lm_p2_cL_b), a
-        ld      a, b
-        cp      $FF
-.smc_chain_row: equ $-1
-        jp      z, dispatch_sentinel_block
-.smc_chain_block: equ $-2
-        ld      a, $FF
-.smc_exit_row: equ $-1
-        ld      (redraw_pipes_linemajor.smc_cursor_row), a
-        ld      hl, dispatch_sentinel_block
-.smc_exit_block: equ $-2
-        ld      (redraw_pipes_linemajor.smc_first_block), hl
-        jp      redraw_pipes_linemajor.dispatch_back
-
-patch_block_P2R:
-        ld      a, (city_aR_cache)
-        ld      (redraw_pipes_linemajor.lm_p2_aR), a
-        ld      a, (city_bR_cache)
-        ld      (redraw_pipes_linemajor.lm_p2_aR_b), a
-        ld      a, (city_cR_cache)
-        ld      (redraw_pipes_linemajor.lm_p2_cR), a
-        ld      (redraw_pipes_linemajor.lm_p2_cR_b), a
-        ld      a, b
-        cp      $FF
-.smc_chain_row: equ $-1
-        jp      z, dispatch_sentinel_block
-.smc_chain_block: equ $-2
-        ld      a, $FF
-.smc_exit_row: equ $-1
-        ld      (redraw_pipes_linemajor.smc_cursor_row), a
-        ld      hl, dispatch_sentinel_block
-.smc_exit_block: equ $-2
-        ld      (redraw_pipes_linemajor.smc_first_block), hl
-        jp      redraw_pipes_linemajor.dispatch_back
-
-patch_block_P3L:
-        ld      a, (city_aL_cache)
-        ld      (redraw_pipes_linemajor.lm_p3_aL), a
-        ld      a, (city_bL_cache)
-        ld      (redraw_pipes_linemajor.lm_p3_aL_b), a
-        ld      a, (city_cL_cache)
-        ld      (redraw_pipes_linemajor.lm_p3_cL), a
-        ld      (redraw_pipes_linemajor.lm_p3_cL_b), a
-        ld      a, b
-        cp      $FF
-.smc_chain_row: equ $-1
-        jp      z, dispatch_sentinel_block
-.smc_chain_block: equ $-2
-        ld      a, $FF
-.smc_exit_row: equ $-1
-        ld      (redraw_pipes_linemajor.smc_cursor_row), a
-        ld      hl, dispatch_sentinel_block
-.smc_exit_block: equ $-2
-        ld      (redraw_pipes_linemajor.smc_first_block), hl
-        jp      redraw_pipes_linemajor.dispatch_back
-
-patch_block_P3R:
-        ld      a, (city_aR_cache)
-        ld      (redraw_pipes_linemajor.lm_p3_aR), a
-        ld      a, (city_bR_cache)
-        ld      (redraw_pipes_linemajor.lm_p3_aR_b), a
-        ld      a, (city_cR_cache)
-        ld      (redraw_pipes_linemajor.lm_p3_cR), a
-        ld      (redraw_pipes_linemajor.lm_p3_cR_b), a
-        ld      a, b
-        cp      $FF
-.smc_chain_row: equ $-1
-        jp      z, dispatch_sentinel_block
-.smc_chain_block: equ $-2
-        ld      a, $FF
-.smc_exit_row: equ $-1
-        ld      (redraw_pipes_linemajor.smc_cursor_row), a
-        ld      hl, dispatch_sentinel_block
-.smc_exit_block: equ $-2
-        ld      (redraw_pipes_linemajor.smc_first_block), hl
-        jp      redraw_pipes_linemajor.dispatch_back
-
-;----------------------------------------------------------------
-; update_smc: load pre-shifted pipe bytes into the SMC slots actually used.
-; With byte_x always in [1, 29], every pipe uses paint_LMMR / paint_LMMR_city —
-; so only those routines' slots need updating. Edge variants (paint_L, _LM,
-; _LMM, _MMR, _MR, _R + city versions) are dead code paths now.
-;----------------------------------------------------------------
-update_smc:
-        ld      a, (phase)
-        add     a, a
-        add     a, a                    ; phase * 4
-        ld      c, a
-        ld      b, 0
-
-        ; Pattern A → A variant body slots (lm_pN_aXXX, used on EVEN rows)
-        ld      hl, pipe_bitmap
-        add     hl, bc
-        ld      a, (hl)                  ; A byte 0 (L cell)
-        ld      (paint_LMMR.smc_l + 1), a
-        ld      (paint_LMMR.smc_tail_l + 1), a
-        ld      (paint_LMMR_city.smc_l + 1), a
-        ld      (paint_LMMR_city.smc_tail_l + 1), a
-        ld      (redraw_pipes_linemajor.lm_p1_aL), a
-        ld      (redraw_pipes_linemajor.lm_p2_aL), a
-        ld      (redraw_pipes_linemajor.lm_p3_aL), a
-        ; L is same byte in A and B pipe patterns — propagate to B slots too
-        ld      (redraw_pipes_linemajor.lm_p1_aL_b), a
-        ld      (redraw_pipes_linemajor.lm_p2_aL_b), a
-        ld      (redraw_pipes_linemajor.lm_p3_aL_b), a
-        ; City-section emit slots start with SKY values; per-pipe transitions
-        ; flip them to city values as the line counter reaches each pipe's
-        ; building top during the cityscape pass.
-        inc     hl
-        ld      a, (hl)                  ; A byte 1 (M1)
-        ld      (paint_LMMR.smc_m1 + 1), a
-        ld      (paint_LMMR.smc_tail_m1 + 1), a
-        ld      (paint_LMMR_city.smc_m1 + 1), a
-        ld      (paint_LMMR_city.smc_tail_m1 + 1), a
-        ld      (redraw_pipes_linemajor.lm_p1_aM1), a
-        ld      (redraw_pipes_linemajor.lm_p2_aM1), a
-        ld      (redraw_pipes_linemajor.lm_p3_aM1), a
-        ld      (redraw_pipes_linemajor.lm_p1_aM1_b), a
-        ld      (redraw_pipes_linemajor.lm_p2_aM1_b), a
-        ld      (redraw_pipes_linemajor.lm_p3_aM1_b), a
-        inc     hl
-        ld      a, (hl)                  ; A byte 2 (M2)
-        ld      (paint_LMMR.smc_m2 + 1), a
-        ld      (paint_LMMR.smc_tail_m2 + 1), a
-        ld      (paint_LMMR_city.smc_m2 + 1), a
-        ld      (paint_LMMR_city.smc_tail_m2 + 1), a
-        ld      (redraw_pipes_linemajor.lm_p1_aM2), a
-        ld      (redraw_pipes_linemajor.lm_p2_aM2), a
-        ld      (redraw_pipes_linemajor.lm_p3_aM2), a
-        inc     hl
-        ld      a, (hl)                  ; A byte 3 (R)
-        ld      (paint_LMMR.smc_r + 1), a
-        ld      (paint_LMMR.smc_tail_r + 1), a
-        ld      (paint_LMMR_city.smc_r + 1), a
-        ld      (paint_LMMR_city.smc_tail_r + 1), a
-        ld      (redraw_pipes_linemajor.lm_p1_aR), a
-        ld      (redraw_pipes_linemajor.lm_p2_aR), a
-        ld      (redraw_pipes_linemajor.lm_p3_aR), a
-
-        ; Pattern B → B variant body slots (used on ODD rows for right-side
-        ; checker dither; M2 and R differ from A pattern, L and M1 same)
-        ld      hl, pipe_bitmap_b
-        add     hl, bc
-        ld      a, (hl)                  ; B byte 0
-        ld      (paint_LMMR.smc_b_l + 1), a
-        ld      (paint_LMMR.smc_pre_b_l + 1), a
-        ld      (paint_LMMR_city.smc_b_l + 1), a
-        ld      (paint_LMMR_city.smc_pre_b_l + 1), a
-        inc     hl
-        ld      a, (hl)                  ; B byte 1
-        ld      (paint_LMMR.smc_b_m1 + 1), a
-        ld      (paint_LMMR.smc_pre_b_m1 + 1), a
-        ld      (paint_LMMR_city.smc_b_m1 + 1), a
-        ld      (paint_LMMR_city.smc_pre_b_m1 + 1), a
-        inc     hl
-        ld      a, (hl)                  ; B byte 2
-        ld      (paint_LMMR.smc_b_m2 + 1), a
-        ld      (paint_LMMR.smc_pre_b_m2 + 1), a
-        ld      (paint_LMMR_city.smc_b_m2 + 1), a
-        ld      (paint_LMMR_city.smc_pre_b_m2 + 1), a
-        ld      (redraw_pipes_linemajor.lm_p1_aM2_b), a
-        ld      (redraw_pipes_linemajor.lm_p2_aM2_b), a
-        ld      (redraw_pipes_linemajor.lm_p3_aM2_b), a
-        inc     hl
-        ld      a, (hl)                  ; B byte 3
-        ld      (paint_LMMR.smc_b_r + 1), a
-        ld      (paint_LMMR.smc_pre_b_r + 1), a
-        ld      (paint_LMMR_city.smc_b_r + 1), a
-        ld      (paint_LMMR_city.smc_pre_b_r + 1), a
-        ld      (redraw_pipes_linemajor.lm_p1_aR_b), a
-        ld      (redraw_pipes_linemajor.lm_p2_aR_b), a
-        ld      (redraw_pipes_linemajor.lm_p3_aR_b), a
-
-        ; Phase-indexed outside-pixel masks (only LMMR_city needs these).
-        ld      a, (phase)
-        ld      c, a
-        ld      b, 0
-        ld      hl, l_out_masks
-        add     hl, bc
-        ld      a, (hl)
-        ld      (paint_LMMR_city.smc_l_outmask + 1), a
-        ld      (paint_LMMR_city.smc_b_l_outmask + 1), a
-        ld      (paint_LMMR_city.smc_pre_b_l_outmask + 1), a
-        ld      (paint_LMMR_city.smc_tail_l_outmask + 1), a
-        ld      hl, r_out_masks
-        add     hl, bc
-        ld      a, (hl)
-        ld      (paint_LMMR_city.smc_r_outmask + 1), a
-        ld      (paint_LMMR_city.smc_b_r_outmask + 1), a
-        ld      (paint_LMMR_city.smc_pre_b_r_outmask + 1), a
-        ld      (paint_LMMR_city.smc_tail_r_outmask + 1), a
-
-        ; Cache "pipe-on-cityscape" L and R tile bytes for both variants of
-        ; this phase. At CITY_TOP transition, A-variant slots get patched
-        ; from city_aL/R_cache ($FF bg = solid-bar rows) and B-variant slots
-        ; get patched from city_bL/R_cache ($99 bg = window rows), matching
-        ; the cityscape pattern's per-row parity.
-        ld      a, (phase)
-        add     a, a
-        add     a, a
-        ld      c, a
-        ld      b, 0
-        ld      hl, pipe_bitmap_city_a
-        add     hl, bc                  ; HL → city A.L byte for this phase
-        ld      a, (hl)
-        ld      (city_aL_cache), a
-        inc     hl
-        inc     hl
-        inc     hl                      ; skip M1, M2 → R byte
-        ld      a, (hl)
-        ld      (city_aR_cache), a
-        ld      hl, pipe_bitmap_city_b
-        add     hl, bc                  ; HL → city B.L byte for this phase
-        ld      a, (hl)
-        ld      (city_bL_cache), a
-        inc     hl
-        inc     hl
-        inc     hl                      ; skip M1, M2 → R byte
-        ld      a, (hl)
-        ld      (city_bR_cache), a
         ret
 
 ;----------------------------------------------------------------
@@ -3346,11 +1642,46 @@ cap_bot_next_imm_addrs:
 ;   DE' = R_B  << 8 | M2_B     (body sky-B pair 2)
 ;----------------------------------------------------------------
 redraw_pipes_v2:
-        ; (configure_pipe_slots dispatch moved to WHITE band of frame_update —
-        ;  vblank pre-MAGENTA is now ~3k so MAGENTA always reached before raster.)
+        ; Deferred configure_pipe_slots dispatch, split across two frames so a
+        ; recycle frame fits under the 50Hz budget. configure_pipe_slots itself
+        ; is band-emit + IY-direct (~32k T), and each half is ~16k T; plus
+        ; PIPE_PROGRAM (~16k) plus bird/ground/etc (~8k) keeps the recycle
+        ; frame around ~40k.
+        ;   pending_regen states: 0 = idle
+        ;                         3 = just-recycled, defer one frame
+        ;                         2 = configure rows 0..79  (first half)
+        ;                         1 = configure rows 80..159 (second half)
+        ; pending_regen: 0 = idle; 2 = defer one frame; 1 = run full configure.
+        ; (Split across two frames was tried but introduces a cap-handler race:
+        ; the OLD cap slot stays in the second-half range, and a cap firing
+        ; there with a NEW _next pointing BEFORE the cap row creates an
+        ; infinite-loop in PIPE_PROGRAM. The optimization alone brings cps
+        ; under budget without needing the split.)
+        ld      a, (pending_regen)
+        or      a
+        jr      z, .skip_regen
+        cp      1
+        jr      z, .regen_full
+        dec     a
+        ld      (pending_regen), a
+        jr      .skip_regen
+.regen_full:
+        ld      a, (recycled_pipe_idx)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        ld      de, pipe_state
+        add     hl, de
+        inc     hl
+        ld      e, (hl)
+        ld      a, (recycled_pipe_idx)
+        ld      b, 0
+        ld      c, GROUND_TOP
+        call    configure_pipe_slots
+        xor     a
+        ld      (pending_regen), a
+.skip_regen:
 
-        ; --- Rest of redraw_pipes_v2 ---
-        ; DIAGNOSTIC v3: BC/DE setup re-enabled. update_cap_imm and update_city_cache STILL SKIPPED.
         ; --- Sky-A pair into BC/DE ---
         ld      a, (phase)
         add     a, a
@@ -3387,46 +1718,8 @@ redraw_pipes_v2:
         ld      (body_b_bc), bc
         ld      (body_b_de), de
         exx
-        ; Refresh cap and city byte values for current phase
+        ; Refresh cap byte values for current phase
         call    update_cap_imm_v2       ; clobbers BC, DE
-
-        ; Update 3 global city-slot indirect pointers for this frame's phase (~30T).
-        ; current_sky_ptr    = pipe_bitmap + phase*4
-        ; current_city_a_ptr = pipe_bitmap_city_a + phase*4
-        ; current_city_b_ptr = pipe_bitmap_city_b + phase*4
-        ld      a, (phase)
-        add     a, a
-        add     a, a                    ; A = phase * 4
-
-        ld      hl, pipe_bitmap
-        add     a, l
-        ld      l, a
-        jr      nc, .csp_nc1
-        inc     h
-.csp_nc1:
-        ld      (current_sky_ptr), hl
-
-        ld      a, (phase)
-        add     a, a
-        add     a, a
-        ld      hl, pipe_bitmap_city_a
-        add     a, l
-        ld      l, a
-        jr      nc, .csp_nc2
-        inc     h
-.csp_nc2:
-        ld      (current_city_a_ptr), hl
-
-        ld      a, (phase)
-        add     a, a
-        add     a, a
-        ld      hl, pipe_bitmap_city_b
-        add     a, l
-        ld      l, a
-        jr      nc, .csp_nc3
-        inc     h
-.csp_nc3:
-        ld      (current_city_b_ptr), hl
 
         ld      a, 3                    ; MAGENTA = PIPE_PROGRAM
         out     ($fe), a
@@ -3440,1823 +1733,6 @@ redraw_pipes_v2:
         ; Save SP for the slot grid's epilogue (ld sp,(saved_sp); ret) to restore.
         ld      (saved_sp), sp
         call    PIPE_PROGRAM
-        ret
-
-seed_pipe_program_with_ret:
-        ld      a, $C9                  ; RET
-        ld      (PIPE_PROGRAM), a
-        ret
-
-;----------------------------------------------------------------
-;----------------------------------------------------------------
-; Line-major rendering (Joffa-style). For each scan line L from 0 to
-; GROUND_TOP-1, emit all NUM_PIPES pipes' content at line L, then advance
-; to L+1. Writer stays just ahead of the raster: per-line cost (~210 T-st
-; for 3 pipes) is under the raster's 224 T-st/line so once we start ahead
-; we stay ahead all the way down.
-;
-; Per-pipe state stored in pipe_lm_state[NUM_PIPES]:
-;   +0: byte_x
-;   +1: cap_top_line   (= gap_y - 1)
-;   +2: cap_bot_line   (= gap_y + PIPE_GAP)
-;   +3: body_bot_start (= gap_y + PIPE_GAP + 1)
-;----------------------------------------------------------------
-; redraw_pipes_linemajor: TIGHT inline per-pipe emit, direct SMC bytes.
-; Per pipe per line ~55 T-st (body); 3 pipes per line ~190 T-st total. Under
-; raster's 224 T-st/line so writer stays ahead of the beam all the way down.
-;
-; SMC slots (per pipe, 13 slots × 3 pipes = 39 patched per frame at setup):
-;   byte_x offset (= byte_x - 1, added to line addr low byte to get L cell)
-;   capt_smc      (cap_top_line for line-vs-state dispatch)
-;   capb_smc      (cap_bot_line)
-;   A pattern body bytes × 4
-;   B pattern body bytes × 4
-;   cap pattern bytes × 4
-
-redraw_pipes_linemajor:
-        ; ── Dual-loop "Joffa-style" pipe renderer. Two inline emit blocks
-        ; alternate: A variant on even rows (A pipe bitmap + $FF cityscape
-        ; bg), B variant on odd rows (B pipe bitmap + $99 cityscape bg).
-        ; This gets the right-side checker dither AND makes the cityscape
-        ; pattern match perfectly behind the pipes (the band alternates the
-        ; same $FF/$99 bytes per row, so pipe edges read identical to the
-        ; buildings flanking them).
-        ; Pair counter C counts pairs (1 pair = 1 A line + 1 B line). Each
-        ; pass through .line_lp_a + .line_lp_b draws 2 lines and decrements C.
-        ld      (saved_sp), sp
-        ld      hl, line_table
-        ld      sp, hl
-
-        ld      b, 0                    ; B = line counter (for pipe decisions)
-        ld      c, CITY_TOP / 2         ; first phase: CITY_TOP/2 = 64 pairs
-                                        ; of sky lines, then mid-loop SMC
-                                        ; swap to city slots for 16 pairs.
-
-.line_lp_a:
-        ; SMC-unrolled per-cell city-transition gate. ONE check replaces 3
-        ; per-pipe checks. When B matches smc_cursor_row, JP directly to
-        ; the next sorted patch block (smc_first_block); the block (and any
-        ; same-row chained blocks) flip body+cap slots from sky→city tile
-        ; bytes for that cell, then JP back to .dispatch_back. No SP-swap,
-        ; no BC clobber — patches use direct ld a, (nn) / ld (nn), a only.
-        ld      a, b
-        cp      $FF
-.smc_cursor_row: equ $-1
-        jr      nz, .dispatch_back
-        jp      dispatch_sentinel_block
-.smc_first_block: equ $-2
-.dispatch_back:
-        pop     de                      ; DE = line addr (SP advances in line_table)
-        ld      h, d                    ; HOIST: H = line_addr_high once per line.
-
-        ; ────── Pipe 1, A variant ──────
-        ld      a, b
-        cp      0                       ; A vs capb+1
-.lm_p1_capb_plus_1: equ $-1
-        jr      nc, .p1_body
-        cp      0                       ; A vs capt
-.lm_p1_capt: equ $-1
-        jr      c, .p1_body
-        jr      z, .p1_cap
-        cp      0                       ; A vs capb
-.lm_p1_capb: equ $-1
-        jr      z, .p1_cap
-        jp      .p1_done
-.p1_cap:
-        ld      a, 0
-.lm_p1_offc: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p1_cL: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_cM1: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_cM2: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_cR: equ $-1
-        jp      .p1_done
-.p1_body:
-        ld      a, 0
-.lm_p1_offb: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p1_aL: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_aM1: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_aM2: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_aR: equ $-1
-.p1_done:
-
-        ; ────── Pipe 2, A variant ──────
-        ld      a, b
-        cp      0
-.lm_p2_capb_plus_1: equ $-1
-        jr      nc, .p2_body
-        cp      0
-.lm_p2_capt: equ $-1
-        jr      c, .p2_body
-        jr      z, .p2_cap
-        cp      0
-.lm_p2_capb: equ $-1
-        jr      z, .p2_cap
-        jp      .p2_done
-.p2_cap:
-        ld      a, 0
-.lm_p2_offc: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p2_cL: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_cM1: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_cM2: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_cR: equ $-1
-        jp      .p2_done
-.p2_body:
-        ld      a, 0
-.lm_p2_offb: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p2_aL: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_aM1: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_aM2: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_aR: equ $-1
-.p2_done:
-
-        ; ────── Pipe 3, A variant ──────
-        ld      a, b
-        cp      0
-.lm_p3_capb_plus_1: equ $-1
-        jr      nc, .p3_body
-        cp      0
-.lm_p3_capt: equ $-1
-        jr      c, .p3_body
-        jr      z, .p3_cap
-        cp      0
-.lm_p3_capb: equ $-1
-        jr      z, .p3_cap
-        jp      .p3_done
-.p3_cap:
-        ld      a, 0
-.lm_p3_offc: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p3_cL: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_cM1: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_cM2: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_cR: equ $-1
-        jp      .p3_done
-.p3_body:
-        ld      a, 0
-.lm_p3_offb: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p3_aL: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_aM1: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_aM2: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_aR: equ $-1
-.p3_done:
-
-        inc     b                       ; advance to odd line (the B iter below)
-        ; Fall through to B variant (no dec c here — counter ticks per pair)
-
-.line_lp_b:
-        pop     de
-        ld      h, d
-
-        ; ────── Pipe 1, B variant ──────
-        ld      a, b
-        cp      0
-.lm_p1_capb_plus_1_b: equ $-1
-        jr      nc, .p1b_body
-        cp      0
-.lm_p1_capt_b: equ $-1
-        jr      c, .p1b_body
-        jr      z, .p1b_cap
-        cp      0
-.lm_p1_capb_b: equ $-1
-        jr      z, .p1b_cap
-        jp      .p1b_done
-.p1b_cap:
-        ld      a, 0
-.lm_p1_offc_b: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p1_cL_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_cM1_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_cM2_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_cR_b: equ $-1
-        jp      .p1b_done
-.p1b_body:
-        ld      a, 0
-.lm_p1_offb_b: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p1_aL_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_aM1_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_aM2_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p1_aR_b: equ $-1
-.p1b_done:
-
-        ; ────── Pipe 2, B variant ──────
-        ld      a, b
-        cp      0
-.lm_p2_capb_plus_1_b: equ $-1
-        jr      nc, .p2b_body
-        cp      0
-.lm_p2_capt_b: equ $-1
-        jr      c, .p2b_body
-        jr      z, .p2b_cap
-        cp      0
-.lm_p2_capb_b: equ $-1
-        jr      z, .p2b_cap
-        jp      .p2b_done
-.p2b_cap:
-        ld      a, 0
-.lm_p2_offc_b: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p2_cL_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_cM1_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_cM2_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_cR_b: equ $-1
-        jp      .p2b_done
-.p2b_body:
-        ld      a, 0
-.lm_p2_offb_b: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p2_aL_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_aM1_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_aM2_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p2_aR_b: equ $-1
-.p2b_done:
-
-        ; ────── Pipe 3, B variant ──────
-        ld      a, b
-        cp      0
-.lm_p3_capb_plus_1_b: equ $-1
-        jr      nc, .p3b_body
-        cp      0
-.lm_p3_capt_b: equ $-1
-        jr      c, .p3b_body
-        jr      z, .p3b_cap
-        cp      0
-.lm_p3_capb_b: equ $-1
-        jr      z, .p3b_cap
-        jp      .p3b_done
-.p3b_cap:
-        ld      a, 0
-.lm_p3_offc_b: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p3_cL_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_cM1_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_cM2_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_cR_b: equ $-1
-        jp      .p3b_done
-.p3b_body:
-        ld      a, 0
-.lm_p3_offb_b: equ $-1
-        add     a, e
-        ld      l, a
-        ld      (hl), 0
-.lm_p3_aL_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_aM1_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_aM2_b: equ $-1
-        inc     l
-        ld      (hl), 0
-.lm_p3_aR_b: equ $-1
-.p3b_done:
-
-        inc     b                       ; advance to next even line
-        dec     c                       ; one pair done
-        jp      nz, .line_lp_a
-        ; Sky pairs exhausted. Check section boundary (B==CITY_TOP) or end.
-        ld      a, b
-        cp      GROUND_TOP
-        jp      nc, .restore
-        ; B == CITY_TOP. Arm cursor: copy first sorted (row, block) from
-        ; the wrap-time initialisers into the line loop's SMC slots.
-        ld      hl, (dispatch_first_block_init)
-        ld      (.smc_first_block), hl
-        ld      a, (dispatch_first_row_init)
-        ld      (.smc_cursor_row), a
-        ld      c, (GROUND_TOP - CITY_TOP) / 2
-        jp      .line_lp_a
-
-.restore:
-        ld      sp, (saved_sp)
-        ret
-
-lm_line_addr: dw 0
-lm_line_num:  db 0
-
-;----------------------------------------------------------------
-; Pipe drawing — split into two passes for race-the-beam:
-;   draw_pipe_body_top: tops of pipes (rendered first across all pipes so the
-;     last-drawn pipe's top still beats the raster).
-;   draw_pipe_rest:     caps + body_bot (raster reaches those rows later).
-; byte_x always in [1, 29] — pipe always uses paint_LMMR / paint_LMMR_city.
-;----------------------------------------------------------------
-; draw_pipe_body_top: paint pipe body_top (lines 0..gap_y-2). Always sky band
-; since random_gap_y caps gap_y at 96 < CITY_TOP=128, so body_top is always
-; entirely above the city band → only paint_LMMR needed.
-; in: C = byte_x, E = gap_y
-draw_pipe_body_top:
-        ld      a, e
-        cp      2
-        ret     c                       ; gap_y < 2 → no body_top to draw
-        sub     1
-        ld      b, a
-        xor     a
-        jp      paint_LMMR
-
-; draw_pipe_rest: cap_top + cap_bot + body_bot.
-; in: C = byte_x, E = gap_y
-draw_pipe_rest:
-        ; Cap top rim — 1 line at gap_y-1. City variant if in city band.
-        ld      a, e
-        or      a
-        jr      z, .skip_cap_top
-        push    de
-        dec     a                       ; A = gap_y - 1
-        ld      b, 1
-        cp      CITY_TOP
-        jr      c, .cap_top_normal
-        cp      CITY_BOTTOM
-        jr      nc, .cap_top_normal
-        call    paint_cap_rounded_LMMR_city
-        jr      .cap_top_done
-.cap_top_normal:
-        call    paint_cap_rounded_LMMR
-.cap_top_done:
-        pop     de
-.skip_cap_top:
-        ; Cap bot rim — 1 line at gap_y+GAP. City variant if in city band.
-        ld      a, e
-        add     a, PIPE_GAP
-        cp      GROUND_TOP
-        jr      nc, .skip_cap_bot
-        push    de
-        ld      b, 1
-        cp      CITY_TOP
-        jr      c, .cap_bot_normal
-        cp      CITY_BOTTOM
-        jr      nc, .cap_bot_normal
-        call    paint_cap_rounded_LMMR_city
-        jr      .cap_bot_done
-.cap_bot_normal:
-        call    paint_cap_rounded_LMMR
-.cap_bot_done:
-        pop     de
-.skip_cap_bot:
-        ; Body bot: split at CITY_TOP. When sky+city both fire, the city
-        ; portion is always GROUND_TOP-CITY_TOP=32 lines (since body_bot
-        ; ends at GROUND_TOP-1=CITY_BOTTOM-1), so no push/pop needed.
-        ld      a, e
-        add     a, PIPE_GAP + 1         ; A = gap_y + 49 = body_bot start
-        cp      GROUND_TOP
-        ret     nc
-        ld      d, a                    ; D = start
-        cp      CITY_TOP
-        jr      nc, .body_bot_city_only ; start >= CITY_TOP → no sky portion
-        ; Sky portion: start=D, count=CITY_TOP-D
-        ld      a, CITY_TOP
-        sub     d                       ; A = sky_count
-        ld      b, a
-        ld      a, d                    ; A = sky start
-        call    paint_LMMR
-        ; City portion: start=CITY_TOP, count=32 (constant)
-        ld      b, CITY_BOTTOM - CITY_TOP
-        ld      a, CITY_TOP
-        jp      paint_LMMR_city
-.body_bot_city_only:
-        ; D >= CITY_TOP. count = GROUND_TOP - D.
-        ld      a, GROUND_TOP
-        sub     d
-        ld      b, a
-        ld      a, d
-        jp      paint_LMMR_city
-
-
-;----------------------------------------------------------------
-; Paint variants — each writes 1..4 SMC'd bytes per scan line.
-; Body and cap share structure; only the SMC slot names differ so
-; update_smc / update_cap_smc each target their own routines.
-;----------------------------------------------------------------
-; paint_LMMR (Joffa-style unrolled A/B-pair version):
-; Draws 2 scanlines per loop iteration with A pattern on the (even-Y) first
-; line and B pattern on the (odd-Y) second line, eliminating the per-line
-; bit-parity test that the bitmap-shift dither would otherwise need.
-;
-; in: A = start_line, B = count (≥1), C = byte_x
-;
-; Dispatch: if start_line is odd, draw 1 B preamble first; if count is odd,
-; draw 1 A tail at the end. The middle is B/2 AB pairs.
-;
-; ~85 cyc/line vs ~118 for the bit-parity loop. Critical path for body_top
-; and body_bot sky portion across all 3 pipes.
-paint_LMMR:
-        ld      (paint_LMMR_start_line), a
-        ; SP-hijack to line_table[start_line]
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-        ; Start parity check
-        ld      a, (paint_LMMR_start_line)
-        bit     0, a
-        jr      z, .start_was_even
-        ; Preamble: draw 1 B line so we enter pair loop at an even Y.
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_pre_b_l:
-        ld      (hl), 0
-        inc     l
-.smc_pre_b_m1:
-        ld      (hl), 0
-        inc     l
-.smc_pre_b_m2:
-        ld      (hl), 0
-        inc     l
-.smc_pre_b_r:
-        ld      (hl), 0
-        dec     b
-        jp      z, .done
-.start_was_even:
-        ; Now B is the count of lines remaining after any preamble.
-        ; Trim B to even, save odd-tail flag.
-        xor     a
-        bit     0, b
-        jr      z, .count_was_even
-        inc     a
-        dec     b
-.count_was_even:
-        ld      (.smc_count_odd + 1), a
-        srl     b                        ; B = pair count
-        jp      z, .check_tail
-.pair_loop:
-        ; A line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_l:
-        ld      (hl), 0
-        inc     l
-.smc_m1:
-        ld      (hl), 0
-        inc     l
-.smc_m2:
-        ld      (hl), 0
-        inc     l
-.smc_r:
-        ld      (hl), 0
-        ; B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_b_l:
-        ld      (hl), 0
-        inc     l
-.smc_b_m1:
-        ld      (hl), 0
-        inc     l
-.smc_b_m2:
-        ld      (hl), 0
-        inc     l
-.smc_b_r:
-        ld      (hl), 0
-        djnz    .pair_loop
-.check_tail:
-.smc_count_odd:
-        ld      a, 0                     ; SMC: 0 or 1
-        or      a
-        jr      z, .done
-        ; Tail: 1 A line at the end.
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_tail_l:
-        ld      (hl), 0
-        inc     l
-.smc_tail_m1:
-        ld      (hl), 0
-        inc     l
-.smc_tail_m2:
-        ld      (hl), 0
-        inc     l
-.smc_tail_r:
-        ld      (hl), 0
-.done:
-        ld      sp, (saved_sp)
-        ret
-
-; paint_LMMR_city: like paint_LMMR but L and R cells are written as
-;   screen = pipe_byte | (bg_byte & outside_mask)
-; with `outside_mask` selecting only the pixels that aren't part of the
-; 24-px pipe shape at this phase. bg_buffer (which holds the cityscape
-; pattern only at columns/rows where buildings actually exist) supplies
-; the building bricks; the mask keeps cityscape OUT of pipe-occupied
-; pixels so the pipe itself never has skyscraper inside it. M1/M2 stay
-; direct writes (ATTR_PIPE green paper).
-;
-; Performance: DE holds a parallel bg_buffer pointer (= HL with bit 7 of
-; high byte set), so per-byte set/res 7,h is replaced by a single set 7,d
-; per line plus inc e to follow HL.
-;
-; Joffa-style unrolled A/B-pair: same shape as paint_LMMR — preamble for
-; odd start (1 B line), B/2 AB pairs, optional A tail for odd remainder.
-; No per-line `bit 0, h` parity test.
-paint_LMMR_city:
-        ld      (paint_LMMR_start_line), a
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-        ld      a, (paint_LMMR_start_line)
-        bit     0, a
-        jr      z, .start_was_even
-        ; Preamble: 1 B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-        ld      d, h
-        ld      e, l
-        set     7, d
-        ld      a, (de)
-.smc_pre_b_l_outmask:
-        and     0
-.smc_pre_b_l:
-        or      0
-        ld      (hl), a
-        inc     l
-.smc_pre_b_m1:
-        ld      (hl), 0
-        inc     l
-.smc_pre_b_m2:
-        ld      (hl), 0
-        inc     l
-        inc     e
-        inc     e
-        inc     e
-        ld      a, (de)
-.smc_pre_b_r_outmask:
-        and     0
-.smc_pre_b_r:
-        or      0
-        ld      (hl), a
-        dec     b
-        jp      z, .done
-.start_was_even:
-        xor     a
-        bit     0, b
-        jr      z, .count_was_even
-        inc     a
-        dec     b
-.count_was_even:
-        ld      (.smc_count_odd + 1), a
-        srl     b
-        jp      z, .check_tail
-.pair_loop:
-        ; A line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-        ld      d, h
-        ld      e, l
-        set     7, d
-        ld      a, (de)
-.smc_l_outmask:
-        and     0
-.smc_l:
-        or      0
-        ld      (hl), a
-        inc     l
-.smc_m1:
-        ld      (hl), 0
-        inc     l
-.smc_m2:
-        ld      (hl), 0
-        inc     l
-        inc     e
-        inc     e
-        inc     e
-        ld      a, (de)
-.smc_r_outmask:
-        and     0
-.smc_r:
-        or      0
-        ld      (hl), a
-        ; B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-        ld      d, h
-        ld      e, l
-        set     7, d
-        ld      a, (de)
-.smc_b_l_outmask:
-        and     0
-.smc_b_l:
-        or      0
-        ld      (hl), a
-        inc     l
-.smc_b_m1:
-        ld      (hl), 0
-        inc     l
-.smc_b_m2:
-        ld      (hl), 0
-        inc     l
-        inc     e
-        inc     e
-        inc     e
-        ld      a, (de)
-.smc_b_r_outmask:
-        and     0
-.smc_b_r:
-        or      0
-        ld      (hl), a
-        djnz    .pair_loop
-.check_tail:
-.smc_count_odd:
-        ld      a, 0                     ; SMC: 0 or 1
-        or      a
-        jr      z, .done
-        ; Tail: 1 A line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-        ld      d, h
-        ld      e, l
-        set     7, d
-        ld      a, (de)
-.smc_tail_l_outmask:
-        and     0
-.smc_tail_l:
-        or      0
-        ld      (hl), a
-        inc     l
-.smc_tail_m1:
-        ld      (hl), 0
-        inc     l
-.smc_tail_m2:
-        ld      (hl), 0
-        inc     l
-        inc     e
-        inc     e
-        inc     e
-        ld      a, (de)
-.smc_tail_r_outmask:
-        and     0
-.smc_tail_r:
-        or      0
-        ld      (hl), a
-.done:
-        ld      sp, (saved_sp)
-        ret
-
-; paint_LMM: A/B-pair unrolled. Parity only affects M2 (A: smc_m2, B: smc_b_m2);
-; L and M1 are identical across A/B (same SMC value patched to all 4 instances).
-paint_LMM:
-        ld      (paint_LMMR_start_line), a
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-        ld      a, (paint_LMMR_start_line)
-        bit     0, a
-        jr      z, .start_was_even
-        ; Preamble: 1 B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_pre_l:
-        ld      (hl), 0
-        inc     l
-.smc_pre_m1:
-        ld      (hl), 0
-        inc     l
-.smc_pre_b_m2:
-        ld      (hl), 0
-        dec     b
-        jp      z, .done
-.start_was_even:
-        xor     a
-        bit     0, b
-        jr      z, .ce
-        inc     a
-        dec     b
-.ce:
-        ld      (.smc_count_odd + 1), a
-        srl     b
-        jp      z, .check_tail
-.pair_loop:
-        ; A line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_l:
-        ld      (hl), 0
-        inc     l
-.smc_m1:
-        ld      (hl), 0
-        inc     l
-.smc_m2:
-        ld      (hl), 0
-        ; B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_pair_b_l:
-        ld      (hl), 0
-        inc     l
-.smc_pair_b_m1:
-        ld      (hl), 0
-        inc     l
-.smc_b_m2:
-        ld      (hl), 0
-        djnz    .pair_loop
-.check_tail:
-.smc_count_odd:
-        ld      a, 0
-        or      a
-        jr      z, .done
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_tail_l:
-        ld      (hl), 0
-        inc     l
-.smc_tail_m1:
-        ld      (hl), 0
-        inc     l
-.smc_tail_m2:
-        ld      (hl), 0
-.done:
-        ld      sp, (saved_sp)
-        ret
-
-paint_LM:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_l:
-        ld      (hl), 0
-        inc     l
-.smc_m:
-        ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_L:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_l:
-        ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-; paint_MMR: A/B-pair unrolled. M1 same across A/B; M2 and R alternate.
-paint_MMR:
-        ld      (paint_LMMR_start_line), a
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-        ld      a, (paint_LMMR_start_line)
-        bit     0, a
-        jr      z, .start_was_even
-        ; Preamble: 1 B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-.smc_pre_m1:
-        ld      (hl), 0
-        inc     l
-.smc_pre_b_m2:
-        ld      (hl), 0
-        inc     l
-.smc_pre_b_r:
-        ld      (hl), 0
-        dec     b
-        jp      z, .done
-.start_was_even:
-        xor     a
-        bit     0, b
-        jr      z, .ce
-        inc     a
-        dec     b
-.ce:
-        ld      (.smc_count_odd + 1), a
-        srl     b
-        jp      z, .check_tail
-.pair_loop:
-        ; A line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-.smc_m1:
-        ld      (hl), 0
-        inc     l
-.smc_m2:
-        ld      (hl), 0
-        inc     l
-.smc_r:
-        ld      (hl), 0
-        ; B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-.smc_pair_b_m1:
-        ld      (hl), 0
-        inc     l
-.smc_b_m2:
-        ld      (hl), 0
-        inc     l
-.smc_b_r:
-        ld      (hl), 0
-        djnz    .pair_loop
-.check_tail:
-.smc_count_odd:
-        ld      a, 0
-        or      a
-        jr      z, .done
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-.smc_tail_m1:
-        ld      (hl), 0
-        inc     l
-.smc_tail_m2:
-        ld      (hl), 0
-        inc     l
-.smc_tail_r:
-        ld      (hl), 0
-.done:
-        ld      sp, (saved_sp)
-        ret
-
-; paint_MR: A/B-pair unrolled. Both M and R alternate.
-paint_MR:
-        ld      (paint_LMMR_start_line), a
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-        ld      a, (paint_LMMR_start_line)
-        bit     0, a
-        jr      z, .start_was_even
-        ; Preamble: 1 B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-.smc_pre_b_m:
-        ld      (hl), 0
-        inc     l
-.smc_pre_b_r:
-        ld      (hl), 0
-        dec     b
-        jp      z, .done
-.start_was_even:
-        xor     a
-        bit     0, b
-        jr      z, .ce
-        inc     a
-        dec     b
-.ce:
-        ld      (.smc_count_odd + 1), a
-        srl     b
-        jp      z, .check_tail
-.pair_loop:
-        ; A line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-.smc_m:
-        ld      (hl), 0
-        inc     l
-.smc_r:
-        ld      (hl), 0
-        ; B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-.smc_b_m:
-        ld      (hl), 0
-        inc     l
-.smc_b_r:
-        ld      (hl), 0
-        djnz    .pair_loop
-.check_tail:
-.smc_count_odd:
-        ld      a, 0
-        or      a
-        jr      z, .done
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-.smc_tail_m:
-        ld      (hl), 0
-        inc     l
-.smc_tail_r:
-        ld      (hl), 0
-.done:
-        ld      sp, (saved_sp)
-        ret
-
-; paint_R: A/B-pair unrolled. Only R cell, alternates.
-paint_R:
-        ld      (paint_LMMR_start_line), a
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-        ld      a, (paint_LMMR_start_line)
-        bit     0, a
-        jr      z, .start_was_even
-        ; Preamble: 1 B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-        inc     l
-.smc_pre_b_r:
-        ld      (hl), 0
-        dec     b
-        jp      z, .done
-.start_was_even:
-        xor     a
-        bit     0, b
-        jr      z, .ce
-        inc     a
-        dec     b
-.ce:
-        ld      (.smc_count_odd + 1), a
-        srl     b
-        jp      z, .check_tail
-.pair_loop:
-        ; A line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-        inc     l
-.smc_r:
-        ld      (hl), 0
-        ; B line
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-        inc     l
-.smc_b_r:
-        ld      (hl), 0
-        djnz    .pair_loop
-.check_tail:
-.smc_count_odd:
-        ld      a, 0
-        or      a
-        jr      z, .done
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-        inc     l
-.smc_tail_r:
-        ld      (hl), 0
-.done:
-        ld      sp, (saved_sp)
-        ret
-
-; Edge body city variants — same shape as their non-city counterparts but
-; the L cell (right-edge variants) or R cell (left-edge variants) is written
-; with masked OR against bg_buffer: `screen = pipe_byte | (bg_byte & out_mask)`
-; so cityscape pattern fills outside-pipe pixels only, never inside the pipe.
-
-paint_LMM_city:                         ; byte_x=30: L+M1+M2 visible
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l                       ; → L cell
-        set     7, h
-        ld      a, (hl)
-.smc_l_outmask:
-        and     0
-        res     7, h
-.smc_l:
-        or      0
-        ld      (hl), a
-        inc     l                       ; → M1
-.smc_m1:
-        ld      (hl), 0
-        inc     l                       ; → M2
-        bit     0, h
-        jr      nz, .odd
-.smc_m2:
-        ld      (hl), 0
-        jr      .next
-.odd:
-.smc_b_m2:
-        ld      (hl), 0
-.next:
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_LM_city:                          ; byte_x=31: L+M visible
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l                       ; → L cell
-        set     7, h
-        ld      a, (hl)
-.smc_l_outmask:
-        and     0
-        res     7, h
-.smc_l:
-        or      0
-        ld      (hl), a
-        inc     l                       ; → M
-.smc_m:
-        ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_L_city:                           ; byte_x=32: L cell only
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l                       ; → L cell
-        set     7, h
-        ld      a, (hl)
-.smc_l_outmask:
-        and     0
-        res     7, h
-.smc_l:
-        or      0
-        ld      (hl), a
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_MMR_city:                         ; byte_x=0: M1+M2+R visible
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a                    ; → M1
-.smc_m1:
-        ld      (hl), 0
-        inc     l                       ; → M2
-        bit     0, h
-        jr      nz, .odd
-.smc_m2:
-        ld      (hl), 0
-        inc     l                       ; → R
-        set     7, h
-        ld      a, (hl)
-.smc_r_outmask:
-        and     0
-        res     7, h
-.smc_r:
-        or      0
-        ld      (hl), a
-        jr      .next
-.odd:
-.smc_b_m2:
-        ld      (hl), 0
-        inc     l                       ; → R
-        set     7, h
-        ld      a, (hl)
-.smc_b_r_outmask:
-        and     0
-        res     7, h
-.smc_b_r:
-        or      0
-        ld      (hl), a
-.next:
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_MR_city:                          ; byte_x=255: M+R visible (at cols 0,1)
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l                       ; → M (col 0)
-        bit     0, h
-        jr      nz, .odd
-.smc_m:
-        ld      (hl), 0
-        inc     l                       ; → R (col 1)
-        set     7, h
-        ld      a, (hl)
-.smc_r_outmask:
-        and     0
-        res     7, h
-.smc_r:
-        or      0
-        ld      (hl), a
-        jr      .next
-.odd:
-.smc_b_m:
-        ld      (hl), 0
-        inc     l
-        set     7, h
-        ld      a, (hl)
-.smc_b_r_outmask:
-        and     0
-        res     7, h
-.smc_b_r:
-        or      0
-        ld      (hl), a
-.next:
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_R_city:                           ; byte_x=254: R cell only (at col 0)
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-        inc     l                       ; → R (col 0)
-        set     7, h
-        ld      a, (hl)
-        bit     0, h
-        jr      nz, .odd
-.smc_r_outmask:
-        and     0
-        res     7, h
-.smc_r:
-        or      0
-        ld      (hl), a
-        jr      .next
-.odd:
-.smc_b_r_outmask:
-        and     0
-        res     7, h
-.smc_b_r:
-        or      0
-        ld      (hl), a
-.next:
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-; paint_cap_rounded_* — 1-row rim with chamfered ends. 7 partial variants
-; matching body variants for smooth entry/exit at screen edges.
-paint_cap_rounded_LMMR:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_l: ld      (hl), 0
-        inc     l
-.smc_m1: ld     (hl), 0
-        inc     l
-.smc_m2: ld     (hl), 0
-        inc     l
-.smc_r: ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-; paint_cap_rounded_LMMR_city: cap-rim variant for the cityscape band.
-; Same masked-OR approach as paint_LMMR_city — bg_buffer is OR'd into
-; the L and R cells but only in pixels outside the 24-px cap shape, so
-; the cap rim itself never has skyscraper inside it. M1/M2 stay direct
-; writes (ATTR_PIPE green paper).
-paint_cap_rounded_LMMR_city:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l                       ; HL → L cell
-        set     7, h
-        ld      a, (hl)
-.smc_l_outmask:
-        and     0
-        res     7, h
-.smc_l:
-        or      0
-        ld      (hl), a
-        inc     l                       ; → M1
-.smc_m1:
-        ld      (hl), 0
-        inc     l                       ; → M2
-.smc_m2:
-        ld      (hl), 0
-        inc     l                       ; → R
-        set     7, h
-        ld      a, (hl)
-.smc_r_outmask:
-        and     0
-        res     7, h
-.smc_r:
-        or      0
-        ld      (hl), a
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_LMM:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_l: ld      (hl), 0
-        inc     l
-.smc_m1: ld     (hl), 0
-        inc     l
-.smc_m2: ld     (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_LM:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_l: ld      (hl), 0
-        inc     l
-.smc_m: ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_L:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-.smc_l: ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_MMR:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-.smc_m1: ld     (hl), 0
-        inc     l
-.smc_m2: ld     (hl), 0
-        inc     l
-.smc_r: ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_MR:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-.smc_m: ld      (hl), 0
-        inc     l
-.smc_r: ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_R:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-        inc     l
-.smc_r: ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-; Edge cap city variants — same shape as the non-city cap variants but
-; with masked-OR against bg_buffer at the L/R cells (whichever the variant
-; has). Used for cap rim lines that fall inside the cityscape band.
-
-paint_cap_rounded_LMM_city:             ; byte_x=30: L+M1+M2
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-        set     7, h
-        ld      a, (hl)
-.smc_l_outmask:
-        and     0
-        res     7, h
-.smc_l:
-        or      0
-        ld      (hl), a
-        inc     l
-.smc_m1: ld     (hl), 0
-        inc     l
-.smc_m2: ld     (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_LM_city:              ; byte_x=31: L+M
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-        set     7, h
-        ld      a, (hl)
-.smc_l_outmask:
-        and     0
-        res     7, h
-.smc_l:
-        or      0
-        ld      (hl), a
-        inc     l
-.smc_m: ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_L_city:               ; byte_x=32: L only
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        dec     l
-        set     7, h
-        ld      a, (hl)
-.smc_l_outmask:
-        and     0
-        res     7, h
-.smc_l:
-        or      0
-        ld      (hl), a
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_MMR_city:             ; byte_x=0: M1+M2+R
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-.smc_m1: ld     (hl), 0
-        inc     l
-.smc_m2: ld     (hl), 0
-        inc     l
-        set     7, h
-        ld      a, (hl)
-.smc_r_outmask:
-        and     0
-        res     7, h
-.smc_r:
-        or      0
-        ld      (hl), a
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_MR_city:              ; byte_x=255: M+R at cols 0,1
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-.smc_m: ld      (hl), 0
-        inc     l
-        set     7, h
-        ld      a, (hl)
-.smc_r_outmask:
-        and     0
-        res     7, h
-.smc_r:
-        or      0
-        ld      (hl), a
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-paint_cap_rounded_R_city:               ; byte_x=254: R only at col 0
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-.lp:
-        pop     hl
-        ld      a, c
-        add     a, l
-        ld      l, a
-        inc     l
-        inc     l
-        set     7, h
-        ld      a, (hl)
-.smc_r_outmask:
-        and     0
-        res     7, h
-.smc_r:
-        or      0
-        ld      (hl), a
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
-
-;----------------------------------------------------------------
-; update_city_cache: refresh 384-byte cache at CITY_CACHE.
-;   slot[(row - CITY_TOP) * 12 + pipe * 4 + cell] =
-;     if cityscape_heights[col_cell] >= (CITY_BOTTOM - row):
-;       L/R: pipe_bitmap_city_X[phase*4 + cell] OR bg_buffer[col_cell][row]
-;       M1/M2: pipe_bitmap_city_X[phase*4 + cell]
-;     else:
-;       pipe_bitmap[phase*4 + cell]
-;
-; X = 'a' for even rows, 'b' for odd rows.
-; col_cell = byte_x_pipe + cell - 1 (cell in {0=L, 1=M1, 2=M2, 3=R}).
-;
-; Cost target: ~5 k T-states/frame.
-;----------------------------------------------------------------
-
-;----------------------------------------------------------------
-; update_cap_imm: for each (pipe, cap-row) recorded in cap_slot_table,
-; write the current phase's cap byte values into the bc-imm and de-imm
-; slots inside pipe_program.
-;
-; cap_slot_table layout per cap-row entry (4 bytes):
-;   [bc_imm_lo_addr, bc_imm_hi_addr, de_imm_lo_addr, de_imm_hi_addr]
-; The bc-imm slot expects (lo=L, hi=M1). The de-imm slot expects (lo=M2, hi=R).
-; Cap bytes source: cap_rounded_bitmap[phase*4 + 0..3] = [L, M1, M2, R].
-;----------------------------------------------------------------
-update_cap_imm:
-        ld      hl, cap_rounded_bitmap
-        ld      a, (phase)
-        add     a, a
-        add     a, a                    ; phase * 4
-        ld      e, a
-        ld      d, 0
-        add     hl, de                  ; HL → cap_rounded_bitmap[phase*4]
-        ld      a, (hl)                 ; L
-        ld      (cap_L_temp), a
-        inc     hl
-        ld      a, (hl)                 ; M1
-        ld      (cap_M1_temp), a
-        inc     hl
-        ld      a, (hl)                 ; M2
-        ld      (cap_M2_temp), a
-        inc     hl
-        ld      a, (hl)                 ; R
-        ld      (cap_R_temp), a
-
-        ld      ix, cap_slot_table
-        ld      b, 6                    ; 6 cap-rows worst case (3 pipes × 2 caps)
-.lp:
-        ld      l, (ix+0)
-        ld      h, (ix+1)
-        ld      a, h
-        or      l
-        jr      z, .skip                ; slot=0 means cap row not present
-        ; (HL) = L slot, (HL+1) = M1 slot
-        ld      a, (cap_L_temp)
-        ld      (hl), a
-        inc     hl
-        ld      a, (cap_M1_temp)
-        ld      (hl), a
-        ; Now the de-imm slot
-        ld      l, (ix+2)
-        ld      h, (ix+3)
-        ld      a, (cap_M2_temp)
-        ld      (hl), a
-        inc     hl
-        ld      a, (cap_R_temp)
-        ld      (hl), a
-.skip:
-        ld      de, 4
-        add     ix, de                  ; advance to next cap-row entry (4 bytes)
-        djnz    .lp
         ret
 
 ;----------------------------------------------------------------
@@ -5345,724 +1821,6 @@ update_cap_imm_v2:
         djnz    .bot_lp
         ret
 
-city_row_temp:   db 0                  ; current row
-city_pipe_temp:  db 0                  ; current pipe index
-city_bx_temp:    db 0                  ; current pipe byte_x
-city_cell_temp:  db 0                  ; current cell index 0..3
-
-; Phase-dependent values, hoisted once per call out of the per-cell loop.
-sky_a_L:         db 0
-sky_a_M1:        db 0
-sky_a_M2:        db 0
-sky_a_R:         db 0
-sky_b_L:         db 0
-sky_b_M1:        db 0
-sky_b_M2:        db 0
-sky_b_R:         db 0
-lmask_temp:      db 0
-rmask_temp:      db 0
-; Hoisted per-(pipe) interleaved data (8 bytes per pipe: heights+col_cells).
-;   pipe*8 + 0..3 = heights[L, M1, M2, R]
-;   pipe*8 + 4..7 = col_cells[L, M1, M2, R]
-pipe_hoist_data: ds 24             ; 3 pipes × 8 bytes
-sky_row:         ds 4              ; active variant's L M1 M2 R for current row
-threshold_temp:  db 0
-bg_row_lo:       db 0
-bg_row_hi:       db 0
-
-update_city_cache:
-        ; --- HOIST 1: phase byte values for sky-A and sky-B ---
-        ld      a, (phase)
-        add     a, a
-        add     a, a                    ; A = phase * 4
-        ld      c, a
-        ld      b, 0
-        ld      hl, pipe_bitmap
-        add     hl, bc
-        ld      de, sky_a_L
-        ldi
-        ldi
-        ldi
-        ldi
-        ld      a, (phase)
-        add     a, a
-        add     a, a
-        ld      c, a
-        ld      b, 0
-        ld      hl, pipe_bitmap_b
-        add     hl, bc
-        ld      de, sky_b_L
-        ldi
-        ldi
-        ldi
-        ldi
-        ; --- HOIST 2: masks for phase ---
-        ld      a, (phase)
-        ld      l, a
-        ld      h, 0
-        ld      de, l_out_masks
-        add     hl, de
-        ld      a, (hl)
-        ld      (lmask_temp), a
-        ld      a, (phase)
-        ld      l, a
-        ld      h, 0
-        ld      de, r_out_masks
-        add     hl, de
-        ld      a, (hl)
-        ld      (rmask_temp), a
-
-        ; --- HOIST 3: heights and col_cells per (pipe, cell) into pipe_hoist_data
-        ;       layout: [h_L, h_M1, h_M2, h_R, c_L, c_M1, c_M2, c_R] per pipe (8 bytes)
-        ld      iy, pipe_hoist_data
-        ld      b, 0                    ; pipe index (0..2)
-.hp_lp:
-        ld      hl, pipe_state
-        ld      a, b
-        add     a, a
-        add     a, l
-        ld      l, a
-        ld      a, (hl)                 ; A = byte_x
-        ld      d, a                    ; D = byte_x
-        ld      e, 0                    ; E = cell index
-.hc_lp:
-        ld      a, d
-        add     a, e
-        dec     a                       ; A = col_cell
-        ld      (iy+4), a               ; store col_cell at offset +4..+7
-        ld      l, a
-        ld      h, 0
-        push    de
-        ld      de, cityscape_heights
-        add     hl, de
-        pop     de
-        ld      a, (hl)
-        ld      (iy+0), a               ; store height at offset +0..+3
-        inc     iy
-        inc     e
-        ld      a, e
-        cp      4
-        jr      c, .hc_lp
-        ; iy advanced 4 (past heights). Advance 4 more (past col_cells of this pipe).
-        push    de
-        ld      de, 4
-        add     iy, de
-        pop     de
-        inc     b
-        ld      a, b
-        cp      NUM_PIPES
-        jr      c, .hp_lp
-
-        ; --- WALK ROWS: flat, hoisted, HL=cache cursor, IX=pipe data ---
-        ld      hl, CITY_CACHE          ; HL = cache cursor (fast ld (hl),a writes)
-        ld      b, CITY_TOP             ; B = row
-.row_lp:
-        ; threshold = CITY_BOTTOM - row
-        ld      a, CITY_BOTTOM
-        sub     b
-        ld      (threshold_temp), a
-
-        ; bg_buffer row base
-        push    hl                      ; save cache cursor
-        ld      l, b
-        ld      h, 0
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      a, (hl)
-        ld      (bg_row_lo), a
-        inc     hl
-        ld      a, (hl)
-        or      $80
-        ld      (bg_row_hi), a
-
-        ; Pick sky variant by row parity, copy 4 bytes into sky_row
-        ld      a, b
-        and     1
-        jr      nz, .pick_b
-        ld      hl, sky_a_L
-        jr      .have_pick
-.pick_b:
-        ld      hl, sky_b_L
-.have_pick:
-        ld      de, sky_row
-        push    bc                      ; LDI clobbers BC; save B (row)
-        ldi
-        ldi
-        ldi
-        ldi
-        pop     bc
-        pop     hl                      ; restore cache cursor
-
-        ; Walk 3 pipes inline; IX walks pipe_hoist_data in 8-byte strides
-        push    ix
-        ld      ix, pipe_hoist_data
-        ld      c, 0                    ; C = pipe (0..2)
-.r_pipe_lp:
-        ; --- Cell 0 (L) ---
-        ld      a, (threshold_temp)
-        cp      (ix+0)
-        jr      nc, .c0_sky
-        ; city L: col_cell at (ix+4)
-        ld      a, (ix+4)
-        push    hl
-        ld      l, a
-        ld      h, 0
-        ld      de, (bg_row_lo)
-        add     hl, de
-        ld      a, (hl)
-        ld      d, a
-        ld      a, (lmask_temp)
-        and     d
-        ld      d, a
-        ld      a, (sky_row+0)
-        or      d
-        pop     hl
-        ld      (hl), a
-        jr      .c0_done
-.c0_sky:
-        ld      a, (sky_row+0)
-        ld      (hl), a
-.c0_done:
-        inc     hl
-
-        ; --- Cell 1 (M1): always sky byte ---
-        ld      a, (sky_row+1)
-        ld      (hl), a
-        inc     hl
-
-        ; --- Cell 2 (M2): always sky byte ---
-        ld      a, (sky_row+2)
-        ld      (hl), a
-        inc     hl
-
-        ; --- Cell 3 (R) ---
-        ld      a, (threshold_temp)
-        cp      (ix+3)
-        jr      nc, .c3_sky
-        ; city R: col_cell at (ix+7)
-        ld      a, (ix+7)
-        push    hl
-        ld      l, a
-        ld      h, 0
-        ld      de, (bg_row_lo)
-        add     hl, de
-        ld      a, (hl)
-        ld      d, a
-        ld      a, (rmask_temp)
-        and     d
-        ld      d, a
-        ld      a, (sky_row+3)
-        or      d
-        pop     hl
-        ld      (hl), a
-        jr      .c3_done
-.c3_sky:
-        ld      a, (sky_row+3)
-        ld      (hl), a
-.c3_done:
-        inc     hl
-
-        ; Advance IX by 8 (next pipe's interleaved data)
-        push    de
-        ld      de, 8
-        add     ix, de
-        pop     de
-
-        inc     c
-        ld      a, c
-        cp      NUM_PIPES
-        jp      c, .r_pipe_lp
-        pop     ix
-
-        inc     b
-        ld      a, b
-        cp      GROUND_TOP
-        jp      c, .row_lp
-
-        ret
-
-;----------------------------------------------------------------
-; build_city_slot_bases: populate city_patch_table[96] from current pipe_state
-; and cityscape_heights. Called once at init and on each recycle.
-;
-; For each pipe 0..2 and city row 128..159 (row_idx 0..31) — pipe-major order:
-;   threshold = CITY_BOTTOM - row = 32 - row_idx
-;   h_L = cityscape_heights[byte_x - 1]
-;   h_R = cityscape_heights[byte_x + 2]
-;   if h_L >= threshold OR h_R >= threshold:
-;     base = pipe_bitmap_city_a (even row) or pipe_bitmap_city_b (odd row)
-;   else:
-;     base = pipe_bitmap
-;
-;   Look up slot first-byte addr via SLOT_ADDR_TABLE:
-;     entry_index = (128 + row_idx)*3 + pipe
-;     slot_first_byte = SLOT_ADDR_TABLE[entry_index]
-;   If (slot_first_byte) == $31 (ld sp,nn body opcode):
-;     city_patch_table[entry*4 + 0..1] = slot_first_byte + 1  (target)
-;     city_patch_table[entry*4 + 2..3] = base
-;   Else (cap/skip slot):
-;     city_patch_table[entry*4 + 0..1] = city_patch_scratch  (harmless)
-;     city_patch_table[entry*4 + 2..3] = 0
-;
-; Clobbers AF, BC, DE, HL, IX, IY.
-;----------------------------------------------------------------
-build_city_slot_bases_pipe:
-        ; Single-pipe entry: A = pipe index (0..2).
-        ; Updates only the 32 city_patch_table entries for that pipe.
-        ; IX = city_patch_table + pipe*128 (32 entries × 4 bytes)
-        ; Sets bcsb_pipe_limit = pipe+1 so the outer loop exits after one iteration.
-        ld      h, 0
-        ld      l, a
-        add     hl, hl          ; *2
-        add     hl, hl          ; *4
-        add     hl, hl          ; *8
-        add     hl, hl          ; *16
-        add     hl, hl          ; *32
-        add     hl, hl          ; *64
-        add     hl, hl          ; *128
-        ld      de, city_patch_table
-        add     hl, de
-        push    hl
-        pop     ix              ; IX = write cursor for this pipe's entries
-        ld      iyl, a          ; IYL = pipe index
-        ld      iyh, 0
-        inc     a               ; A = pipe+1 (loop limit)
-        ld      (bcsb_pipe_limit), a
-        jp      bcsb_pipe_lp    ; enter the common body
-
-build_city_slot_bases:
-        ; Walk pipe 0..2 (outer), row_idx 0..31 (inner) — pipe-major
-        ld      a, NUM_PIPES
-        ld      (bcsb_pipe_limit), a    ; limit = NUM_PIPES (all pipes)
-        ld      iy, 0                   ; IY = pipe index (use as counter)
-        ld      ix, city_patch_table    ; IX = write cursor into city_patch_table
-
-bcsb_pipe_lp:
-        ; A = pipe index (low byte of IY)
-        push    iy
-        pop     hl
-        ld      a, l                    ; A = pipe index (0..2)
-
-        ; byte_x = pipe_state[pipe*2]
-        add     a, a                    ; A = pipe*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state
-        add     hl, de
-        ld      a, (hl)                 ; A = byte_x
-
-        ; h_L = cityscape_heights[byte_x - 1]
-        dec     a                       ; A = byte_x - 1 = col_L
-        ld      l, a
-        ld      h, 0
-        ld      de, cityscape_heights
-        add     hl, de
-        ld      c, (hl)                 ; C = h_L
-
-        ; h_R = cityscape_heights[byte_x + 2]
-        ; col_R = byte_x + 2 = col_L + 3
-        ld      a, l
-        add     a, 3                    ; col_L + 3 = byte_x + 2
-        ld      l, a
-        jr      nc, .bcsb_hr_nc
-        inc     h
-.bcsb_hr_nc:
-        ld      b, (hl)                 ; B = h_R
-
-        ; Walk city rows row_idx 0..31 (row 128..159)
-        ; threshold starts at 32 and decrements to 1
-        ld      a, 32                   ; A = threshold (CITY_BOTTOM - CITY_TOP)
-        ; E = row_idx = 0
-        ld      e, 0                    ; E = row_idx
-
-.bcsb_row_lp:
-        ; threshold = 32 - row_idx = A (we count down)
-        ; Check if h_L >= threshold OR h_R >= threshold
-        push    af                      ; save threshold
-        push    bc                      ; save h_L (C), h_R (B)
-        push    de                      ; save row_idx (E)
-
-        ; Check h_L (C) >= threshold (A)
-        ld      d, a                    ; D = threshold
-        ld      a, c                    ; A = h_L
-        cp      d                       ; h_L - threshold; carry set if h_L < threshold
-        jr      nc, .bcsb_city         ; h_L >= threshold → city
-
-        ; Check h_R (B) >= threshold (D)
-        ld      a, b                    ; A = h_R
-        cp      d                       ; h_R - threshold; carry set if h_R < threshold
-        jr      nc, .bcsb_city
-
-        ; Neither side is city; use pipe_bitmap (sky only)
-        ld      hl, pipe_bitmap
-        jr      .bcsb_store
-
-.bcsb_city:
-        ; City side present; pick A or B variant by row parity
-        ; row = 128 + row_idx; parity = row & 1 = row_idx & 1 (128 is even)
-        pop     de
-        push    de                      ; restore/peek row_idx
-        ld      a, e                    ; A = row_idx
-        and     1                       ; 0 = even row (A variant), 1 = odd (B variant)
-        jr      nz, .bcsb_city_b
-        ld      hl, pipe_bitmap_city_a
-        jr      .bcsb_store
-.bcsb_city_b:
-        ld      hl, pipe_bitmap_city_b
-
-.bcsb_store:
-        ; HL = base (bitmap address for this slot)
-        ; Stack (top to bottom): row_idx(E), h_L(C)/h_R(B), threshold
-        ; Now look up slot first-byte addr via SLOT_ADDR_TABLE
-        ; entry_index = (128 + row_idx)*3 + pipe
-        ; IY = pipe index
-
-        ; Save base
-        push    hl                      ; save base
-
-        ; Get row_idx from stack (peek — it's already on stack as DE, E=row_idx)
-        pop     hl                      ; HL = base (just saved)
-        ; Access stack without popping: we have three levels: [DE(row_idx), BC(hL/hR), AF(thresh)]
-        ; They are already saved; we need row_idx (E from DE push).
-        ; Use IY for pipe; we need row_idx. Quickest: re-derive from IY and loop state.
-        ; row_idx is in the stacked DE.E — but we can't peek stack easily.
-        ; Instead keep HL=base aside in bcsb_base_tmp and use fresh regs.
-        ld      (bcsb_base_tmp), hl     ; stash base
-
-        ; Peek row_idx: it's the E byte of the DE we pushed 3rd from top
-        ; Stack layout (SP → low address): DE(row_idx), BC(h_L/h_R), AF(thresh)
-        ;  SP+0 = E (row_idx lo), SP+1 = D
-        ; We can't easily peek without full pop/push. Just pop and repush.
-        pop     de                      ; DE has row_idx in E (restoring DE push)
-        ; D held a temporary value; E = row_idx
-        push    de                      ; put it back
-
-        ; Compute SLOT_ADDR_TABLE entry for (row=128+row_idx, pipe=IY_lo)
-        ; entry_index = row*3 + pipe
-        ; byte offset = entry_index * 2
-        ; row = 128 + E
-        ld      a, e
-        add     a, 128                  ; A = row (128..159)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; row*2
-        ld      d, h
-        ld      b, l
-        add     hl, hl                  ; row*4  (use D=row*2 hi, B=row*2 lo)
-        ; hl = row*4, db = row*2 (as 16-bit pair d:b — careful: d=h of row*2, b=l of row*2)
-        ; Actually let's redo: hl=row*2, de=row*2, then hl=row*2+row*2+row*2? No.
-        ; row*3 = row*2 + row. hl = row*2 after first add hl,hl.
-        ; restart cleaner:
-        ld      a, e
-        add     a, 128                  ; A = row
-        ld      l, a
-        ld      h, 0                    ; HL = row
-        add     hl, hl                  ; HL = row*2
-        ld      d, h
-        ld      b, l                    ; save row*2 in DB (d=hi, b=lo) — nonstandard but ok
-        add     hl, hl                  ; HL = row*4
-        ; HL = row*4, need row*6 = row*4 + row*2
-        ; row*2 hi is in D, lo in B
-        ld      a, l
-        add     a, b                    ; (row*4+row*2) lo
-        ld      l, a
-        ld      a, h
-        adc     a, d                    ; (row*4+row*2) hi
-        ld      h, a                    ; HL = row*6 = (row*3)*2
-
-        ; Add pipe*2
-        push    iy
-        pop     de
-        ld      a, e                    ; A = pipe index
-        add     a, a                    ; A = pipe*2
-        add     a, l
-        ld      l, a
-        jr      nc, .bcsb_sat_nc
-        inc     h
-.bcsb_sat_nc:
-        ; HL = byte offset in SLOT_ADDR_TABLE
-        ld      de, SLOT_ADDR_TABLE
-        add     hl, de                  ; HL → SLOT_ADDR_TABLE[entry*2]
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = slot_first_byte_addr
-
-        ; Check opcode: is (DE) == $31 (ld sp,nn)?
-        ld      a, (de)
-        cp      $31
-        jr      nz, .bcsb_cap_slot
-
-        ; Body slot: target = slot_first_byte_addr + 1
-        inc     de                      ; DE = slot+1 (target)
-        ld      hl, (bcsb_base_tmp)     ; HL = base
-        ; Write 4-byte entry: target_lo, target_hi, base_lo, base_hi
-        ld      (ix+0), e               ; target_lo
-        ld      (ix+1), d               ; target_hi
-        ld      (ix+2), l               ; base_lo
-        ld      (ix+3), h               ; base_hi
-        jr      .bcsb_entry_done
-
-.bcsb_cap_slot:
-        ; Cap/skip slot: target = city_patch_scratch, base = 0
-        ld      (ix+0), low city_patch_scratch
-        ld      (ix+1), high city_patch_scratch
-        ld      (ix+2), 0
-        ld      (ix+3), 0
-
-.bcsb_entry_done:
-        inc     ix
-        inc     ix
-        inc     ix
-        inc     ix                      ; advance IX by 4 bytes
-
-        pop     de                      ; restore row_idx (E)
-        pop     bc                      ; restore h_L (C), h_R (B)
-        pop     af                      ; restore threshold (A)
-
-        ; Advance to next row
-        dec     a                       ; threshold--
-        inc     e                       ; row_idx++
-        ld      d, a                    ; save threshold in D temporarily
-        ld      a, e
-        cp      32
-        ld      a, d                    ; restore threshold
-        jp      nz, .bcsb_row_lp
-
-        ; Next pipe
-        push    iy
-        pop     hl
-        inc     l
-        push    hl
-        pop     iy
-        ld      a, l
-        ld      b, a
-        ld      a, (bcsb_pipe_limit)
-        cp      b
-        jp      nz, bcsb_pipe_lp
-
-        ret
-
-bcsb_base_tmp:  dw 0   ; temp: holds base during SLOT_ADDR_TABLE lookup
-bcsb_pipe_limit: db NUM_PIPES  ; outer loop limit (NUM_PIPES = all, pipe+1 = single)
-
-; city_patch_table layout: pipe-major order (pipe 0 rows 0..31, pipe 1 rows 0..31,
-; pipe 2 rows 0..31). Each 4-byte entry: target_lo, target_hi, base_lo, base_hi.
-; patch_city_slot_cache_addrs walks in the same order via SP-hijack (pop).
-
-;----------------------------------------------------------------
-; build_slot_targets: populate slot_targets[96×2] from current pipe_state.
-;
-; For each (pipe 0..2, row_idx 0..31):
-;   row = 128 + row_idx
-;   entry_idx = row*3 + pipe
-;   slot_first_byte_addr = SLOT_ADDR_TABLE[entry_idx*2]  (LE 16-bit)
-;   if (slot_first_byte_addr) == $31 (body slot):
-;     slot_targets[pipe*32+row_idx] = slot_first_byte_addr + 1
-;   else (cap/skip slot):
-;     slot_targets[pipe*32+row_idx] = pcsca_scratch
-;
-; Called once at init and once per recycle.  ~5k T-states — runs off hot path.
-; Clobbers AF, BC, DE, HL.
-;----------------------------------------------------------------
-build_slot_targets:
-        ld      hl, slot_targets        ; HL = write cursor
-        ld      b, 0                    ; B = pipe index (0..2)
-.bst_pipe_lp:
-        ld      c, 0                    ; C = row_idx (0..31)
-.bst_row_lp:
-        ; entry_idx = (128 + row_idx)*3 + pipe
-        ; byte_offset into SAT = entry_idx * 2
-        ; = ((128+C)*3 + B)*2 = (128+C)*6 + B*2
-        push    hl                      ; save write cursor
-        push    bc                      ; save pipe, row_idx
-
-        ld      a, c
-        add     a, 128                  ; A = row (128..159)
-        ld      l, a
-        ld      h, 0                    ; HL = row
-        add     hl, hl                  ; HL = row*2
-        ld      e, l
-        ld      d, h                    ; DE = row*2
-        add     hl, hl                  ; HL = row*4
-        add     hl, de                  ; HL = row*6
-
-        ; Add pipe*2
-        ld      a, b
-        add     a, a                    ; A = pipe*2
-        add     a, l
-        ld      l, a
-        jr      nc, .bst_sat_nc
-        inc     h
-.bst_sat_nc:
-        ; HL = byte offset into SLOT_ADDR_TABLE
-        ld      de, SLOT_ADDR_TABLE
-        add     hl, de                  ; HL → SAT entry
-
-        ; Read slot_first_byte_addr (LE 16-bit)
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = slot_first_byte_addr
-
-        pop     bc                      ; restore pipe, row_idx
-        pop     hl                      ; restore write cursor
-
-        ; Check opcode at slot_first_byte_addr
-        ; New city body slots start with $ED (ld sp,(nn)); ptr_lo is at slot+2.
-        ; Normal body slots start with $31 (ld sp,nn) — no city slot targets stored here.
-        ld      a, (de)
-        cp      $ED                     ; city body slot?
-        jr      nz, .bst_cap
-
-        ; City body slot: store slot_first_byte_addr + 2 (ptr_lo operand address)
-        inc     de
-        inc     de                      ; DE = slot+2 (where ptr_lo is patched)
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-        inc     hl
-        jr      .bst_next_row
-
-.bst_cap:
-        ; Cap/skip/normal-body slot: store address of pcsca_scratch (harmless write target)
-        ld      (hl), low pcsca_scratch
-        inc     hl
-        ld      (hl), high pcsca_scratch
-        inc     hl
-
-.bst_next_row:
-        inc     c
-        ld      a, c
-        cp      32
-        jr      nz, .bst_row_lp
-
-        inc     b
-        ld      a, b
-        cp      NUM_PIPES
-        jr      nz, .bst_pipe_lp
-
-        ret
-
-;----------------------------------------------------------------
-; patch_city_slot_ptrs: per-wrap SMC patch of city body slot ptr operands.
-;
-; Called once per wrap (every 8 frames) from wrap_byte_x.
-; For each of 96 city body slots, patches the 2-byte (nn) operand of
-; "ld sp,(nn)" to point at the correct global pointer variable:
-;   current_sky_ptr / current_city_a_ptr / current_city_b_ptr
-; Selection is based on CITY_BASE_LUT[(byte_x-1)*64 + row_idx*2] bitmap base.
-;
-; slot_targets[] was rebuilt by build_slot_targets to hold slot+2
-; (the ptr_lo byte of the ED 7B nn_lo nn_hi instruction) for city body slots,
-; or pcsca_scratch for cap/skip/normal-body slots (harmless write).
-;
-; Design: SP hijacked to walk slot_targets via pop. HL walks CITY_BASE_LUT.
-; BC holds the LUT-read base addr (B=hi, C=lo). DE gets slot+2 addr from pop.
-; Comparison done in A; known base addrs are immediate constants.
-;
-; Per-slot cost: pop(10)+ld(7)+inc(6)+ld(7)+inc(6)+compare+write ~60T avg
-; 96 slots × 60T + 3 pipe setups ~120T = ~5880T per wrap (~1470T amortised/frame)
-;
-; Clobbers AF, BC, DE, HL. Saves/restores SP via saved_sp_inner.
-;----------------------------------------------------------------
-patch_city_slot_ptrs:
-        ld      (saved_sp_inner), sp
-        ld      sp, slot_targets        ; SP-hijack: walks slot_targets via pop
-
-        xor     a                       ; pipe = 0
-.pcssp_pipe_lp:
-        ld      (pcsca_pipe_idx), a
-
-        ; Compute lut_row_ptr = CITY_BASE_LUT + (byte_x - 1) * 64
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; pipe * 2
-        ld      de, pipe_state
-        add     hl, de
-        ld      a, (hl)                 ; A = byte_x
-        dec     a                       ; A = byte_x - 1
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; *2
-        add     hl, hl                  ; *4
-        add     hl, hl                  ; *8
-        add     hl, hl                  ; *16
-        add     hl, hl                  ; *32
-        add     hl, hl                  ; *64
-        ld      de, CITY_BASE_LUT
-        add     hl, de                  ; HL = lut cursor (row_idx=0)
-
-        ld      b, 32                   ; 32 rows per pipe
-.pcssp_row_lp:
-        ; SP-hijack pop gives slot+2 address into DE
-        pop     de                      ; DE = slot+2 (ptr_lo operand to patch)
-
-        ; Read base addr from LUT (LE 16-bit). B=row counter survives untouched.
-        ld      a, (hl)                 ; A = base_lo
-        inc     hl
-        ld      c, (hl)                 ; C = base_hi
-        inc     hl
-        ; Save base_lo to scratch; needed if hi-byte comparison fails and we fall through
-        ld      (pcsca_phase_off), a
-
-        ; Compare against pipe_bitmap_city_b (lo byte first — fastest reject)
-        cp      low pipe_bitmap_city_b
-        jr      nz, .pcssp_not_citb
-        ld      a, c
-        cp      high pipe_bitmap_city_b
-        jr      nz, .pcssp_try_cita     ; lo matched but hi didn't → not city_b
-
-        ; Match: current_city_b_ptr
-        ld      a, low current_city_b_ptr
-        ld      (de), a
-        inc     de
-        ld      a, high current_city_b_ptr
-        ld      (de), a
-        djnz    .pcssp_row_lp
-        jr      .pcssp_next_pipe
-
-.pcssp_try_cita:
-        ld      a, (pcsca_phase_off)    ; restore base_lo
-.pcssp_not_citb:
-        ; Compare against pipe_bitmap_city_a
-        cp      low pipe_bitmap_city_a
-        jr      nz, .pcssp_sky
-        ld      a, c
-        cp      high pipe_bitmap_city_a
-        jr      nz, .pcssp_sky          ; lo matched but hi didn't → sky
-
-        ; Match: current_city_a_ptr
-        ld      a, low current_city_a_ptr
-        ld      (de), a
-        inc     de
-        ld      a, high current_city_a_ptr
-        ld      (de), a
-        djnz    .pcssp_row_lp
-        jr      .pcssp_next_pipe
-
-.pcssp_sky:
-        ; Default: current_sky_ptr
-        ld      a, low current_sky_ptr
-        ld      (de), a
-        inc     de
-        ld      a, high current_sky_ptr
-        ld      (de), a
-        djnz    .pcssp_row_lp
-
-.pcssp_next_pipe:
-        ld      a, (pcsca_pipe_idx)
-        inc     a
-        cp      NUM_PIPES
-        jr      nz, .pcssp_pipe_lp
-
-        ld      sp, (saved_sp_inner)
-        ret
-
-pcsca_pipe_idx:   db 0         ; current pipe index (in memory; SP is hijacked)
-pcsca_phase_off:  db 0         ; scratch: base_lo saved during inner loop
-pcsca_lut_ptr:    dw 0         ; (unused legacy scratch)
-pcsca_row2_tmp:   dw 0         ; (unused legacy scratch)
-
 ;----------------------------------------------------------------
 clear_pipe_col:
         ld      a, e
@@ -6087,8 +1845,7 @@ clear_pipe_col:
 
 ;----------------------------------------------------------------
 ; paint_restore: copy bg_buffer[col] → screen[col] for B scan lines
-; starting at line A. Used as the "erase" when pipe leaves a col,
-; so cityscape pixels survive.
+; starting at line A. Used as the "erase" when pipe leaves a col.
 ;
 ; 4x-unrolled per iteration to amortize the djnz / loop overhead.
 ; Callers (clear_pipe_col) always pass B as a multiple of 8 (gap_y is
@@ -6421,7 +2178,7 @@ update_bird:
 ; 4 bytes/row: inv_maskL, spriteL, inv_maskR, spriteR. Per byte we do
 ;   screen = (screen AND inv_mask) OR sprite
 ; so the bird's body footprint is cleared to paper colour before the outline
-; is laid on top — cityscape/pipe pixels behind the bird don't bleed through.
+; is laid on top — pipe pixels behind the bird don't bleed through.
 draw_bird:
         ld      a, (bird_y + 1)
         ld      (bird_old_y), a
@@ -6577,9 +2334,8 @@ restore_bird_bg:
 
 ;----------------------------------------------------------------
 ; update_pipe_attrs:
-;   Refill sky+city attr bands with defaults, then overwrite cells that
+;   Full attr refill (sky/ground/scoreboard), then overwrite cells that
 ;   currently contain pipe pixels with ATTR_PIPE (paper green + ink black).
-;   Ground band is static $20 = ATTR_PIPE already, no refill needed.
 ;----------------------------------------------------------------
 update_pipe_attrs:
         call    refill_base_attrs       ; full attr refill (slow path, init only)
@@ -6611,8 +2367,8 @@ apply_pipe_attrs:
         ret
 
 ;----------------------------------------------------------------
-; refill_base_attrs: LDIR sky + ground + scoreboard rows, then overlay city.
-; Used once at init to set up BACKUP_ATTRS. NOT called per frame anymore.
+; refill_base_attrs: LDIR sky + ground + scoreboard attr bands, then buffer
+; cols. Used once at init to set up BACKUP_ATTRS.
 ;----------------------------------------------------------------
 refill_base_attrs:
         ld      hl, ATTRS
@@ -6634,7 +2390,6 @@ refill_base_attrs:
         inc     de
         ld      bc, 3 * 32 - 1
         ldir
-        call    paint_city_attrs
         jp      paint_buffer_attrs      ; tail-call: overlay invisible attr in buffer cols
 
 ;----------------------------------------------------------------
@@ -6703,61 +2458,6 @@ restore_trailing_pipe_attrs:
         pop     bc
         djnz    .lp
         ret
-
-;----------------------------------------------------------------
-; paint_city_attrs: for each col, paint ATTR_CITY at the rows the building
-; covers. cityscape_heights[col]/8 = number of city rows from the bottom up.
-;----------------------------------------------------------------
-paint_city_attrs:
-        ld      iy, cityscape_heights
-        ld      c, 0                    ; col counter
-.col_lp:
-        ld      a, (iy+0)
-        or      a
-        jr      z, .col_skip
-        ; cells = height / 8 (heights are multiples of 8)
-        srl     a
-        srl     a
-        srl     a
-        ld      b, a                    ; B = cells (= row count for this building)
-        ; top_row = 20 - cells
-        ld      a, 20
-        sub     b
-        ; HL = ATTRS + top_row * 32 + col
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        push    bc
-        ld      bc, ATTRS
-        add     hl, bc
-        pop     bc
-        ld      a, c
-        add     a, l
-        ld      l, a
-        jr      nc, .nc
-        inc     h
-.nc:
-.row_lp:
-        ld      (hl), ATTR_CITY
-        ld      a, l
-        add     a, 32
-        ld      l, a
-        jr      nc, .nc2
-        inc     h
-.nc2:
-        djnz    .row_lp
-.col_skip:
-        inc     iy
-        inc     c
-        ld      a, c
-        cp      32
-        jr      nz, .col_lp
-        ret
-
 ;----------------------------------------------------------------
 ; paint_buffer_attrs: overlay invisible attr at buffer cols (0-3, 28-31)
 ; in rows 0-19 — pipes scrolling through these cols render invisibly because
