@@ -40,13 +40,12 @@ CITY_TOP        EQU 160                 ; cityscape removed; all rows < 160 trea
 CITY_BOTTOM     EQU 160                 ; first scan line below cityscape
 
 ; ─── Slot grid layout (fixed-slot dispatch) ──────────────────────
-SLOT_GRID_BASE         EQU $DB00       ; 160 rows × 16 B = 2560 B total grid
-SLOT_GRID_NORMAL_BASE  EQU SLOT_GRID_BASE              ; all rows (cityscape removed)
-SLOT_GRID_NORMAL_SIZE  EQU 160 * 16                    ; 2560 B
-SLOT_GRID_END          EQU SLOT_GRID_BASE + SLOT_GRID_NORMAL_SIZE  ; $E500
-; Legacy aliases kept for any stale refs (point past end of normal grid).
-SLOT_GRID_CITY_BASE    EQU SLOT_GRID_END
-SLOT_GRID_CITY_SIZE    EQU 0
+SLOT_GRID_BASE         EQU $DB00       ; 3045 B total grid
+SLOT_GRID_NORMAL_BASE  EQU SLOT_GRID_BASE              ; rows 0..127
+SLOT_GRID_NORMAL_SIZE  EQU 128 * 16                    ; 2048 B
+SLOT_GRID_CITY_BASE    EQU SLOT_GRID_BASE + SLOT_GRID_NORMAL_SIZE  ; $E300
+SLOT_GRID_CITY_SIZE    EQU 32 * 34                     ; 1088 B  (was 32*31=992)
+SLOT_GRID_END          EQU SLOT_GRID_CITY_BASE + SLOT_GRID_CITY_SIZE  ; $E740
 PIPE_PROGRAM           EQU SLOT_GRID_BASE              ; entry point alias
 
 NORMAL_ROW_STRIDE      EQU 16          ; 1 (exx) + 3*5
@@ -835,14 +834,14 @@ ipp_row_idx_off: dw 0                  ; scratch: row_idx*2 saved during city pi
 ; Scratch memory: cps_pipe, cps_gap_y, cps_byte_x, cps_cap_top_row,
 ;   cps_cap_bot_row, cps_cap_top_handler_addr, cps_cap_bot_handler_addr.
 ;----------------------------------------------------------------
-;----------------------------------------------------------------
-; cps_setup(A=pipe, E=gap_y): cache scratch, return DE=sublist base.
-; Called from configure_pipe_slots (sync) and configure_pipe_slots_chunk.
-cps_setup:
+configure_pipe_slots:
+        ; ── Save args ────────────────────────────────────────────
         ld      (cps_pipe), a
         ld      a, e
         ld      (cps_gap_y), a
 
+        ; ── Cache byte_x for this pipe ───────────────────────────
+        ; pipe_state layout: db byte_x, gap_y  (2B per pipe)
         ld      a, (cps_pipe)
         add     a, a                    ; pipe*2
         ld      hl, pipe_state
@@ -854,15 +853,17 @@ cps_setup:
         ld      a, (hl)                 ; A = byte_x for this pipe
         ld      (cps_byte_x), a
 
+        ; ── Pre-compute cap rows ──────────────────────────────────
         ld      a, (cps_gap_y)
         dec     a
-        ld      (cps_cap_top_row), a
+        ld      (cps_cap_top_row), a    ; cap_top_row = gap_y - 1
         ld      a, (cps_gap_y)
         add     a, PIPE_GAP
-        ld      (cps_cap_bot_row), a
+        ld      (cps_cap_bot_row), a    ; cap_bot_row = gap_y + 48
 
+        ; ── Load cap_top handler address ─────────────────────────
         ld      a, (cps_pipe)
-        add     a, a
+        add     a, a                    ; pipe*2
         ld      hl, cap_top_handler_addrs
         add     a, l
         ld      l, a
@@ -874,6 +875,7 @@ cps_setup:
         ld      d, (hl)
         ld      (cps_cap_top_handler_addr), de
 
+        ; ── Load cap_bot handler address ─────────────────────────
         ld      a, (cps_pipe)
         add     a, a
         ld      hl, cap_bot_handler_addrs
@@ -887,51 +889,7 @@ cps_setup:
         ld      d, (hl)
         ld      (cps_cap_bot_handler_addr), de
 
-        ; Point cap_top/cap_bot handler NEXT imms at SLOT_GRID_END (epilogue)
-        ; for the duration of chunked configure. If PIPE_PROGRAM fires a stale
-        ; OLD cap slot (still in the grid in rows >= cursor), the handler will
-        ; jump to the grid-end epilogue and exit cleanly — instead of taking
-        ; the NEW NEXT which could land on another OLD cap and infinite-loop.
-        ; Real NEXTs get patched by cps_patch_cap_imms at end of chunking.
-        ; (OLD cap TARGETs are still byte_x=1 from previous configure, which
-        ; is in the left buffer — invisible — so we don't need to touch them.)
-        ld      a, (cps_pipe)
-        add     a, a                    ; pipe*2
-        ld      hl, cap_top_next_imm_addrs
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_ctn_safe_nc
-        inc     h
-.cps_ctn_safe_nc:
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = address of cap_top NEXT imm lo
-        ld      hl, SLOT_GRID_END
-        ld      a, l
-        ld      (de), a
-        inc     de
-        ld      a, h
-        ld      (de), a
-
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, cap_bot_next_imm_addrs
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_cbn_safe_nc
-        inc     h
-.cps_cbn_safe_nc:
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        ld      hl, SLOT_GRID_END
-        ld      a, l
-        ld      (de), a
-        inc     de
-        ld      a, h
-        ld      (de), a
-
-        ; DE = sublist base
+        ; ── Load active sublist base ──────────────────────────────
         ld      a, (cps_pipe)
         add     a, a
         ld      hl, cps_sublist_base_table
@@ -942,43 +900,40 @@ cps_setup:
 .cps_sl_nc:
         ld      e, (hl)
         inc     hl
-        ld      d, (hl)
-        ret
+        ld      d, (hl)                 ; DE = active sublist write cursor
 
-CHUNK_SIZE      EQU 32
+        ; ── Initialize slot walk pointer ──────────────────────────
+        ; cps_slot_walk_ptr = SLOT_ADDR_TABLE + pipe*2  (points at row 0's
+        ; entry for this pipe; advances by 6 per row to skip other pipes).
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      hl, SLOT_ADDR_TABLE
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_swp_nc
+        inc     h
+.cps_swp_nc:
+        ld      (cps_slot_walk_ptr), hl
 
-;----------------------------------------------------------------
-configure_pipe_slots:
-        ; SYNC entry — used by init_pipes. Runs full 160 rows + epilogue.
-        call    cps_setup               ; A=pipe, E=gap_y. DE = sublist base.
-        ld      a, 160
-        ld      (configure_pipe_slots.cps_endpoint_smc), a
+        ; ── Main row loop: B = row 0..159 ────────────────────────
         ld      b, 0
-        ; Fall through into row loop.
 .cps_row_lp:
         push    bc                      ; save B=row
         push    de                      ; save active-list cursor
 
-        ; ── Look up slot address: SLOT_ADDR_TABLE[(row*3+pipe)*2] ──
-        ld      l, b
-        ld      h, 0
-        add     hl, hl                  ; row*2
-        ld      d, h
-        ld      e, l                    ; DE_tmp = row*2
-        add     hl, hl                  ; row*4
-        add     hl, de                  ; row*6
-        ld      a, (cps_pipe)
-        add     a, a                    ; pipe*2
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_tbl_nc
-        inc     h
-.cps_tbl_nc:
-        ld      de, SLOT_ADDR_TABLE
-        add     hl, de
+        ; ── Read slot address from walk pointer (no indexing) ─────
+        ld      hl, (cps_slot_walk_ptr)
         ld      e, (hl)
         inc     hl
         ld      d, (hl)                 ; DE = slot address
+        ; Advance walk pointer by 5 (one inc above, +5 more = +6 stride)
+        ld      a, l
+        add     a, 5
+        ld      l, a
+        jr      nc, .cps_walk_nc
+        inc     h
+.cps_walk_nc:
+        ld      (cps_slot_walk_ptr), hl
         push    de
         pop     iy                      ; IY = slot base
 
@@ -1007,29 +962,12 @@ configure_pipe_slots:
 
         ; ── cap_top template ─────────────────────────────────────
 .cps_do_cap_top:
-        ld      a, b
-        cp      CITY_TOP
-        jr      nc, .cps_ct_city
         ld      hl, (cps_cap_top_handler_addr)
         ld      (iy+0), $C3
         ld      (iy+1), l
         ld      (iy+2), h
         ld      (iy+3), $00
         ld      (iy+4), $00
-        jr      .cps_ct_emit_active
-.cps_ct_city:
-        ld      hl, (cps_cap_top_handler_addr)
-        ld      (iy+0), $C3
-        ld      (iy+1), l
-        ld      (iy+2), h
-        ld      (iy+3), $00
-        ld      (iy+4), $00
-        ld      (iy+5), $00
-        ld      (iy+6), $00
-        ld      (iy+7), $00
-        ld      (iy+8), $00
-        ld      (iy+9), $00
-        ld      (iy+10), $00
 .cps_ct_emit_active:
         ; Active entry = cap_top_target_imm_addrs[pipe] (2 bytes)
         pop     de                      ; restore sublist cursor
@@ -1053,29 +991,12 @@ configure_pipe_slots:
 
         ; ── cap_bot template ─────────────────────────────────────
 .cps_do_cap_bot:
-        ld      a, b
-        cp      CITY_TOP
-        jr      nc, .cps_cb_city
         ld      hl, (cps_cap_bot_handler_addr)
         ld      (iy+0), $C3
         ld      (iy+1), l
         ld      (iy+2), h
         ld      (iy+3), $00
         ld      (iy+4), $00
-        jr      .cps_cb_emit_active
-.cps_cb_city:
-        ld      hl, (cps_cap_bot_handler_addr)
-        ld      (iy+0), $C3
-        ld      (iy+1), l
-        ld      (iy+2), h
-        ld      (iy+3), $00
-        ld      (iy+4), $00
-        ld      (iy+5), $00
-        ld      (iy+6), $00
-        ld      (iy+7), $00
-        ld      (iy+8), $00
-        ld      (iy+9), $00
-        ld      (iy+10), $00
 .cps_cb_emit_active:
         pop     de
         ld      a, (cps_pipe)
@@ -1098,27 +1019,11 @@ configure_pipe_slots:
 
         ; ── skip template ────────────────────────────────────────
 .cps_do_skip:
-        ld      a, b
-        cp      CITY_TOP
-        jr      nc, .cps_skip_city
         ld      (iy+0), $00
         ld      (iy+1), $00
         ld      (iy+2), $00
         ld      (iy+3), $00
         ld      (iy+4), $00
-        jr      .cps_skip_done
-.cps_skip_city:
-        ld      (iy+0), $00
-        ld      (iy+1), $00
-        ld      (iy+2), $00
-        ld      (iy+3), $00
-        ld      (iy+4), $00
-        ld      (iy+5), $00
-        ld      (iy+6), $00
-        ld      (iy+7), $00
-        ld      (iy+8), $00
-        ld      (iy+9), $00
-        ld      (iy+10), $00
 .cps_skip_done:
         pop     de                      ; no active list entry for skip
         push    de
@@ -1126,28 +1031,43 @@ configure_pipe_slots:
 
         ; ── body template ────────────────────────────────────────
 .cps_do_body:
-        ld      a, b
-        cp      CITY_TOP
-        jp      nc, .cps_body_city
-
-        ; Normal body: 31 lo hi D5 C5
-        ; screen_target = line_table[row] + byte_x + 3
+        ; Body: 31 lo hi D5 C5
+        ; Look up precomputed screen target (byte_x=29 baseline).
+        ; Only valid when cps_byte_x == 29 (the recycle case). For sync (init)
+        ; configure with non-29 byte_x, fall back to computed path.
+        ld      a, (cps_byte_x)
+        cp      29
+        jr      nz, .cps_body_compute
+        ; Fast: read from screen_target_table_29[row]
         ld      l, b
         ld      h, 0
         add     hl, hl                  ; row*2
+        ld      de, screen_target_table_29
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      h, d
+        ld      l, e
+        jr      .cps_body_emit
+.cps_body_compute:
+        ; Slow path: compute line_table[row] + byte_x + 3
+        ld      l, b
+        ld      h, 0
+        add     hl, hl
         ld      de, line_table
         add     hl, de
         ld      e, (hl)
         inc     hl
-        ld      d, (hl)                 ; DE = line_addr
+        ld      d, (hl)
         ld      a, (cps_byte_x)
         add     a, 3
         add     a, e
         ld      l, a
         ld      h, d
-        jr      nc, .cps_nb_nc
+        jr      nc, .cps_body_emit
         inc     h
-.cps_nb_nc:
+.cps_body_emit:
         ld      (iy+0), $31
         ld      (iy+1), l
         ld      (iy+2), h
@@ -1167,131 +1087,14 @@ configure_pipe_slots:
         push    de
         jp      .cps_row_done
 
-.cps_body_city:
-        ; City body (11 bytes): ED 7B ptr_lo ptr_hi C1 D1 31 screen_lo screen_hi D5 C5
-        ; ptr = one of current_sky_ptr/current_city_a_ptr/current_city_b_ptr
-        ; Look up which ptr to use: CITY_BASE_LUT[(byte_x-1)*64 + row_idx*2]
-        ld      a, b
-        sub     CITY_TOP                ; A = row_idx (0..31)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; row_idx * 2
-        ld      d, h
-        ld      e, l                    ; DE = row_idx * 2
-
-        ld      a, (cps_byte_x)
-        dec     a                       ; A = byte_x - 1
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                  ; HL = (byte_x-1) * 64
-        add     hl, de                  ; HL = (byte_x-1)*64 + row_idx*2
-        ld      de, CITY_BASE_LUT
-        add     hl, de                  ; HL → LUT entry
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = bitmap base address
-
-        ; Map DE → ptr variable address
-        ld      hl, pipe_bitmap_city_b
-        or      a
-        sbc     hl, de
-        jr      z, .cps_ptr_city_b
-        ld      hl, pipe_bitmap_city_a
-        or      a
-        sbc     hl, de
-        jr      z, .cps_ptr_city_a
-        ld      hl, current_sky_ptr
-        jr      .cps_ptr_done
-.cps_ptr_city_a:
-        ld      hl, current_city_a_ptr
-        jr      .cps_ptr_done
-.cps_ptr_city_b:
-        ld      hl, current_city_b_ptr
-.cps_ptr_done:
-        ; HL = address of the correct global ptr variable
-        ld      (iy+0), $ED
-        ld      (iy+1), $7B
-        ld      (iy+2), l               ; ptr_lo
-        ld      (iy+3), h               ; ptr_hi
-        ld      (iy+4), $C1             ; pop bc
-        ld      (iy+5), $D1             ; pop de
-        ; screen_target = line_table[row] + byte_x + 3
-        ld      a, b
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; row*2
-        ld      de, line_table
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = line_addr
-        ld      a, (cps_byte_x)
-        add     a, 3
-        add     a, e
-        ld      l, a
-        ld      h, d
-        jr      nc, .cps_cbs_nc
-        inc     h
-.cps_cbs_nc:
-        ld      (iy+6), $31
-        ld      (iy+7), l
-        ld      (iy+8), h
-        ld      (iy+9), $D5
-        ld      (iy+10), $C5
-        ; Active entry: slot_addr + 7 (screen target lo byte at new offset)
-        pop     de
-        push    iy
-        pop     hl                      ; HL = slot base
-        ld      a, l
-        add     a, 7
-        ld      l, a
-        jr      nc, .cps_cba_nc
-        inc     h
-.cps_cba_nc:
-        ld      a, l
-        ld      (de), a
-        inc     de
-        ld      a, h
-        ld      (de), a
-        inc     de
-        push    de
-
 .cps_row_done:
         pop     de                      ; restore sublist cursor
         pop     bc                      ; restore B=row
         inc     b
         ld      a, b
-.cps_endpoint_smc EQU $+1
-        cp      160                     ; SMC: chunk endpoint (160 for sync/final)
+        cp      GROUND_TOP              ; 160
         jp      nz, .cps_row_lp
-        ; Reached chunk endpoint. Is this the final chunk (or sync)?
-        cp      GROUND_TOP
-        jp      z, .cps_run_epilogue
-        ; Partial chunk: save cursor and return.
-        ld      (cps_cursor_row), a
-        ld      a, e
-        ld      (cps_cursor_de), a
-        ld      a, d
-        ld      (cps_cursor_de + 1), a
-        ret
 
-.cps_run_epilogue:
-        ; Final chunk (or sync) — clear chunk-state then re-patch cap imms.
-        ; (cps_patch_cap_imms was already called by cps_setup at first chunk;
-        ;  we call it again on the final chunk so the imms are guaranteed
-        ;  consistent even if something else stomped them.)
-        xor     a
-        ld      (pending_regen), a
-        ld      a, 160
-        ld      (cps_cursor_row), a
-        ; Fall through into cps_patch_cap_imms (ends with ret).
-
-cps_patch_cap_imms:
         ; ── Patch cap_top handler target imm ─────────────────────
         ; target = line_table[cap_top_row] + byte_x + 3
         ld      a, (cps_cap_top_row)
@@ -1435,41 +1238,6 @@ cps_patch_cap_imms:
         ret
 
 ;----------------------------------------------------------------
-; configure_pipe_slots_chunk(A=pipe, E=gap_y)
-; Re-runs prologue (idempotent), restores cursor, sets endpoint =
-; min(cursor + CHUNK_SIZE, 160), enters the shared row loop. On the
-; final chunk the loop falls through to the epilogue which clears
-; pending_regen and resets cps_cursor_row=160.
-;----------------------------------------------------------------
-configure_pipe_slots_chunk:
-        ; A=pipe, E=gap_y. Pre-store to scratch BEFORE reading cursor (which
-        ; clobbers A) so first-chunk cps_setup uses the correct pipe/gap_y.
-        ld      (cps_pipe), a
-        ld      a, e
-        ld      (cps_gap_y), a
-        ld      a, (cps_cursor_row)
-        or      a
-        jr      nz, .cpsc_resume
-        ; First chunk: call cps_setup (reads cps_pipe/cps_gap_y from scratch)
-        ld      a, (cps_pipe)
-        ld      hl, cps_gap_y
-        ld      e, (hl)
-        call    cps_setup               ; DE = sublist base
-        xor     a                       ; cursor row = 0
-        jr      .cpsc_set_endpoint
-.cpsc_resume:
-        ld      de, (cps_cursor_de)     ; resume saved sublist cursor
-.cpsc_set_endpoint:
-        ld      b, a                    ; B = start row
-        add     a, CHUNK_SIZE
-        cp      161
-        jr      c, .cpsc_set
-        ld      a, 160
-.cpsc_set:
-        ld      (configure_pipe_slots.cps_endpoint_smc), a
-        jp      configure_pipe_slots.cps_row_lp
-
-;----------------------------------------------------------------
 ; compute_next_slot: given a cap row and the current pipe, return the address
 ; of the next slot to execute after the cap handler finishes.
 ;
@@ -1537,10 +1305,10 @@ cps_cap_top_row:        db 0
 cps_cap_bot_row:        db 0
 cps_cap_top_handler_addr: dw 0
 cps_cap_bot_handler_addr: dw 0
-; Chunked-configure state. cursor_row = next row for the chunk to process
-; (0..160; 160 = chunking complete). cursor_de = saved sublist write cursor.
-cps_cursor_row:         db 0
-cps_cursor_de:          dw 0
+; Walk cursor into SLOT_ADDR_TABLE for the currently-configured pipe.
+; Set in prologue to (SLOT_ADDR_TABLE + pipe*2); advanced by 6 per row.
+; Replaces the per-row indexed lookup (saves ~80T per row × 160 = ~13k).
+cps_slot_walk_ptr:      dw 0
 
 ; ── Per-pipe active sublist base table ───────────────────────────
 cps_sublist_base_table:
@@ -1564,6 +1332,11 @@ pcsca_saved_sp: dw 0               ; SP save/restore for SP-hijack patch
 slot_targets: ds 192, 0
 
 pcsca_scratch: dw 0   ; safe write target for cap slots (harmless)
+
+; Precomputed screen targets for byte_x=29 baseline (recycle byte_x).
+; targets[row] = line_table[row] + 32 (= byte_x=29 + 3). Populated at init.
+; Used by configure_pipe_slots body emit to skip the line_table+byte_x add.
+screen_target_table_29: ds 320, 0       ; 160 entries × 2 bytes
 
 ;----------------------------------------------------------------
 ; init_background: fill bg_buffer with sky + cityscape, then blit
@@ -1644,11 +1417,35 @@ draw_bg_column:
         ret
 
 ;----------------------------------------------------------------
+; init_screen_target_table: populate screen_target_table_29 with
+;   targets[row] = line_table[row] + 32 (= byte_x=29 + 3).
+; Configure_pipe_slots reads this on every body emit instead of recomputing.
+;----------------------------------------------------------------
+init_screen_target_table:
+        ld      hl, line_table
+        ld      de, screen_target_table_29
+        ld      b, 160
+.istt_lp:
+        ld      a, (hl)
+        add     a, 32
+        ld      (de), a
+        inc     hl
+        inc     de
+        ld      a, (hl)
+        adc     a, 0
+        ld      (de), a
+        inc     hl
+        inc     de
+        djnz    .istt_lp
+        ret
+
+;----------------------------------------------------------------
 init_pipes:
         xor     a
         ld      (phase), a
         call    update_city_cache
         call    init_slot_addr_table        ; precompute slot_addr_table[160][3]
+        call    init_screen_target_table    ; precompute screen_target_table_29[160]
         call    init_pipe_program           ; emit fixed slot grid (reads slot_addr_table)
         ; For each pipe, apply initial cap/skip configuration.
         xor     a                            ; pipe index 0
@@ -1806,6 +1603,32 @@ frame_update:
         ld      (wrap_pending), a
         call    restore_trailing_pipe_attrs
 .skip_restore:
+        ; Deferred configure_pipe_slots dispatch (WHITE band, ~20k headroom
+        ; on non-wrap frames). Keeps vblank pre-MAGENTA at ~3k so MAGENTA
+        ; always reaches before raster.
+        ;   pending_regen states: 0 = nothing, 2 = wait one more frame, 1 = run.
+        ld      a, (pending_regen)
+        or      a
+        jr      z, .no_regen
+        cp      1
+        jr      z, .fu_do_regen
+        dec     a
+        ld      (pending_regen), a
+        jr      .no_regen
+.fu_do_regen:
+        xor     a
+        ld      (pending_regen), a
+        ld      a, (recycled_pipe_idx)
+        push    af
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        ld      de, pipe_state
+        add     hl, de
+        inc     hl
+        ld      e, (hl)
+        pop     af
+        call    configure_pipe_slots
 .no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
@@ -2837,17 +2660,14 @@ wrap_byte_x:
 .recycle:
         call    random_gap_y            ; A = new random gap_y; IY/BC preserved
         ld      (iy+1), a
+        ld      a, 2
+        ld      (pending_regen), a      ; defer configure_pipe_slots by 2 frames
+                                        ; (1: this frame N already at limit with patch_city;
+                                        ;  N+1 runs deferred patch; N+2 runs configure)
         ; Record which pipe recycled — B counts down from NUM_PIPES to 1, so index = NUM_PIPES - B.
         ld      a, NUM_PIPES
         sub     b
         ld      (recycled_pipe_idx), a
-        ; Reset chunked configure state: pending_regen=1 (in progress),
-        ; cursor_row=0 (start from beginning). Chunks fire each subsequent
-        ; vblank until the epilogue clears pending.
-        xor     a
-        ld      (cps_cursor_row), a
-        ld      a, 1
-        ld      (pending_regen), a
         ld      a, 29
 .save:
         ld      (iy+0), a
@@ -3526,25 +3346,8 @@ cap_bot_next_imm_addrs:
 ;   DE' = R_B  << 8 | M2_B     (body sky-B pair 2)
 ;----------------------------------------------------------------
 redraw_pipes_v2:
-        ; Chunked configure_pipe_slots dispatch (vblank, ~14k headroom).
-        ; pending_regen: 0 = idle; nonzero = chunking in progress. Each frame
-        ; we run one CHUNK_SIZE-row chunk; the routine self-clears
-        ; pending_regen=0 when the final chunk finishes the epilogue.
-        ld      a, (pending_regen)
-        or      a
-        jr      z, .skip_regen
-        ld      a, (recycled_pipe_idx)
-        push    af
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        ld      de, pipe_state
-        add     hl, de
-        inc     hl
-        ld      e, (hl)
-        pop     af
-        call    configure_pipe_slots_chunk
-.skip_regen:
+        ; (configure_pipe_slots dispatch moved to WHITE band of frame_update —
+        ;  vblank pre-MAGENTA is now ~3k so MAGENTA always reached before raster.)
 
         ; --- Rest of redraw_pipes_v2 ---
         ; DIAGNOSTIC v3: BC/DE setup re-enabled. update_cap_imm and update_city_cache STILL SKIPPED.
