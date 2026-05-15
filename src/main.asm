@@ -2068,16 +2068,15 @@ clear_pipe_col:
         jp      paint_restore
 
 ;----------------------------------------------------------------
-; paint_restore: write sky byte ($00) to screen[col] for B scan lines
+; paint_restore: copy bg_buffer[col] → screen[col] for B scan lines
 ; starting at line A. Used as the "erase" when pipe leaves a col.
 ;
-; Background is uniform sky (cityscape removed in commit 9ae48ac); the
-; old BG_BUFFER-read path was a 23 T/line tax for a known constant 0,
-; and the buffer at $C000 is overlaid by BODY_TEMPLATE after init.
-;
 ; 4x-unrolled per iteration to amortize the djnz / loop overhead.
-; Per line: 32 T (pop + col-add + ld(hl),0) — was 52 T with BG read.
-; Save ~20 T × ~336 lines per wrap ≈ 6.7 k T per wrap frame.
+; Callers (clear_pipe_col) always pass B as a multiple of 8 (gap_y is
+; aligned to 8), so no remainder handling is needed: B is divided by 4
+; up front and the inner block writes 4 lines per pass.
+; Cost: ~55 cyc/line vs ~65 unrolled = ~10 cyc/line saved × ~336 lines
+; per wrap = ~3300 cyc saved per wrap frame.
 ;----------------------------------------------------------------
 paint_restore:
         ld      h, 0
@@ -2095,22 +2094,34 @@ paint_restore:
         ld      a, c
         add     a, l
         ld      l, a
-        ld      (hl), 0
+        set     7, h
+        ld      d, (hl)
+        res     7, h
+        ld      (hl), d
         pop     hl                      ; line N+1
         ld      a, c
         add     a, l
         ld      l, a
-        ld      (hl), 0
+        set     7, h
+        ld      d, (hl)
+        res     7, h
+        ld      (hl), d
         pop     hl                      ; line N+2
         ld      a, c
         add     a, l
         ld      l, a
-        ld      (hl), 0
+        set     7, h
+        ld      d, (hl)
+        res     7, h
+        ld      (hl), d
         pop     hl                      ; line N+3
         ld      a, c
         add     a, l
         ld      l, a
-        ld      (hl), 0
+        set     7, h
+        ld      d, (hl)
+        res     7, h
+        ld      (hl), d
         djnz    .lp
         ld      sp, (saved_sp)
         ret
