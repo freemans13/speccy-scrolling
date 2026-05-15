@@ -504,14 +504,6 @@ ipp_byte_x:     ds 3, 0                 ; scratch: byte_x per pipe (3 bytes)
 ;
 ; Scratch memory: cps_pipe, cps_gap_y, cps_byte_x, cps_cap_top_row,
 ;   cps_cap_bot_row, cps_cap_top_handler_addr, cps_cap_bot_handler_addr.
-;----------------------------------------------------------------
-; configure_pipe_slots(A=pipe, E=gap_y, B=row_start, C=row_end)
-; Reconfigures slots for [row_start, row_end) of the given pipe.
-; - row_start == 0:        fresh active list (cursor from cps_sublist_base_table)
-; - row_start > 0:         continues from cps_active_save (set by prior call)
-; - row_end == GROUND_TOP: runs post-loop cap-imm patching + writes new gap_y
-; Single-shot call uses B=0, C=GROUND_TOP. Split callers pass 0/80 then 80/160.
-;----------------------------------------------------------------
 ; configure_pipe_slots — template-based recycle/init configure.
 ; Stamps BODY_TEMPLATE then overlays CAP_BLOCK at the gap_y offset,
 ; patches pipe-specific cap-handler refs and imms, and rebuilds the
@@ -535,18 +527,6 @@ configure_pipe_slots:
         ld      a, e
         add     a, PIPE_GAP
         ld      (cps_cap_bot_row), a
-
-        ; byte_x = pipe_state[pipe*2]
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, pipe_state
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_bx_nc
-        inc     h
-.cps_bx_nc:
-        ld      a, (hl)
-        ld      (cps_byte_x), a
 
         ; ─── Step 1: stamp BODY_TEMPLATE → slot column for this pipe ─
         ; DE = slot[0][pipe] = SLOT_GRID_BASE + 1 + pipe*5
@@ -662,7 +642,7 @@ configure_pipe_slots:
         ld      e, a
         ld      d, 0
         add     hl, de
-        ld      de, SLOT_GRID_BASE + 2          ; +1 ($31 byte) + 1 (we want target byte)
+        ld      de, SLOT_GRID_BASE + 2          ; +1 (EXX byte) + 1 (skip $C3 JP opcode)
         add     hl, de                          ; HL = slot[cap_top_row][pipe] + 1
         ; Look up cap_top_handler_pipe_<pipe> from cap_top_handler_addrs[pipe]
         ld      a, (cps_pipe)
