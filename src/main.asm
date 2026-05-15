@@ -237,6 +237,7 @@ pipe_scored:  db 0, 0, 0
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
 wrap_pending:  db 0                      ; set when a wrap happened this frame
 pending_regen: db 0                      ; set when a recycle happened; gen_pipe_program deferred
+patch_pending: db 0                      ; set by wrap_byte_x when byte_x changed; cleared after patch_pipe_targets runs
 recycled_pipe_idx: db 0
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
@@ -1642,27 +1643,9 @@ frame_update:
         ld      (wrap_pending), a
         call    restore_trailing_pipe_attrs
 .skip_restore:
-        ; Deferred full regen: if a pipe recycled this frame, regenerate the
-        ; flat program now (after pipe_state is fully updated by wrap_byte_x).
-        ld      a, (pending_regen)
-        or      a
-        jr      z, .no_regen
-        xor     a
-        ld      (pending_regen), a
-        ld      a, (recycled_pipe_idx)
-        ; E = pipe_state[A*2 + 1] = new gap_y for the recycled pipe
-        push    af
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                      ; pipe * 2
-        ld      de, pipe_state
-        add     hl, de
-        inc     hl                          ; HL → gap_y
-        ld      e, (hl)
-        pop     af
-        call    configure_pipe_slots
-        call    build_slot_targets      ; cap positions may change on recycle
-        ; city_base_lut is static (built once at init) — no rebuild needed here.
+        ; pending_regen flag stays set; configure_pipe_slots + build_slot_targets
+        ; are deferred to the top of the next redraw_pipes_v2 (runs during
+        ; top-blanking, hidden from view). Nothing to do here.
 .no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
@@ -2630,7 +2613,9 @@ wrap_byte_x:
         inc     iy
         pop     bc
         djnz    .outer
-        jp      patch_pipe_targets      ; tail-call: replaces fall-through to patch_pipe_smc
+        ld      a, 1
+        ld      (patch_pending), a      ; defer patch_pipe_targets to top of next redraw_pipes_v2
+        ret
 
 patch_pipe_smc:
         ; Patch ALL variant slots — sky A, sky B, city A, city B — for each
@@ -3295,6 +3280,40 @@ cap_bot_next_imm_addrs:
 ;   DE' = R_B  << 8 | M2_B     (body sky-B pair 2)
 ;----------------------------------------------------------------
 redraw_pipes_v2:
+        ; --- Deferred work from previous frame's end (runs during top-blanking) ---
+
+        ; 1. patch_pipe_targets first (non-recycled pipes need decrement; recycled
+        ;    pipe's old targets are about to be overwritten, wasted decrement harmless).
+        ld      a, (patch_pending)
+        or      a
+        jr      z, .skip_patch
+        xor     a
+        ld      (patch_pending), a
+        call    patch_pipe_targets
+.skip_patch:
+
+        ; 2. configure_pipe_slots + build_slot_targets for the recycled pipe.
+        ;    Runs after patch so configure writes fresh targets at current byte_x.
+        ld      a, (pending_regen)
+        or      a
+        jr      z, .skip_regen
+        xor     a
+        ld      (pending_regen), a
+        ld      a, (recycled_pipe_idx)
+        push    af
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; pipe * 2
+        ld      de, pipe_state
+        add     hl, de
+        inc     hl                      ; HL → gap_y byte
+        ld      e, (hl)                 ; E = current gap_y
+        pop     af
+        call    configure_pipe_slots
+        call    build_slot_targets
+.skip_regen:
+
+        ; --- Rest of redraw_pipes_v2 ---
         ; DIAGNOSTIC v3: BC/DE setup re-enabled. update_cap_imm and update_city_cache STILL SKIPPED.
         ; --- Sky-A pair into BC/DE ---
         ld      a, (phase)
@@ -5864,17 +5883,17 @@ patch_city_slot_cache_addrs:
         ld      a, (phase)
         add     a, a
         add     a, a               ; A = phase * 4
-        ld      c, a               ; C = phase_offset (preserved across inner loop)
+        ld      (pcsca_phase_off), a  ; save to memory (SP gets hijacked, can't use stack)
 
         ld      (saved_sp_inner), sp
         ld      sp, slot_targets   ; SP-hijack: walks slot_targets via pop
 
-        ld      b, 0               ; B = pipe index (0..2)
+        xor     a                  ; pipe index in memory
 .pcsca_pipe_lp:
-        push    bc                 ; save pipe(B) + phase_offset(C)
+        ld      (pcsca_pipe_idx), a
 
         ; Compute lut_row_ptr = CITY_BASE_LUT + (byte_x - 1) * 64
-        ld      l, b
+        ld      l, a
         ld      h, 0
         add     hl, hl             ; pipe * 2
         ld      de, pipe_state
@@ -5892,8 +5911,10 @@ patch_city_slot_cache_addrs:
         ld      de, CITY_BASE_LUT
         add     hl, de             ; HL = lut_row_ptr (row_idx=0 entry)
 
-        ; Inner loop: 32 rows for this pipe
-        ld      b, 32
+        ld      a, (pcsca_phase_off)
+        ld      c, a               ; C = phase_offset (live across inner loop)
+
+        ld      b, 32              ; 32 rows
 .pcsca_row_lp:
         pop     de                 ; DE = slot+1 addr (from slot_targets via SP-hijack)
         ld      a, (hl)            ; A = base_lo
@@ -5907,14 +5928,15 @@ patch_city_slot_cache_addrs:
         inc     hl                 ; advance LUT cursor to next row entry
         djnz    .pcsca_row_lp
 
-        pop     bc                 ; restore pipe(B) + phase_offset(C)
-        inc     b
-        ld      a, b
+        ld      a, (pcsca_pipe_idx)
+        inc     a
         cp      NUM_PIPES
         jr      nz, .pcsca_pipe_lp
 
         ld      sp, (saved_sp_inner)
         ret
+
+pcsca_pipe_idx:   db 0         ; current pipe index (in memory; SP is hijacked)
 
 pcsca_phase_off:  db 0         ; (unused — kept to avoid relocation of saved_sp_inner ref)
 pcsca_lut_ptr:    dw 0         ; (unused legacy scratch)
