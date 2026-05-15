@@ -540,36 +540,22 @@ configure_pipe_slots:
         add     hl, de
         ex      de, hl                          ; DE = slot[0][pipe]
         ld      hl, BODY_TEMPLATE
-        ld      b, GROUND_TOP                   ; 160 rows
+        ld      iyl, GROUND_TOP                 ; row counter (160)
 .cps_body_stamp_lp:
-        ; Copy 5 bytes from (HL) to (DE)
-        ld      a, (hl)
-        ld      (de), a
-        inc     hl
-        inc     de
-        ld      a, (hl)
-        ld      (de), a
-        inc     hl
-        inc     de
-        ld      a, (hl)
-        ld      (de), a
-        inc     hl
-        inc     de
-        ld      a, (hl)
-        ld      (de), a
-        inc     hl
-        inc     de
-        ld      a, (hl)
-        ld      (de), a
-        inc     hl
-        inc     de
-        ; Advance DE by SLOT_ROW_STRIDE - 5 = 11 to next row's same pipe slot
+        ldi
+        ldi
+        ldi
+        ldi
+        ldi
+        ; Advance DE by SLOT_ROW_STRIDE - 5 = 11 to next row's same pipe slot.
+        ; (LDI auto-incremented DE by 5; need +11 more.)
         push    hl
         ld      hl, SLOT_ROW_STRIDE - 5
         add     hl, de
         ex      de, hl
         pop     hl
-        djnz    .cps_body_stamp_lp
+        dec     iyl
+        jr      nz, .cps_body_stamp_lp
 
         ; ─── Step 2: stamp CAP_BLOCK at slot[cap_top_row][pipe] ─────
         ; DE = slot[cap_top_row][pipe] = SLOT_GRID_BASE + 1 + cap_top_row*16 + pipe*5
@@ -592,34 +578,20 @@ configure_pipe_slots:
         add     hl, de
         ex      de, hl                          ; DE = slot[cap_top_row][pipe]
         ld      hl, CAP_BLOCK
-        ld      b, 50                           ; 50 rows in cap block
+        ld      iyl, 50                         ; 50 rows in cap block
 .cps_cap_stamp_lp:
-        ld      a, (hl)
-        ld      (de), a
-        inc     hl
-        inc     de
-        ld      a, (hl)
-        ld      (de), a
-        inc     hl
-        inc     de
-        ld      a, (hl)
-        ld      (de), a
-        inc     hl
-        inc     de
-        ld      a, (hl)
-        ld      (de), a
-        inc     hl
-        inc     de
-        ld      a, (hl)
-        ld      (de), a
-        inc     hl
-        inc     de
+        ldi
+        ldi
+        ldi
+        ldi
+        ldi
         push    hl
         ld      hl, SLOT_ROW_STRIDE - 5
         add     hl, de
         ex      de, hl
         pop     hl
-        djnz    .cps_cap_stamp_lp
+        dec     iyl
+        jr      nz, .cps_cap_stamp_lp
 
         ; ─── Step 3: patch cap-slot handler addresses (pipe-specific) ─
         ; slot[cap_top_row][pipe] +1..+2 := cap_top_handler_pipe_<pipe>
@@ -803,7 +775,13 @@ configure_pipe_slots:
         ld      a, h
         ld      (bc), a
 
-        ; ─── Step 6: rebuild active sublist for this pipe ─────────
+        ; ─── Step 6: build active sublist for this pipe (computed) ─
+        ; Active list: 110 body row entries (slot+1 addresses) + 2 cap entries
+        ; (cap_*_target_imm_addrs[pipe]) = exactly 112 entries per pipe.
+        ; We walk rows 0..159 with a cursor HL = slot[R][pipe]+1, advancing
+        ; by SLOT_ROW_STRIDE per row. For each row we know its type from
+        ; cps_cap_top_row, cps_cap_bot_row (and the skip range between them).
+
         ; IX = sublist start (ACTIVE_PIPE_<pipe>)
         ld      a, (cps_pipe)
         add     a, a
@@ -817,65 +795,36 @@ configure_pipe_slots:
         inc     hl
         ld      d, (hl)
         push    de
-        pop     ix                              ; IX = ACTIVE_PIPE_<pipe>
+        pop     ix                              ; IX = active list cursor
 
-        ; IY = slot[0][pipe], to scan slot first-bytes
+        ; HL = slot[0][pipe]+1 (target imm lo-byte address for row 0)
         ld      a, (cps_pipe)
         ld      e, a
         add     a, a
         add     a, a
-        add     a, e
+        add     a, e                            ; A = pipe*5
         ld      l, a
         ld      h, 0
-        ld      de, SLOT_GRID_BASE + 1
-        add     hl, de
-        push    hl
-        pop     iy                              ; IY = slot[0][pipe]
+        ld      de, SLOT_GRID_BASE + 2          ; +1 (EXX) + 1 (skip $31)
+        add     hl, de                          ; HL = slot[0][pipe]+1
 
-        ld      b, 0                            ; B = row counter
-.cps_act_lp:
-        ld      a, (iy+0)
+        ; --- Band 1: body rows 0..cap_top_row-1 ---
+        ld      a, (cps_cap_top_row)
         or      a
-        jr      z, .cps_act_skip                ; zero = skip slot, no entry
-        cp      $C3
-        jr      z, .cps_act_cap
-
-        ; Body slot: write slot+1 (= iy+1) to (ix), advance ix by 2.
-        push    iy
-        pop     hl
-        inc     hl
+        jr      z, .cps_act_skip_band1          ; cap_top_row == 0 → no body before
+        ld      b, a                            ; B = count
+.cps_act_band1_lp:
         ld      (ix+0), l
         ld      (ix+1), h
         inc     ix
         inc     ix
-        jr      .cps_act_advance
+        ld      de, SLOT_ROW_STRIDE
+        add     hl, de                          ; cursor → next row
+        djnz    .cps_act_band1_lp
+.cps_act_skip_band1:
 
-.cps_act_cap:
-        ; Cap slot: is this cap_top or cap_bot?
-        ld      a, b
-        ld      hl, cps_cap_top_row
-        cp      (hl)
-        jr      z, .cps_act_cap_top
-        ; cap_bot: write cap_bot_target_imm_addrs[pipe]
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, cap_bot_target_imm_addrs
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_act_cb_nc
-        inc     h
-.cps_act_cb_nc:
-        ld      a, (hl)
-        ld      (ix+0), a
-        inc     hl
-        ld      a, (hl)
-        ld      (ix+1), a
-        inc     ix
-        inc     ix
-        jr      .cps_act_advance
-
-.cps_act_cap_top:
-        ; cap_top: write cap_top_target_imm_addrs[pipe]
+        ; --- cap_top entry: write cap_top_target_imm_addrs[pipe] ---
+        push    hl                              ; save cursor
         ld      a, (cps_pipe)
         add     a, a
         ld      hl, cap_top_target_imm_addrs
@@ -891,15 +840,55 @@ configure_pipe_slots:
         ld      (ix+1), a
         inc     ix
         inc     ix
+        pop     hl                              ; restore cursor
 
-.cps_act_advance:
-.cps_act_skip:
+        ; Advance cursor past cap_top + 48 skip rows (49 rows × SLOT_ROW_STRIDE)
+        push    bc
+        ld      bc, 49 * SLOT_ROW_STRIDE
+        add     hl, bc
+        pop     bc
+
+        ; --- cap_bot entry: write cap_bot_target_imm_addrs[pipe] ---
+        push    hl
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      hl, cap_bot_target_imm_addrs
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_act_cb_nc
+        inc     h
+.cps_act_cb_nc:
+        ld      a, (hl)
+        ld      (ix+0), a
+        inc     hl
+        ld      a, (hl)
+        ld      (ix+1), a
+        inc     ix
+        inc     ix
+        pop     hl
+
+        ; Advance cursor past cap_bot row
         ld      de, SLOT_ROW_STRIDE
-        add     iy, de
-        inc     b
-        ld      a, b
+        add     hl, de
+
+        ; --- Band 2: body rows cap_bot_row+1..159 ---
+        ld      a, (cps_cap_bot_row)
+        inc     a                               ; cap_bot_row + 1
         cp      GROUND_TOP
-        jp      nz, .cps_act_lp
+        jr      nc, .cps_act_skip_band2         ; if cap_bot_row + 1 >= 160, no body after
+        ld      b, a                            ; B = cap_bot_row + 1 (start)
+        ld      a, GROUND_TOP
+        sub     b                               ; A = 160 - (cap_bot_row+1) = count
+        ld      b, a                            ; B = count
+.cps_act_band2_lp:
+        ld      (ix+0), l
+        ld      (ix+1), h
+        inc     ix
+        inc     ix
+        ld      de, SLOT_ROW_STRIDE
+        add     hl, de
+        djnz    .cps_act_band2_lp
+.cps_act_skip_band2:
 
         ; ─── Step 7: store new gap_y back to pipe_state[pipe*2 + 1] ─
         ld      a, (cps_pipe)
