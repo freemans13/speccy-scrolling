@@ -36,7 +36,7 @@ ATTR_BUFFER     EQU $2D                 ; paper cyan + ink cyan — invisible bu
 GROUND_TOP      EQU 160                 ; first scan line of ground band — pipes stop here
 SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= ground+8)
 
-CITY_TOP        EQU 128                 ; first scan line of cityscape band
+CITY_TOP        EQU 160                 ; cityscape removed; all rows < 160 treated as non-city
 CITY_BOTTOM     EQU 160                 ; first scan line below cityscape
 
 ; ─── Slot grid layout (fixed-slot dispatch) ──────────────────────
@@ -456,12 +456,10 @@ bird_sprite_f2:                         ; wing DOWN — wing box rows 10–13
 ; aligned to char-row boundaries so the per-cell ATTR_CITY (white paper) only
 ; covers the building cells, not the whole row.
 cityscape_heights:
-        ; EXPERIMENT: uniform heights → flat-topped band → per-slot city/sky
-        ; decision is constant ("always city" for rows 128-159 in visible cols).
-        ; Lets us strip patch_city_slot_ptrs, city_base_lut, build_slot_targets.
-        ; Cols 0-3 and 28-31 are buffer cols (invisible attr) — no city there.
-        db  0,  0,  0,  0, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32
-        db 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,  0,  0,  0,  0
+        ; Cityscape removed — all heights 0 so init_background draws no
+        ; city pixels and paint_city_attrs paints nothing.
+        db  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
+        db  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
 
 ; Ground tiles — 8x8 pattern, 4 phases of horizontal scroll.
 ;   Row 0: $FF — solid black top edge.
@@ -534,11 +532,8 @@ init_slot_addr_table:
         ld      b, 0
 .row_lp:
         push    bc
-        ld      a, b
-        cp      128
-        jr      nc, .city_row
-
-        ; Normal: DE = SLOT_GRID_NORMAL_BASE + row*16 + 1
+        ; Uniform normal layout for all 160 rows (cityscape removed).
+        ; DE = SLOT_GRID_NORMAL_BASE + row*16 + 1
         ld      l, b
         ld      h, 0
         add     hl, hl
@@ -549,27 +544,6 @@ init_slot_addr_table:
         add     hl, de
         ex      de, hl                          ; DE = base addr for pipe 0
         ld      c, NORMAL_SLOT_STRIDE
-        jr      .write_3_pipes
-
-.city_row:
-        ; City: DE = SLOT_GRID_CITY_BASE + (row-128)*34 + 1
-        ; (row-128)*34 = (row-128)*32 + (row-128)*2
-        ld      a, b
-        sub     128
-        ld      l, a
-        ld      h, 0                            ; HL = row - 128
-        add     hl, hl                          ; HL = (row-128) × 2
-        ld      d, h
-        ld      e, l                            ; DE = (row-128) × 2
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; HL = (row-128) × 32
-        add     hl, de                          ; HL = (row-128) × 34
-        ld      de, SLOT_GRID_CITY_BASE + 1
-        add     hl, de                          ; HL = base addr for pipe 0
-        ex      de, hl                          ; DE = base addr
-        ld      c, CITY_SLOT_STRIDE
 
 .write_3_pipes:
         ld      b, 3
@@ -2771,28 +2745,7 @@ wrap_byte_x:
         ld      a, (iy+0)
         cp      1
         jr      z, .recycle
-        cp      2
-        jr      z, .trans_to_sky                ; old=2 → new=1 (exit visible)
-        cp      29
-        jr      z, .trans_to_city               ; old=29 → new=28 (enter visible)
         dec     a
-        jr      .save
-.trans_to_sky:
-        ; Switch this pipe's 32 city slot ptrs from city_a/b to sky.
-        ; Patch routine clobbers A/B/DE/HL; B holds outer loop counter so
-        ; we read it BEFORE the call.
-        ld      a, NUM_PIPES
-        sub     b                               ; A = pipe idx
-        ld      c, 1                            ; sky mode
-        call    patch_pipe_city_slots
-        ld      a, 1
-        jr      .save
-.trans_to_city:
-        ld      a, NUM_PIPES
-        sub     b
-        ld      c, 0                            ; city mode
-        call    patch_pipe_city_slots
-        ld      a, 28
         jr      .save
 .recycle:
         call    random_gap_y            ; A = new random gap_y; IY/BC preserved
