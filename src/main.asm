@@ -1719,9 +1719,32 @@ frame_update:
         ld      (wrap_pending), a
         call    restore_trailing_pipe_attrs
 .skip_restore:
-        ; pending_regen flag stays set; configure_pipe_slots + build_slot_targets
-        ; are deferred to the top of the next redraw_pipes_v2 (runs during
-        ; top-blanking, hidden from view). Nothing to do here.
+        ; Deferred configure_pipe_slots dispatch (WHITE band, ~20k headroom
+        ; on non-wrap frames). Keeps vblank pre-MAGENTA at ~3k so MAGENTA
+        ; always reaches before raster.
+        ;   pending_regen states: 0 = nothing, 2 = wait one more frame, 1 = run.
+        ld      a, (pending_regen)
+        or      a
+        jr      z, .no_regen
+        cp      1
+        jr      z, .fu_do_regen
+        dec     a
+        ld      (pending_regen), a
+        jr      .no_regen
+.fu_do_regen:
+        xor     a
+        ld      (pending_regen), a
+        ld      a, (recycled_pipe_idx)
+        push    af
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        ld      de, pipe_state
+        add     hl, de
+        inc     hl
+        ld      e, (hl)
+        pop     af
+        call    configure_pipe_slots
 .no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
@@ -2105,6 +2128,83 @@ patch_pipe_targets:
 .pt_done_p2:
 
         ld      sp, (saved_sp_inner)
+        ret
+
+;----------------------------------------------------------------
+; patch_pipe_city_slots: A = pipe (0..2), C = mode (0=city, 1=sky).
+; Rewrites the 16-bit (nn) operand of each of pipe's 32 city body slots
+; (rows 128..159) so PIPE_PROGRAM's `ld sp, (nn)` reads from the right
+; global bitmap ptr:
+;   sky mode (byte_x in buffer cols): all 32 → current_sky_ptr
+;   city mode (byte_x in visible cols, uniform cityscape): even row_idx →
+;       current_city_a_ptr, odd row_idx → current_city_b_ptr.
+;
+; Called from wrap_byte_x on byte_x transitions 29→28 (enter visible,
+; mode=city) and 2→1 (exit visible, mode=sky). With uniform cityscape
+; heights these are the only two transitions where the slot ptr choice
+; changes; in between, ptrs are stable.
+;
+; Cost ~1k T-states per call; ~once per ~30 wraps per pipe so amortized
+; negligible.
+; Clobbers: A, B, DE, HL.
+;----------------------------------------------------------------
+patch_pipe_city_slots:
+        ld      hl, SLOT_ADDR_TABLE + 128 * 6   ; row 128 base
+        add     a, a                            ; pipe * 2
+        add     a, l
+        ld      l, a
+        jr      nc, .ppcs_base_nc
+        inc     h
+.ppcs_base_nc:
+        ld      b, 32                           ; 32 city rows
+.ppcs_lp:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = slot address
+        push    hl
+        ; Only patch CITY BODY slots ($ED $7B = ld sp, (nn)). Cap slots in the
+        ; city band start with $C3 (jp), skip slots with $00. Writing slot+2
+        ; on those would clobber the cap handler's JP target hi byte (crash)
+        ; or write a benign-looking-but-wrong opcode into skip slots.
+        ld      a, (de)
+        cp      $ED
+        jr      nz, .ppcs_skip_slot
+        inc     de
+        inc     de                              ; DE = slot+2 = (nn) lo byte
+        bit     0, c                            ; mode: sky?
+        jr      nz, .ppcs_write_sky
+        ; city mode: A variant if B even, B variant if B odd
+        bit     0, b
+        jr      nz, .ppcs_write_city_b
+        ld      a, low current_city_a_ptr
+        ld      (de), a
+        inc     de
+        ld      a, high current_city_a_ptr
+        ld      (de), a
+        jr      .ppcs_next
+.ppcs_write_city_b:
+        ld      a, low current_city_b_ptr
+        ld      (de), a
+        inc     de
+        ld      a, high current_city_b_ptr
+        ld      (de), a
+        jr      .ppcs_next
+.ppcs_write_sky:
+        ld      a, low current_sky_ptr
+        ld      (de), a
+        inc     de
+        ld      a, high current_sky_ptr
+        ld      (de), a
+.ppcs_next:
+.ppcs_skip_slot:
+        pop     hl
+        ld      a, l
+        add     a, 5
+        ld      l, a
+        jr      nc, .ppcs_nc
+        inc     h
+.ppcs_nc:
+        djnz    .ppcs_lp
         ret
 
 ;----------------------------------------------------------------
@@ -2671,7 +2771,28 @@ wrap_byte_x:
         ld      a, (iy+0)
         cp      1
         jr      z, .recycle
+        cp      2
+        jr      z, .trans_to_sky                ; old=2 → new=1 (exit visible)
+        cp      29
+        jr      z, .trans_to_city               ; old=29 → new=28 (enter visible)
         dec     a
+        jr      .save
+.trans_to_sky:
+        ; Switch this pipe's 32 city slot ptrs from city_a/b to sky.
+        ; Patch routine clobbers A/B/DE/HL; B holds outer loop counter so
+        ; we read it BEFORE the call.
+        ld      a, NUM_PIPES
+        sub     b                               ; A = pipe idx
+        ld      c, 1                            ; sky mode
+        call    patch_pipe_city_slots
+        ld      a, 1
+        jr      .save
+.trans_to_city:
+        ld      a, NUM_PIPES
+        sub     b
+        ld      c, 0                            ; city mode
+        call    patch_pipe_city_slots
+        ld      a, 28
         jr      .save
 .recycle:
         call    random_gap_y            ; A = new random gap_y; IY/BC preserved
@@ -3362,39 +3483,8 @@ cap_bot_next_imm_addrs:
 ;   DE' = R_B  << 8 | M2_B     (body sky-B pair 2)
 ;----------------------------------------------------------------
 redraw_pipes_v2:
-        ; --- Deferred work from previous frame's end (runs during top-blanking) ---
-        ; (patch_pipe_targets moved back to WHITE band in wrap_byte_x.)
-
-        ; configure_pipe_slots + build_slot_targets for the recycled pipe.
-        ;    pending_regen states: 0 = nothing, 2 = wait one more frame, 1 = run now.
-        ;    Set to 2 on recycle (in wrap_byte_x). Decrements each frame. Runs when 1.
-        ld      a, (pending_regen)
-        or      a
-        jr      z, .skip_regen
-        cp      1
-        jr      z, .do_regen
-        ; pending_regen == 2: decrement to 1, do nothing this frame
-        dec     a
-        ld      (pending_regen), a
-        jr      .skip_regen
-.do_regen:
-        xor     a
-        ld      (pending_regen), a
-        ld      a, (recycled_pipe_idx)
-        push    af
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; pipe * 2
-        ld      de, pipe_state
-        add     hl, de
-        inc     hl                      ; HL → gap_y byte
-        ld      e, (hl)                 ; E = current gap_y
-        pop     af
-        call    configure_pipe_slots
-        ; (build_slot_targets + patch_city_slot_ptrs eliminated: with uniform
-        ;  cityscape heights, configure_pipe_slots writes correct (nn) operand
-        ;  in each city body slot directly via CITY_BASE_LUT lookup.)
-.skip_regen:
+        ; (configure_pipe_slots dispatch moved to WHITE band of frame_update —
+        ;  vblank pre-MAGENTA is now ~3k so MAGENTA always reached before raster.)
 
         ; --- Rest of redraw_pipes_v2 ---
         ; DIAGNOSTIC v3: BC/DE setup re-enabled. update_cap_imm and update_city_cache STILL SKIPPED.
