@@ -888,7 +888,8 @@ configure_pipe_slots:
 
         ; HL = slot[160][pipe]+1 (one past last body row;
         ;       loop subtracts 16 first to give slot[159][pipe]+1 first push)
-        ;    = SLOT_GRID_BASE + 1 + 160*16 + pipe*5
+        ;    = SLOT_GRID_BASE + 2 + 160*16 + pipe*5
+        ;    (+1 for EXX byte at row start, +1 to skip $31 opcode → target imm lo addr)
         push    af                              ; save M
         ld      a, (cps_pipe)
         ld      c, a
@@ -897,7 +898,7 @@ configure_pipe_slots:
         add     a, c                            ; A = pipe*5
         ld      l, a
         ld      h, 0                            ; HL = pipe*5
-        ld      bc, SLOT_GRID_BASE + 1 + 160*16
+        ld      bc, SLOT_GRID_BASE + 2 + 160*16
         add     hl, bc                          ; HL = slot[160][pipe]+1
         pop     af                              ; A = M again
         ld      b, a                            ; B = counter
@@ -964,7 +965,7 @@ configure_pipe_slots:
         jr      nc, .cps_act_b1_nc
         inc     h
 .cps_act_b1_nc:
-        ld      bc, SLOT_GRID_BASE + 1
+        ld      bc, SLOT_GRID_BASE + 2          ; +1 EXX + 1 skip $31 → target imm lo addr
         add     hl, bc                          ; HL = slot[N][pipe]+1
 
         pop     af                              ; A = N
