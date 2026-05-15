@@ -530,21 +530,113 @@ configure_pipe_slots:
         add     a, PIPE_GAP
         ld      (cps_cap_bot_row), a
 
-        ; ─── Step 1: re-stamp body at OLD cap range (incremental) ─
-        ; The slot grid only differs from body where the OLD cap_block was
-        ; stamped (50 rows starting at old_cap_top_row). Restore body bytes
-        ; there; Step 2 then stamps the NEW cap_block at the NEW position.
-        ;
-        ; saved_old_gap_y = 0 → init mode (slot grid is fresh body from
-        ; init_pipe_program). Skip step 1 entirely.
-        ;
-        ; Saves ~60 rows × 146 T ≈ 8.7 k T per recycle vs the previous full
-        ; body-region re-stamp.
+        ; ─── Step 1: stamp body region for this pipe ────────────────
+        ; saved_old_gap_y == 0 → init mode (full re-stamp, regions A+B).
+        ;   init_pipe_program writes per-pipe-specific byte_x targets;
+        ;   step 1 resets all body rows to byte_x=29 baseline so
+        ;   shift_pipe_targets's per-pipe shift is correct.
+        ; saved_old_gap_y != 0 → recycle mode (50-row incremental).
+        ;   The OLD cap_block lives in 50 rows starting at old_cap_top_row;
+        ;   restoring body just there (instead of all ~110 body rows)
+        ;   saves ~60 rows × 146 T ≈ 8.7 k T per recycle.
 
         ld      a, (saved_old_gap_y)
         or      a
-        jr      z, .cps_body_done               ; init mode: skip
-        dec     a                               ; A = old_cap_top_row = old_gap_y - 1
+        jp      nz, .cps_body_incremental
+
+        ; --- Region A: stamp rows [0, cap_top_row-1] ---
+        ld      a, (cps_cap_top_row)
+        or      a
+        jr      z, .cps_body_a_done             ; skip if cap_top_row == 0
+        ld      iyl, a                          ; counter = cap_top_row
+
+        ; DE = slot[0][pipe] = SLOT_GRID_BASE + 1 + pipe*5
+        ld      a, (cps_pipe)
+        ld      e, a
+        add     a, a
+        add     a, a
+        add     a, e                            ; A = pipe*5
+        ld      l, a
+        ld      h, 0
+        ld      de, SLOT_GRID_BASE + 1
+        add     hl, de
+        ex      de, hl                          ; DE = slot[0][pipe]
+        ld      hl, BODY_TEMPLATE
+.cps_body_a_lp:
+        ldi
+        ldi
+        ldi
+        ldi
+        ldi
+        push    hl
+        ld      hl, SLOT_ROW_STRIDE - 5
+        add     hl, de
+        ex      de, hl
+        pop     hl
+        dec     iyl
+        jr      nz, .cps_body_a_lp
+.cps_body_a_done:
+
+        ; --- Region B: stamp rows [cap_bot_row+1, 159] ---
+        ld      a, (cps_cap_bot_row)
+        cpl                                     ; A = ~cap_bot_row = 255 - cap_bot_row
+        sub     255 - 159                       ; A = 159 - cap_bot_row
+        jp      z, .cps_body_done               ; skip if count == 0
+        jp      c, .cps_body_done               ; safety: cap_bot_row > 159
+        ld      iyl, a                          ; counter
+
+        ; HL = BODY_TEMPLATE + (cap_bot_row+1) * 5
+        ld      a, (cps_cap_bot_row)
+        inc     a                               ; A = cap_bot_row + 1
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl                          ; HL = (cap_bot_row+1) * 4
+        ld      e, a
+        ld      d, 0
+        add     hl, de                          ; HL = (cap_bot_row+1) * 5
+        ld      de, BODY_TEMPLATE
+        add     hl, de                          ; HL = BODY_TEMPLATE + (cap_bot_row+1)*5
+        push    hl                              ; save template src
+        ; DE = slot[cap_bot_row+1][pipe]
+        ld      a, (cps_cap_bot_row)
+        inc     a
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; HL = (cap_bot_row+1) * 16
+        ld      a, (cps_pipe)
+        ld      e, a
+        add     a, a
+        add     a, a
+        add     a, e                            ; A = pipe*5
+        ld      e, a
+        ld      d, 0
+        add     hl, de                          ; HL += pipe*5
+        ld      de, SLOT_GRID_BASE + 1
+        add     hl, de                          ; HL = slot[cap_bot_row+1][pipe]
+        ex      de, hl                          ; DE = dest slot
+        pop     hl                              ; HL = template src
+.cps_body_b_lp:
+        ldi
+        ldi
+        ldi
+        ldi
+        ldi
+        push    hl
+        ld      hl, SLOT_ROW_STRIDE - 5
+        add     hl, de
+        ex      de, hl
+        pop     hl
+        dec     iyl
+        jr      nz, .cps_body_b_lp
+        jr      .cps_body_done
+
+.cps_body_incremental:
+        ; A = saved_old_gap_y. Compute old_cap_top_row = old_gap_y - 1.
+        dec     a
         ld      iyh, a                          ; stash old_cap_top_row
 
         ; HL = BODY_TEMPLATE + old_cap_top_row * 5
@@ -560,8 +652,7 @@ configure_pipe_slots:
         push    hl                              ; save template src
 
         ; DE = slot[old_cap_top_row][pipe]
-        ;    = SLOT_GRID_BASE + 1 + old_cap_top_row*16 + pipe*5
-        ld      a, iyh                          ; A = old_cap_top_row
+        ld      a, iyh
         ld      l, a
         ld      h, 0
         add     hl, hl
@@ -581,7 +672,7 @@ configure_pipe_slots:
         ex      de, hl                          ; DE = dest slot
         pop     hl                              ; HL = template src
 
-        ld      iyl, 50                         ; loop 50 rows (cap_top + 48 skip + cap_bot)
+        ld      iyl, 50                         ; cap_top + 48 skip + cap_bot
 .cps_body_inc_lp:
         ldi
         ldi
@@ -596,8 +687,9 @@ configure_pipe_slots:
         dec     iyl
         jr      nz, .cps_body_inc_lp
 
-        ; clear saved_old_gap_y so the next configure call (init reuse or
-        ; same-pipe reconfigure) doesn't redo this restore unnecessarily.
+        ; clear saved_old_gap_y so a follow-up init-style call would take
+        ; the full-stamp path again (defensive — currently configure isn't
+        ; called like that, but keeps the sentinel honest).
         xor     a
         ld      (saved_old_gap_y), a
 
