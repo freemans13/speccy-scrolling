@@ -527,7 +527,18 @@ configure_pipe_slots:
         add     a, PIPE_GAP
         ld      (cps_cap_bot_row), a
 
-        ; ─── Step 1: stamp BODY_TEMPLATE → slot column for this pipe ─
+        ; ─── Step 1: stamp BODY_TEMPLATE → body rows only (skip cap range) ─
+        ; Region A: rows [0, cap_top_row-1]    (count = cap_top_row)
+        ; Region B: rows [cap_bot_row+1, 159]  (count = 159 - cap_bot_row)
+        ; Cap region [cap_top_row..cap_bot_row] is overwritten by Step 2.
+        ; Saves 50 rows × 146T = 7300T vs stamping all 160 rows.
+
+        ; --- Region A: stamp rows [0, cap_top_row-1] ---
+        ld      a, (cps_cap_top_row)
+        or      a
+        jr      z, .cps_body_a_done             ; skip if cap_top_row == 0
+        ld      iyl, a                          ; counter = cap_top_row
+
         ; DE = slot[0][pipe] = SLOT_GRID_BASE + 1 + pipe*5
         ld      a, (cps_pipe)
         ld      e, a
@@ -540,22 +551,77 @@ configure_pipe_slots:
         add     hl, de
         ex      de, hl                          ; DE = slot[0][pipe]
         ld      hl, BODY_TEMPLATE
-        ld      iyl, GROUND_TOP                 ; row counter (160)
-.cps_body_stamp_lp:
+.cps_body_a_lp:
         ldi
         ldi
         ldi
         ldi
         ldi
-        ; Advance DE by SLOT_ROW_STRIDE - 5 = 11 to next row's same pipe slot.
-        ; (LDI auto-incremented DE by 5; need +11 more.)
         push    hl
         ld      hl, SLOT_ROW_STRIDE - 5
         add     hl, de
         ex      de, hl
         pop     hl
         dec     iyl
-        jr      nz, .cps_body_stamp_lp
+        jr      nz, .cps_body_a_lp
+.cps_body_a_done:
+
+        ; --- Region B: stamp rows [cap_bot_row+1, 159] ---
+        ld      a, (cps_cap_bot_row)
+        cpl                                     ; A = ~cap_bot_row = 255 - cap_bot_row
+        sub     255 - 159                       ; A = 159 - cap_bot_row
+        jr      z, .cps_body_b_done             ; skip if count == 0
+        jr      c, .cps_body_b_done             ; safety: cap_bot_row > 159
+        ld      iyl, a                          ; counter
+
+        ; HL = BODY_TEMPLATE + (cap_bot_row+1) * 5
+        ld      a, (cps_cap_bot_row)
+        inc     a                               ; A = cap_bot_row + 1
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl                          ; HL = (cap_bot_row+1) * 4
+        ld      e, a
+        ld      d, 0
+        add     hl, de                          ; HL = (cap_bot_row+1) * 5
+        ld      de, BODY_TEMPLATE
+        add     hl, de                          ; HL = BODY_TEMPLATE + (cap_bot_row+1)*5
+        push    hl                              ; save template src
+        ; DE = slot[cap_bot_row+1][pipe] = SLOT_GRID_BASE + 1 + (cap_bot_row+1)*16 + pipe*5
+        ld      a, (cps_cap_bot_row)
+        inc     a
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; HL = (cap_bot_row+1) * 16
+        ld      a, (cps_pipe)
+        ld      e, a
+        add     a, a
+        add     a, a
+        add     a, e                            ; A = pipe*5
+        ld      e, a
+        ld      d, 0
+        add     hl, de                          ; HL += pipe*5
+        ld      de, SLOT_GRID_BASE + 1
+        add     hl, de                          ; HL = slot[cap_bot_row+1][pipe]
+        ex      de, hl                          ; DE = dest slot
+        pop     hl                              ; HL = template src
+.cps_body_b_lp:
+        ldi
+        ldi
+        ldi
+        ldi
+        ldi
+        push    hl
+        ld      hl, SLOT_ROW_STRIDE - 5
+        add     hl, de
+        ex      de, hl
+        pop     hl
+        dec     iyl
+        jr      nz, .cps_body_b_lp
+.cps_body_b_done:
 
         ; ─── Step 2: stamp CAP_BLOCK at slot[cap_top_row][pipe] ─────
         ; DE = slot[cap_top_row][pipe] = SLOT_GRID_BASE + 1 + cap_top_row*16 + pipe*5
