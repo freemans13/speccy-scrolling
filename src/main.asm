@@ -44,14 +44,14 @@ SLOT_GRID_BASE         EQU $DB00       ; 3045 B total grid
 SLOT_GRID_NORMAL_BASE  EQU SLOT_GRID_BASE              ; rows 0..127
 SLOT_GRID_NORMAL_SIZE  EQU 128 * 16                    ; 2048 B
 SLOT_GRID_CITY_BASE    EQU SLOT_GRID_BASE + SLOT_GRID_NORMAL_SIZE  ; $E300
-SLOT_GRID_CITY_SIZE    EQU 32 * 31                     ; 992 B
-SLOT_GRID_END          EQU SLOT_GRID_CITY_BASE + SLOT_GRID_CITY_SIZE  ; $E6E0
+SLOT_GRID_CITY_SIZE    EQU 32 * 34                     ; 1088 B  (was 32*31=992)
+SLOT_GRID_END          EQU SLOT_GRID_CITY_BASE + SLOT_GRID_CITY_SIZE  ; $E740
 PIPE_PROGRAM           EQU SLOT_GRID_BASE              ; entry point alias
 
 NORMAL_ROW_STRIDE      EQU 16          ; 1 (exx) + 3*5
-CITY_ROW_STRIDE        EQU 31          ; 1 (exx) + 3*10
+CITY_ROW_STRIDE        EQU 34          ; 1 (exx) + 3*11  (was 31 = 1+3*10)
 NORMAL_SLOT_STRIDE     EQU 5
-CITY_SLOT_STRIDE       EQU 10
+CITY_SLOT_STRIDE       EQU 11          ; was 10; ld sp,(nn) = 4B vs 3B
 
 ; ─── Cityscape data (unchanged) ──────────────────────────────────
 CITY_BG_TABLE          EQU $EB00       ; 1024 B
@@ -221,6 +221,13 @@ body_a_bc:      dw 0
 body_a_de:      dw 0
 body_b_bc:      dw 0
 body_b_de:      dw 0
+
+; Three global city-slot indirect pointers. Updated once per frame in redraw_pipes_v2.
+; Each city body slot does ld sp,(current_X_ptr) to load its 4-byte bitmap row;
+; only these 3 words change per frame (was 96 cache_addr patches = ~8k T-states).
+current_sky_ptr:    dw 0     ; = pipe_bitmap + phase*4
+current_city_a_ptr: dw 0     ; = pipe_bitmap_city_a + phase*4
+current_city_b_ptr: dw 0     ; = pipe_bitmap_city_b + phase*4
 
 ; Scratch bytes for update_cap_imm's phase-shifted cap values
 cap_L_temp:     db 0
@@ -542,20 +549,20 @@ init_slot_addr_table:
         jr      .write_3_pipes
 
 .city_row:
-        ; City: DE = SLOT_GRID_CITY_BASE + (row-128)*31 + 1
+        ; City: DE = SLOT_GRID_CITY_BASE + (row-128)*34 + 1
+        ; (row-128)*34 = (row-128)*32 + (row-128)*2
         ld      a, b
         sub     128
         ld      l, a
-        ld      h, 0
+        ld      h, 0                            ; HL = row - 128
+        add     hl, hl                          ; HL = (row-128) × 2
         ld      d, h
-        ld      e, l                            ; DE = row - 128
-        add     hl, hl
+        ld      e, l                            ; DE = (row-128) × 2
         add     hl, hl
         add     hl, hl
         add     hl, hl
         add     hl, hl                          ; HL = (row-128) × 32
-        or      a
-        sbc     hl, de                          ; HL = (row-128) × 31
+        add     hl, de                          ; HL = (row-128) × 34
         ld      de, SLOT_GRID_CITY_BASE + 1
         add     hl, de                          ; HL = base addr for pipe 0
         ex      de, hl                          ; DE = base addr
@@ -700,40 +707,78 @@ init_pipe_program:
         jp      .ipp_row_done
 
         ; ──────────────────────────────────────────────────────────
-        ; City row (128..159): 3 × 10-byte city body template
-        ;   $31 cache_lo cache_hi $C1 $D1 $31 screen_lo screen_hi $D5 $C5
+        ; City row (128..159): 3 × 11-byte city body template
+        ;   $ED $7B ptr_lo ptr_hi $C1 $D1 $31 screen_lo screen_hi $D5 $C5
+        ;   (ld sp,(nn) ; pop bc ; pop de ; ld sp,screen ; push de ; push bc)
+        ; ptr = one of current_sky_ptr / current_city_a_ptr / current_city_b_ptr
         ; ──────────────────────────────────────────────────────────
 .ipp_city_row:
         ld      c, 0                    ; pipe index
 .ipp_city_pipe_lp:
-        ; Compute cache_addr = CITY_CACHE + (row - CITY_TOP)*12 + pipe*4
+        ; Look up ptr address via CITY_BASE_LUT[(byte_x-1)*64 + row_idx*2].
+        ; The LUT stores the bitmap base address; we map it to one of 3 ptr vars.
+        ; row_idx = B - CITY_TOP  (B preserved on outer stack)
         ld      a, b
-        sub     CITY_TOP                ; A = row - 128 (0..31)
+        sub     CITY_TOP                ; A = row_idx (0..31)
         ld      l, a
         ld      h, 0
-        add     hl, hl                  ; *2
-        add     hl, hl                  ; *4
-        ld      d, h
-        ld      e, l                    ; DE = (row-CITY_TOP)*4
-        add     hl, hl                  ; *8
-        add     hl, de                  ; *12
-        ld      de, CITY_CACHE
-        add     hl, de                  ; HL = CITY_CACHE + (row-CITY_TOP)*12
+        add     hl, hl                  ; row_idx * 2  (2 bytes per LUT entry)
+        ld      (ipp_row_idx_off), hl   ; save for this pipe
+
+        ; byte_x for pipe C
+        ld      hl, ipp_byte_x
         ld      a, c
-        add     a, a
-        add     a, a                    ; pipe*4
         add     a, l
         ld      l, a
-        jr      nc, .ipp_cache_nc
+        jr      nc, .ipp_cp2_nc
         inc     h
-.ipp_cache_nc:
-        ; HL = cache_addr for (row, pipe)
-        ; Emit first 5 bytes: ld sp,cache_addr ; pop bc ; pop de
-        ld      (iy+0), $31
-        ld      (iy+1), l
-        ld      (iy+2), h
-        ld      (iy+3), $C1             ; pop bc
-        ld      (iy+4), $D1             ; pop de
+.ipp_cp2_nc:
+        ld      a, (hl)                 ; A = byte_x
+        dec     a                       ; A = byte_x - 1
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; HL = (byte_x-1) * 64
+        ld      de, (ipp_row_idx_off)
+        add     hl, de                  ; HL = (byte_x-1)*64 + row_idx*2
+        ld      de, CITY_BASE_LUT
+        add     hl, de                  ; HL → LUT entry
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = bitmap base address
+
+        ; Map DE (bitmap base) → ptr variable address
+        ; pipe_bitmap → current_sky_ptr
+        ; pipe_bitmap_city_a → current_city_a_ptr
+        ; pipe_bitmap_city_b → current_city_b_ptr
+        ld      hl, pipe_bitmap_city_b
+        or      a
+        sbc     hl, de
+        jr      z, .ipp_ptr_city_b
+        ld      hl, pipe_bitmap_city_a
+        or      a
+        sbc     hl, de
+        jr      z, .ipp_ptr_city_a
+        ld      hl, current_sky_ptr
+        jr      .ipp_ptr_done
+.ipp_ptr_city_a:
+        ld      hl, current_city_a_ptr
+        jr      .ipp_ptr_done
+.ipp_ptr_city_b:
+        ld      hl, current_city_b_ptr
+.ipp_ptr_done:
+        ; HL = address of the correct global ptr variable
+        ; Emit 11-byte slot: ED 7B ptr_lo ptr_hi C1 D1 31 screen_lo screen_hi D5 C5
+        ld      (iy+0), $ED
+        ld      (iy+1), $7B
+        ld      (iy+2), l               ; ptr_lo
+        ld      (iy+3), h               ; ptr_hi
+        ld      (iy+4), $C1             ; pop bc
+        ld      (iy+5), $D1             ; pop de
 
         ; Compute screen_target = line_table[B] + byte_x[C] + 3
         ld      a, b
@@ -758,19 +803,19 @@ init_pipe_program:
         ld      h, 0
         add     hl, de                  ; HL = screen_target
 
-        ; Emit last 5 bytes at IY+5: ld sp,screen_target ; push de ; push bc
-        ld      (iy+5), $31
-        ld      (iy+6), l
-        ld      (iy+7), h
-        ld      (iy+8), $D5             ; push de
-        ld      (iy+9), $C5             ; push bc
-        ld      de, CITY_SLOT_STRIDE    ; = 10
+        ; Emit last 5 bytes at IY+6: ld sp,screen_target ; push de ; push bc
+        ld      (iy+6), $31
+        ld      (iy+7), l
+        ld      (iy+8), h
+        ld      (iy+9), $D5             ; push de
+        ld      (iy+10), $C5            ; push bc
+        ld      de, CITY_SLOT_STRIDE    ; = 11
         add     iy, de                  ; advance cursor to next slot
 
         inc     c
         ld      a, c
         cp      NUM_PIPES               ; 3
-        jr      nz, .ipp_city_pipe_lp
+        jp      nz, .ipp_city_pipe_lp
 
 .ipp_row_done:
         pop     bc                      ; restore B=row
@@ -793,7 +838,8 @@ init_pipe_program:
         ld      (hl), $C9
         ret
 
-ipp_byte_x: ds 3, 0                    ; scratch: byte_x per pipe (3 bytes)
+ipp_byte_x:     ds 3, 0                 ; scratch: byte_x per pipe (3 bytes)
+ipp_row_idx_off: dw 0                  ; scratch: row_idx*2 saved during city pipe loop
 
 ;----------------------------------------------------------------
 ; configure_pipe_slots(A=pipe 0..2, E=new_gap_y 1..111)
@@ -955,6 +1001,7 @@ configure_pipe_slots:
         ld      (iy+7), $00
         ld      (iy+8), $00
         ld      (iy+9), $00
+        ld      (iy+10), $00
 .cps_ct_emit_active:
         ; Active entry = cap_top_target_imm_addrs[pipe] (2 bytes)
         pop     de                      ; restore sublist cursor
@@ -1000,6 +1047,7 @@ configure_pipe_slots:
         ld      (iy+7), $00
         ld      (iy+8), $00
         ld      (iy+9), $00
+        ld      (iy+10), $00
 .cps_cb_emit_active:
         pop     de
         ld      a, (cps_pipe)
@@ -1042,6 +1090,7 @@ configure_pipe_slots:
         ld      (iy+7), $00
         ld      (iy+8), $00
         ld      (iy+9), $00
+        ld      (iy+10), $00
 .cps_skip_done:
         pop     de                      ; no active list entry for skip
         push    de
@@ -1091,34 +1140,58 @@ configure_pipe_slots:
         jp      .cps_row_done
 
 .cps_body_city:
-        ; City body: 31 cache_lo cache_hi C1 D1 31 screen_lo screen_hi D5 C5
-        ; cache_addr = CITY_CACHE + (row - CITY_TOP)*12 + pipe*4
+        ; City body (11 bytes): ED 7B ptr_lo ptr_hi C1 D1 31 screen_lo screen_hi D5 C5
+        ; ptr = one of current_sky_ptr/current_city_a_ptr/current_city_b_ptr
+        ; Look up which ptr to use: CITY_BASE_LUT[(byte_x-1)*64 + row_idx*2]
         ld      a, b
-        sub     CITY_TOP                ; A = row - 128
+        sub     CITY_TOP                ; A = row_idx (0..31)
         ld      l, a
         ld      h, 0
-        add     hl, hl                  ; *2
-        add     hl, hl                  ; *4
+        add     hl, hl                  ; row_idx * 2
         ld      d, h
-        ld      e, l                    ; DE = (row-CITY_TOP)*4
-        add     hl, hl                  ; *8
-        add     hl, de                  ; *12
-        ld      de, CITY_CACHE
-        add     hl, de                  ; HL = CITY_CACHE + (row-CITY_TOP)*12
-        ld      a, (cps_pipe)
-        add     a, a
-        add     a, a                    ; pipe*4
-        add     a, l
+        ld      e, l                    ; DE = row_idx * 2
+
+        ld      a, (cps_byte_x)
+        dec     a                       ; A = byte_x - 1
         ld      l, a
-        jr      nc, .cps_cbc_nc
-        inc     h
-.cps_cbc_nc:
-        ; HL = cache_addr
-        ld      (iy+0), $31
-        ld      (iy+1), l
-        ld      (iy+2), h
-        ld      (iy+3), $C1             ; pop bc
-        ld      (iy+4), $D1             ; pop de
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; HL = (byte_x-1) * 64
+        add     hl, de                  ; HL = (byte_x-1)*64 + row_idx*2
+        ld      de, CITY_BASE_LUT
+        add     hl, de                  ; HL → LUT entry
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = bitmap base address
+
+        ; Map DE → ptr variable address
+        ld      hl, pipe_bitmap_city_b
+        or      a
+        sbc     hl, de
+        jr      z, .cps_ptr_city_b
+        ld      hl, pipe_bitmap_city_a
+        or      a
+        sbc     hl, de
+        jr      z, .cps_ptr_city_a
+        ld      hl, current_sky_ptr
+        jr      .cps_ptr_done
+.cps_ptr_city_a:
+        ld      hl, current_city_a_ptr
+        jr      .cps_ptr_done
+.cps_ptr_city_b:
+        ld      hl, current_city_b_ptr
+.cps_ptr_done:
+        ; HL = address of the correct global ptr variable
+        ld      (iy+0), $ED
+        ld      (iy+1), $7B
+        ld      (iy+2), l               ; ptr_lo
+        ld      (iy+3), h               ; ptr_hi
+        ld      (iy+4), $C1             ; pop bc
+        ld      (iy+5), $D1             ; pop de
         ; screen_target = line_table[row] + byte_x + 3
         ld      a, b
         ld      l, a
@@ -1137,17 +1210,17 @@ configure_pipe_slots:
         jr      nc, .cps_cbs_nc
         inc     h
 .cps_cbs_nc:
-        ld      (iy+5), $31
-        ld      (iy+6), l
-        ld      (iy+7), h
-        ld      (iy+8), $D5
-        ld      (iy+9), $C5
-        ; Active entry: slot_addr + 6 (screen target lo byte)
+        ld      (iy+6), $31
+        ld      (iy+7), l
+        ld      (iy+8), h
+        ld      (iy+9), $D5
+        ld      (iy+10), $C5
+        ; Active entry: slot_addr + 7 (screen target lo byte at new offset)
         pop     de
         push    iy
         pop     hl                      ; HL = slot base
         ld      a, l
-        add     a, 6
+        add     a, 7
         ld      l, a
         jr      nc, .cps_cba_nc
         inc     h
@@ -2600,8 +2673,10 @@ wrap_byte_x:
 .recycle:
         call    random_gap_y            ; A = new random gap_y; IY/BC preserved
         ld      (iy+1), a
-        ld      a, 1
-        ld      (pending_regen), a      ; defer gen_pipe_program to end of frame_update
+        ld      a, 2
+        ld      (pending_regen), a      ; defer configure_pipe_slots by 2 frames
+                                        ; (1: this frame N already at limit with patch_city;
+                                        ;  N+1 runs deferred patch; N+2 runs configure)
         ; Record which pipe recycled — B counts down from NUM_PIPES to 1, so index = NUM_PIPES - B.
         ld      a, NUM_PIPES
         sub     b
@@ -2615,6 +2690,10 @@ wrap_byte_x:
         djnz    .outer
         ld      a, 1
         ld      (patch_pending), a      ; defer patch_pipe_targets to top of next redraw_pipes_v2
+        ; Update city slot ptr operands for new byte_x (CITY_BASE_LUT already has new values).
+        ; On recycle frames, configure_pipe_slots + build_slot_targets + patch_city_slot_ptrs
+        ; will run again at the top of redraw_pipes_v2 to handle the recycled pipe's new gap_y.
+        call    patch_city_slot_ptrs
         ret
 
 patch_pipe_smc:
@@ -3293,10 +3372,18 @@ redraw_pipes_v2:
 .skip_patch:
 
         ; 2. configure_pipe_slots + build_slot_targets for the recycled pipe.
-        ;    Runs after patch so configure writes fresh targets at current byte_x.
+        ;    pending_regen states: 0 = nothing, 2 = wait one more frame, 1 = run now.
+        ;    Set to 2 on recycle (in wrap_byte_x). Decrements each frame. Runs when 1.
         ld      a, (pending_regen)
         or      a
         jr      z, .skip_regen
+        cp      1
+        jr      z, .do_regen
+        ; pending_regen == 2: decrement to 1, do nothing this frame
+        dec     a
+        ld      (pending_regen), a
+        jr      .skip_regen
+.do_regen:
         xor     a
         ld      (pending_regen), a
         ld      a, (recycled_pipe_idx)
@@ -3311,6 +3398,7 @@ redraw_pipes_v2:
         pop     af
         call    configure_pipe_slots
         call    build_slot_targets
+        call    patch_city_slot_ptrs    ; rebuild ptr operands after slot structure changed
 .skip_regen:
 
         ; --- Rest of redraw_pipes_v2 ---
@@ -3353,9 +3441,45 @@ redraw_pipes_v2:
         exx
         ; Refresh cap and city byte values for current phase
         call    update_cap_imm_v2       ; clobbers BC, DE
-        ld      a, 6                    ; YELLOW = city cache addr patching
-        out     ($fe), a
-        call    patch_city_slot_cache_addrs
+
+        ; Update 3 global city-slot indirect pointers for this frame's phase (~30T).
+        ; current_sky_ptr    = pipe_bitmap + phase*4
+        ; current_city_a_ptr = pipe_bitmap_city_a + phase*4
+        ; current_city_b_ptr = pipe_bitmap_city_b + phase*4
+        ld      a, (phase)
+        add     a, a
+        add     a, a                    ; A = phase * 4
+
+        ld      hl, pipe_bitmap
+        add     a, l
+        ld      l, a
+        jr      nc, .csp_nc1
+        inc     h
+.csp_nc1:
+        ld      (current_sky_ptr), hl
+
+        ld      a, (phase)
+        add     a, a
+        add     a, a
+        ld      hl, pipe_bitmap_city_a
+        add     a, l
+        ld      l, a
+        jr      nc, .csp_nc2
+        inc     h
+.csp_nc2:
+        ld      (current_city_a_ptr), hl
+
+        ld      a, (phase)
+        add     a, a
+        add     a, a
+        ld      hl, pipe_bitmap_city_b
+        add     a, l
+        ld      l, a
+        jr      nc, .csp_nc3
+        inc     h
+.csp_nc3:
+        ld      (current_city_b_ptr), hl
+
         ld      a, 3                    ; MAGENTA = PIPE_PROGRAM
         out     ($fe), a
         ; PIPE_PROGRAM has a leading EXX at every row to alternate A/B variants.
@@ -5836,12 +5960,15 @@ build_slot_targets:
         pop     hl                      ; restore write cursor
 
         ; Check opcode at slot_first_byte_addr
+        ; New city body slots start with $ED (ld sp,(nn)); ptr_lo is at slot+2.
+        ; Normal body slots start with $31 (ld sp,nn) — no city slot targets stored here.
         ld      a, (de)
-        cp      $31                     ; body slot?
+        cp      $ED                     ; city body slot?
         jr      nz, .bst_cap
 
-        ; Body slot: store slot_first_byte_addr + 1
-        inc     de                      ; DE = slot+1 (where cache_lo goes)
+        ; City body slot: store slot_first_byte_addr + 2 (ptr_lo operand address)
+        inc     de
+        inc     de                      ; DE = slot+2 (where ptr_lo is patched)
         ld      (hl), e
         inc     hl
         ld      (hl), d
@@ -5849,7 +5976,7 @@ build_slot_targets:
         jr      .bst_next_row
 
 .bst_cap:
-        ; Cap/skip slot: store address of pcsca_scratch (harmless write target)
+        ; Cap/skip/normal-body slot: store address of pcsca_scratch (harmless write target)
         ld      (hl), low pcsca_scratch
         inc     hl
         ld      (hl), high pcsca_scratch
@@ -5869,76 +5996,122 @@ build_slot_targets:
         ret
 
 ;----------------------------------------------------------------
-; patch_city_slot_cache_addrs: per-frame SMC patch of city body slot cache_addrs.
+; patch_city_slot_ptrs: per-wrap SMC patch of city body slot ptr operands.
 ;
-; SP-hijack design — walks slot_targets (pre-built) and CITY_BASE_LUT in
-; lockstep.  No per-slot SAT lookup, no opcode check.
+; Called once per wrap (every 8 frames) from wrap_byte_x.
+; For each of 96 city body slots, patches the 2-byte (nn) operand of
+; "ld sp,(nn)" to point at the correct global pointer variable:
+;   current_sky_ptr / current_city_a_ptr / current_city_b_ptr
+; Selection is based on CITY_BASE_LUT[(byte_x-1)*64 + row_idx*2] bitmap base.
 ;
-; Per-slot cost: pop(10)+ld(7)+add(4)+ld(7)+inc(6)+inc(6)+ld(7)+adc(7)+ld(7)+inc(6)+djnz(13) = ~80T
-; 96 slots × 80T = ~7680T + 3 pipe setups ~80T each = ~7920T total.
+; slot_targets[] was rebuilt by build_slot_targets to hold slot+2
+; (the ptr_lo byte of the ED 7B nn_lo nn_hi instruction) for city body slots,
+; or pcsca_scratch for cap/skip/normal-body slots (harmless write).
+;
+; Design: SP hijacked to walk slot_targets via pop. HL walks CITY_BASE_LUT.
+; BC holds the LUT-read base addr (B=hi, C=lo). DE gets slot+2 addr from pop.
+; Comparison done in A; known base addrs are immediate constants.
+;
+; Per-slot cost: pop(10)+ld(7)+inc(6)+ld(7)+inc(6)+compare+write ~60T avg
+; 96 slots × 60T + 3 pipe setups ~120T = ~5880T per wrap (~1470T amortised/frame)
 ;
 ; Clobbers AF, BC, DE, HL. Saves/restores SP via saved_sp_inner.
 ;----------------------------------------------------------------
-patch_city_slot_cache_addrs:
-        ld      a, (phase)
-        add     a, a
-        add     a, a               ; A = phase * 4
-        ld      (pcsca_phase_off), a  ; save to memory (SP gets hijacked, can't use stack)
-
+patch_city_slot_ptrs:
         ld      (saved_sp_inner), sp
-        ld      sp, slot_targets   ; SP-hijack: walks slot_targets via pop
+        ld      sp, slot_targets        ; SP-hijack: walks slot_targets via pop
 
-        xor     a                  ; pipe index in memory
-.pcsca_pipe_lp:
+        xor     a                       ; pipe = 0
+.pcssp_pipe_lp:
         ld      (pcsca_pipe_idx), a
 
         ; Compute lut_row_ptr = CITY_BASE_LUT + (byte_x - 1) * 64
         ld      l, a
         ld      h, 0
-        add     hl, hl             ; pipe * 2
+        add     hl, hl                  ; pipe * 2
         ld      de, pipe_state
         add     hl, de
-        ld      a, (hl)            ; A = byte_x
-        dec     a                  ; A = byte_x - 1
+        ld      a, (hl)                 ; A = byte_x
+        dec     a                       ; A = byte_x - 1
         ld      l, a
         ld      h, 0
-        add     hl, hl             ; *2
-        add     hl, hl             ; *4
-        add     hl, hl             ; *8
-        add     hl, hl             ; *16
-        add     hl, hl             ; *32
-        add     hl, hl             ; *64
+        add     hl, hl                  ; *2
+        add     hl, hl                  ; *4
+        add     hl, hl                  ; *8
+        add     hl, hl                  ; *16
+        add     hl, hl                  ; *32
+        add     hl, hl                  ; *64
         ld      de, CITY_BASE_LUT
-        add     hl, de             ; HL = lut_row_ptr (row_idx=0 entry)
+        add     hl, de                  ; HL = lut cursor (row_idx=0)
 
-        ld      a, (pcsca_phase_off)
-        ld      c, a               ; C = phase_offset (live across inner loop)
+        ld      b, 32                   ; 32 rows per pipe
+.pcssp_row_lp:
+        ; SP-hijack pop gives slot+2 address into DE
+        pop     de                      ; DE = slot+2 (ptr_lo operand to patch)
 
-        ld      b, 32              ; 32 rows
-.pcsca_row_lp:
-        pop     de                 ; DE = slot+1 addr (from slot_targets via SP-hijack)
-        ld      a, (hl)            ; A = base_lo
-        add     a, c               ; A = base_lo + phase_offset
-        ld      (de), a            ; write cache_lo at slot+1
-        inc     de
+        ; Read base addr from LUT (LE 16-bit). B=row counter survives untouched.
+        ld      a, (hl)                 ; A = base_lo
         inc     hl
-        ld      a, (hl)            ; A = base_hi
-        adc     a, 0               ; A = base_hi + carry
-        ld      (de), a            ; write cache_hi at slot+2
-        inc     hl                 ; advance LUT cursor to next row entry
-        djnz    .pcsca_row_lp
+        ld      c, (hl)                 ; C = base_hi
+        inc     hl
+        ; Save base_lo to scratch; needed if hi-byte comparison fails and we fall through
+        ld      (pcsca_phase_off), a
 
+        ; Compare against pipe_bitmap_city_b (lo byte first — fastest reject)
+        cp      low pipe_bitmap_city_b
+        jr      nz, .pcssp_not_citb
+        ld      a, c
+        cp      high pipe_bitmap_city_b
+        jr      nz, .pcssp_try_cita     ; lo matched but hi didn't → not city_b
+
+        ; Match: current_city_b_ptr
+        ld      a, low current_city_b_ptr
+        ld      (de), a
+        inc     de
+        ld      a, high current_city_b_ptr
+        ld      (de), a
+        djnz    .pcssp_row_lp
+        jr      .pcssp_next_pipe
+
+.pcssp_try_cita:
+        ld      a, (pcsca_phase_off)    ; restore base_lo
+.pcssp_not_citb:
+        ; Compare against pipe_bitmap_city_a
+        cp      low pipe_bitmap_city_a
+        jr      nz, .pcssp_sky
+        ld      a, c
+        cp      high pipe_bitmap_city_a
+        jr      nz, .pcssp_sky          ; lo matched but hi didn't → sky
+
+        ; Match: current_city_a_ptr
+        ld      a, low current_city_a_ptr
+        ld      (de), a
+        inc     de
+        ld      a, high current_city_a_ptr
+        ld      (de), a
+        djnz    .pcssp_row_lp
+        jr      .pcssp_next_pipe
+
+.pcssp_sky:
+        ; Default: current_sky_ptr
+        ld      a, low current_sky_ptr
+        ld      (de), a
+        inc     de
+        ld      a, high current_sky_ptr
+        ld      (de), a
+        djnz    .pcssp_row_lp
+
+.pcssp_next_pipe:
         ld      a, (pcsca_pipe_idx)
         inc     a
         cp      NUM_PIPES
-        jr      nz, .pcsca_pipe_lp
+        jr      nz, .pcssp_pipe_lp
 
         ld      sp, (saved_sp_inner)
         ret
 
 pcsca_pipe_idx:   db 0         ; current pipe index (in memory; SP is hijacked)
-
-pcsca_phase_off:  db 0         ; (unused — kept to avoid relocation of saved_sp_inner ref)
+pcsca_phase_off:  db 0         ; scratch: base_lo saved during inner loop
 pcsca_lut_ptr:    dw 0         ; (unused legacy scratch)
 pcsca_row2_tmp:   dw 0         ; (unused legacy scratch)
 
