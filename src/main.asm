@@ -138,9 +138,6 @@ wrap_pending:  db 0                      ; set when a wrap happened this frame
 pending_regen: db 0                      ; set when a recycle happened; configure_pipe_slots deferred
 patch_pending: db 0                      ; set by wrap_byte_x when byte_x changed; cleared after patch_pipe_targets runs
 recycled_pipe_idx: db 0
-saved_old_gap_y:   db 0                 ; OLD gap_y of the just-recycled pipe; configure
-                                        ; reads this to incrementally restore body only at
-                                        ; the OLD cap range. 0 = init mode → skip restore.
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
@@ -530,59 +527,31 @@ configure_pipe_slots:
         add     a, PIPE_GAP
         ld      (cps_cap_bot_row), a
 
-        ; ─── Step 1: re-stamp body at OLD cap range (incremental) ─
-        ; The slot grid only differs from body where the OLD cap_block was
-        ; stamped (50 rows starting at old_cap_top_row). Restore body bytes
-        ; there; Step 2 then stamps the NEW cap_block at the NEW position.
-        ;
-        ; saved_old_gap_y = 0 → init mode (slot grid is fresh body from
-        ; init_pipe_program). Skip step 1 entirely.
-        ;
-        ; Saves ~60 rows × 146 T ≈ 8.7 k T per recycle vs the previous full
-        ; body-region re-stamp.
+        ; ─── Step 1: stamp BODY_TEMPLATE → body rows only (skip cap range) ─
+        ; Region A: rows [0, cap_top_row-1]    (count = cap_top_row)
+        ; Region B: rows [cap_bot_row+1, 159]  (count = 159 - cap_bot_row)
+        ; Cap region [cap_top_row..cap_bot_row] is overwritten by Step 2.
+        ; Saves 50 rows × 146T = 7300T vs stamping all 160 rows.
 
-        ld      a, (saved_old_gap_y)
+        ; --- Region A: stamp rows [0, cap_top_row-1] ---
+        ld      a, (cps_cap_top_row)
         or      a
-        jr      z, .cps_body_done               ; init mode: skip
-        dec     a                               ; A = old_cap_top_row = old_gap_y - 1
-        ld      iyh, a                          ; stash old_cap_top_row
+        jr      z, .cps_body_a_done             ; skip if cap_top_row == 0
+        ld      iyl, a                          ; counter = cap_top_row
 
-        ; HL = BODY_TEMPLATE + old_cap_top_row * 5
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                          ; row*2
-        ld      e, a
-        ld      d, 0
-        add     hl, hl                          ; row*4
-        add     hl, de                          ; row*5
-        ld      de, BODY_TEMPLATE
-        add     hl, de                          ; HL = BODY_TEMPLATE + row*5
-        push    hl                              ; save template src
-
-        ; DE = slot[old_cap_top_row][pipe]
-        ;    = SLOT_GRID_BASE + 1 + old_cap_top_row*16 + pipe*5
-        ld      a, iyh                          ; A = old_cap_top_row
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; HL = row*16
+        ; DE = slot[0][pipe] = SLOT_GRID_BASE + 1 + pipe*5
         ld      a, (cps_pipe)
         ld      e, a
         add     a, a
         add     a, a
         add     a, e                            ; A = pipe*5
-        ld      e, a
-        ld      d, 0
-        add     hl, de                          ; HL += pipe*5
+        ld      l, a
+        ld      h, 0
         ld      de, SLOT_GRID_BASE + 1
-        add     hl, de                          ; HL = slot[old_cap_top_row][pipe]
-        ex      de, hl                          ; DE = dest slot
-        pop     hl                              ; HL = template src
-
-        ld      iyl, 50                         ; loop 50 rows (cap_top + 48 skip + cap_bot)
-.cps_body_inc_lp:
+        add     hl, de
+        ex      de, hl                          ; DE = slot[0][pipe]
+        ld      hl, BODY_TEMPLATE
+.cps_body_a_lp:
         ldi
         ldi
         ldi
@@ -594,14 +563,65 @@ configure_pipe_slots:
         ex      de, hl
         pop     hl
         dec     iyl
-        jr      nz, .cps_body_inc_lp
+        jr      nz, .cps_body_a_lp
+.cps_body_a_done:
 
-        ; clear saved_old_gap_y so the next configure call (init reuse or
-        ; same-pipe reconfigure) doesn't redo this restore unnecessarily.
-        xor     a
-        ld      (saved_old_gap_y), a
+        ; --- Region B: stamp rows [cap_bot_row+1, 159] ---
+        ld      a, (cps_cap_bot_row)
+        cpl                                     ; A = ~cap_bot_row = 255 - cap_bot_row
+        sub     255 - 159                       ; A = 159 - cap_bot_row
+        jr      z, .cps_body_b_done             ; skip if count == 0
+        jr      c, .cps_body_b_done             ; safety: cap_bot_row > 159
+        ld      iyl, a                          ; counter
 
-.cps_body_done:
+        ; HL = BODY_TEMPLATE + (cap_bot_row+1) * 5
+        ld      a, (cps_cap_bot_row)
+        inc     a                               ; A = cap_bot_row + 1
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl                          ; HL = (cap_bot_row+1) * 4
+        ld      e, a
+        ld      d, 0
+        add     hl, de                          ; HL = (cap_bot_row+1) * 5
+        ld      de, BODY_TEMPLATE
+        add     hl, de                          ; HL = BODY_TEMPLATE + (cap_bot_row+1)*5
+        push    hl                              ; save template src
+        ; DE = slot[cap_bot_row+1][pipe] = SLOT_GRID_BASE + 1 + (cap_bot_row+1)*16 + pipe*5
+        ld      a, (cps_cap_bot_row)
+        inc     a
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; HL = (cap_bot_row+1) * 16
+        ld      a, (cps_pipe)
+        ld      e, a
+        add     a, a
+        add     a, a
+        add     a, e                            ; A = pipe*5
+        ld      e, a
+        ld      d, 0
+        add     hl, de                          ; HL += pipe*5
+        ld      de, SLOT_GRID_BASE + 1
+        add     hl, de                          ; HL = slot[cap_bot_row+1][pipe]
+        ex      de, hl                          ; DE = dest slot
+        pop     hl                              ; HL = template src
+.cps_body_b_lp:
+        ldi
+        ldi
+        ldi
+        ldi
+        ldi
+        push    hl
+        ld      hl, SLOT_ROW_STRIDE - 5
+        add     hl, de
+        ex      de, hl
+        pop     hl
+        dec     iyl
+        jr      nz, .cps_body_b_lp
+.cps_body_b_done:
 
         ; ─── Step 2: stamp CAP_BLOCK at slot[cap_top_row][pipe] ─────
         ; DE = slot[cap_top_row][pipe] = SLOT_GRID_BASE + 1 + cap_top_row*16 + pipe*5
@@ -1676,9 +1696,6 @@ wrap_byte_x:
         dec     a
         jr      .save
 .recycle:
-        ld      a, (iy+1)               ; A = OLD gap_y (still in pipe_state)
-        ld      (saved_old_gap_y), a    ; configure will use this to incrementally
-                                        ; re-stamp body only at the OLD cap range
         call    random_gap_y            ; A = new random gap_y; IY/BC preserved
         ld      (iy+1), a
         ld      a, 2
