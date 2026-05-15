@@ -502,8 +502,6 @@ ipp_byte_x:     ds 3, 0                 ; scratch: byte_x per pipe (3 bytes)
 ; After the row loop, patches cap_top/cap_bot handler target imms.
 ; Finally stores new_gap_y → pipe_state[pipe*2 + 1].
 ;
-; Scratch memory: cps_pipe, cps_gap_y, cps_byte_x, cps_cap_top_row,
-;   cps_cap_bot_row, cps_cap_top_handler_addr, cps_cap_bot_handler_addr.
 ; configure_pipe_slots — template-based recycle/init configure.
 ; Stamps BODY_TEMPLATE then overlays CAP_BLOCK at the gap_y offset,
 ; patches pipe-specific cap-handler refs and imms, and rebuilds the
@@ -981,15 +979,8 @@ compute_next_slot:
 ; ── Scratch variables for configure_pipe_slots ───────────────────
 cps_pipe:               db 0
 cps_gap_y:              db 0
-cps_byte_x:             db 0
 cps_cap_top_row:        db 0
 cps_cap_bot_row:        db 0
-cps_row_start:          db 0
-cps_row_end:            db 0
-cps_cap_top_handler_addr: dw 0
-cps_cap_bot_handler_addr: dw 0
-; Active-list cursor saved between split halves of configure_pipe_slots.
-cps_active_save:        dw 0
 
 ; ── Per-pipe active sublist base table ───────────────────────────
 cps_sublist_base_table:
