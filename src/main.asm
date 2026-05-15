@@ -95,6 +95,9 @@ main_loop:
         call    frame_update
         ld      a, 5                    ; PROFILE: CYAN = idle until next halt
         out     ($fe), a
+        ld      a, (pending_regen)
+        or      a
+        call    nz, deferred_configure  ; run configure in CYAN (after raster, no race-the-beam)
         ei
         jr      main_loop
 
@@ -1334,6 +1337,41 @@ init_pipes:
         ret
 
 ;----------------------------------------------------------------
+; deferred_configure: called from main_loop's CYAN region (post-frame,
+; pre-halt). Implements the same 2-frame defer state machine that used
+; to live at the top of redraw_pipes_v2. Running here means the raster
+; has already passed the visible area, so configure cost is invisible
+; — no RED bloom, no race-the-beam stutter on the next frame.
+;
+; Entry: pending_regen != 0 (caller checked).
+;   pending_regen == 2 → just-recycled, defer 1 more CYAN tick.
+;   pending_regen == 1 → run configure for recycled_pipe_idx; clear.
+;----------------------------------------------------------------
+deferred_configure:
+        ld      a, (pending_regen)
+        cp      1
+        jr      z, .run
+        dec     a                               ; 2 → 1
+        ld      (pending_regen), a
+        ret
+.run:
+        ld      a, (recycled_pipe_idx)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        ld      de, pipe_state
+        add     hl, de
+        inc     hl
+        ld      e, (hl)                         ; E = recycled pipe's new gap_y
+        ld      a, (recycled_pipe_idx)
+        ld      b, 0
+        ld      c, GROUND_TOP
+        call    configure_pipe_slots
+        xor     a
+        ld      (pending_regen), a
+        ret
+
+;----------------------------------------------------------------
 frame_update:
         ; ── Pipes go FIRST so X_0 is as low as possible. Skipped the magenta
         ; OUT-($fe) — saved 18 T-st of lead-time over the raster. The border
@@ -1882,30 +1920,9 @@ redraw_pipes_v2:
         ; there with a NEW _next pointing BEFORE the cap row creates an
         ; infinite-loop in PIPE_PROGRAM. The optimization alone brings cps
         ; under budget without needing the split.)
-        ld      a, (pending_regen)
-        or      a
-        jr      z, .skip_regen
-        cp      1
-        jr      z, .regen_full
-        dec     a
-        ld      (pending_regen), a
-        jr      .skip_regen
-.regen_full:
-        ld      a, (recycled_pipe_idx)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        ld      de, pipe_state
-        add     hl, de
-        inc     hl
-        ld      e, (hl)
-        ld      a, (recycled_pipe_idx)
-        ld      b, 0
-        ld      c, GROUND_TOP
-        call    configure_pipe_slots
-        xor     a
-        ld      (pending_regen), a
-.skip_regen:
+        ; (configure_pipe_slots dispatch moved to main_loop's CYAN region —
+        ; runs after raster bottom-blanking, so no RED bloom or race-the-beam
+        ; on the next frame's render.)
 
         ; --- Sky-A pair into BC/DE ---
         ld      a, (phase)
