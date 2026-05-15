@@ -2688,8 +2688,10 @@ wrap_byte_x:
         inc     iy
         pop     bc
         djnz    .outer
-        ld      a, 1
-        ld      (patch_pending), a      ; defer patch_pipe_targets to top of next redraw_pipes_v2
+        ; Run patch_pipe_targets in WHITE band (end-of-frame state prep).
+        ; WHITE is partially hidden in bottom blanking, so this is less visible
+        ; than running it in RED at top of next frame.
+        call    patch_pipe_targets
         ; Update city slot ptr operands for new byte_x (CITY_BASE_LUT already has new values).
         ; On recycle frames, configure_pipe_slots + build_slot_targets + patch_city_slot_ptrs
         ; will run again at the top of redraw_pipes_v2 to handle the recycled pipe's new gap_y.
@@ -3360,18 +3362,9 @@ cap_bot_next_imm_addrs:
 ;----------------------------------------------------------------
 redraw_pipes_v2:
         ; --- Deferred work from previous frame's end (runs during top-blanking) ---
+        ; (patch_pipe_targets moved back to WHITE band in wrap_byte_x.)
 
-        ; 1. patch_pipe_targets first (non-recycled pipes need decrement; recycled
-        ;    pipe's old targets are about to be overwritten, wasted decrement harmless).
-        ld      a, (patch_pending)
-        or      a
-        jr      z, .skip_patch
-        xor     a
-        ld      (patch_pending), a
-        call    patch_pipe_targets
-.skip_patch:
-
-        ; 2. configure_pipe_slots + build_slot_targets for the recycled pipe.
+        ; configure_pipe_slots + build_slot_targets for the recycled pipe.
         ;    pending_regen states: 0 = nothing, 2 = wait one more frame, 1 = run now.
         ;    Set to 2 on recycle (in wrap_byte_x). Decrements each frame. Runs when 1.
         ld      a, (pending_regen)
