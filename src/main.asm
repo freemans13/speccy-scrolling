@@ -80,6 +80,7 @@ start:
         call    init_background
         call    refill_base_attrs
         call    backup_base_attrs       ; snapshot ATTRS → BACKUP_ATTRS (no pipes)
+        call    build_slot_templates    ; populate template store at $C000
         call    init_pipes              ; draws pipes (pixels) — attrs still base
         call    init_bird
         call    apply_pipe_attrs        ; overlay ATTR_PIPE at initial pipe positions
