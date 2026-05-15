@@ -1075,6 +1075,135 @@ init_screen_target_table:
         ret
 
 ;----------------------------------------------------------------
+; build_slot_templates — one-shot init builder for the template store.
+; Walks line_table to populate:
+;   BODY_TEMPLATE:    160 rows × ($31, lo+32, hi, $D5, $C5) for byte_x=29
+;   CAP_BLOCK:         50 rows: cap_top stub, 48 skip rows, cap_bot stub
+;   CAP_TARGET_TABLE:  12 (gap_y) entries × (cap_top_target, cap_bot_target)
+;
+; Called once at boot, BEFORE init_pipes. Cost ~80k T-states, run-once.
+; Clobbers AF, BC, DE, HL, IX.
+;----------------------------------------------------------------
+build_slot_templates:
+        ; ─── Fill BODY_TEMPLATE: 160 rows × 5 bytes ─────────────────
+        ld      hl, line_table
+        ld      de, BODY_TEMPLATE
+        ld      b, GROUND_TOP                   ; B = row counter (160)
+.bst_body_lp:
+        ld      a, $31                          ; opcode: ld sp, nn
+        ld      (de), a
+        inc     de
+        ld      a, (hl)                         ; line_table[R].lo
+        add     a, 32                           ; +32 for byte_x=29 (29+3 offset)
+        ld      (de), a
+        inc     de
+        inc     hl
+        ld      a, (hl)                         ; line_table[R].hi
+        adc     a, 0                            ; carry from +32
+        ld      (de), a
+        inc     de
+        inc     hl
+        ld      a, $D5                          ; opcode: push de
+        ld      (de), a
+        inc     de
+        ld      a, $C5                          ; opcode: push bc
+        ld      (de), a
+        inc     de
+        djnz    .bst_body_lp
+
+        ; ─── Fill CAP_BLOCK: 50 rows × 5 bytes ───────────────────
+        ; Row 0 (cap_top): $C3, 0, 0, 0, 0  (JP nn ; nop ; nop — handler addr patched at recycle)
+        ; Rows 1..48 (skip): 0, 0, 0, 0, 0  (5 NOPs)
+        ; Row 49 (cap_bot): $C3, 0, 0, 0, 0
+        ld      hl, CAP_BLOCK
+        ld      (hl), $C3                       ; cap_top stub
+        inc     hl
+        ld      b, 4                            ; remaining cap_top bytes (0, 0, 0, 0)
+.bst_cap_top_zero:
+        ld      (hl), 0
+        inc     hl
+        djnz    .bst_cap_top_zero
+        ; 48 skip rows × 5 bytes = 240 zero bytes
+        ld      b, 240
+.bst_cap_skip_lp:
+        ld      (hl), 0
+        inc     hl
+        djnz    .bst_cap_skip_lp
+        ; cap_bot stub
+        ld      (hl), $C3
+        inc     hl
+        ld      b, 4
+.bst_cap_bot_zero:
+        ld      (hl), 0
+        inc     hl
+        djnz    .bst_cap_bot_zero
+
+        ; ─── Fill CAP_TARGET_TABLE: 12 entries × 4 bytes ──────────
+        ; For each gap_y in {8, 16, 24, ..., 96}:
+        ;   word(line_table[gap_y - 1] + 32)   = cap_top_target
+        ;   word(line_table[gap_y + 48] + 32)  = cap_bot_target
+        ld      ix, CAP_TARGET_TABLE
+        ld      b, 1                            ; B = gap_y index 1..12
+.bst_ctt_lp:
+        push    bc                              ; preserve B (outer counter)
+
+        ; cap_top_target: read line_table[gap_y - 1], add 32
+        ld      a, b
+        rlca
+        rlca
+        rlca                                    ; A = B * 8 = gap_y (8..96)
+        dec     a                               ; A = gap_y - 1
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; row*2
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = line_addr
+        ld      a, e
+        add     a, 32
+        ld      (ix+0), a
+        ld      a, d
+        adc     a, 0
+        ld      (ix+1), a
+
+        ; cap_bot_target: read line_table[gap_y + 48], add 32
+        pop     bc                              ; restore B
+        push    bc
+        ld      a, b
+        rlca
+        rlca
+        rlca                                    ; A = B * 8 = gap_y
+        add     a, 48                           ; A = gap_y + 48 (= cap_bot_row)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      a, e
+        add     a, 32
+        ld      (ix+2), a
+        ld      a, d
+        adc     a, 0
+        ld      (ix+3), a
+
+        ; Advance IX by 4 to next entry
+        ld      de, 4
+        add     ix, de
+
+        pop     bc                              ; restore B
+        inc     b
+        ld      a, b
+        cp      13                              ; loop while B in 1..12
+        jr      nz, .bst_ctt_lp
+
+        ret
+
+;----------------------------------------------------------------
 init_pipes:
         xor     a
         ld      (phase), a
