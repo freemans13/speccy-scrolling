@@ -511,12 +511,21 @@ ipp_byte_x:     ds 3, 0                 ; scratch: byte_x per pipe (3 bytes)
 ; - row_start > 0:         continues from cps_active_save (set by prior call)
 ; - row_end == GROUND_TOP: runs post-loop cap-imm patching + writes new gap_y
 ; Single-shot call uses B=0, C=GROUND_TOP. Split callers pass 0/80 then 80/160.
+;----------------------------------------------------------------
+; configure_pipe_slots — template-based recycle/init configure.
+; Stamps BODY_TEMPLATE then overlays CAP_BLOCK at the gap_y offset,
+; patches pipe-specific cap-handler refs and imms, and rebuilds the
+; pipe's active sublist.
+;
+; In:  A = pipe (0..2)
+;      E = gap_y (multiple of 8 in 8..96)
+;     B, C = ignored (kept for caller-compat with prior signature)
+; Clobbers: AF, BC, DE, HL, IX, IY.
+;
+; Recycle cost: ~30k T-states (down from ~44k pre-template).
+;----------------------------------------------------------------
 configure_pipe_slots:
         ld      (cps_pipe), a
-        ld      a, b
-        ld      (cps_row_start), a
-        ld      a, c
-        ld      (cps_row_end), a
         ld      a, e
         ld      (cps_gap_y), a
 
@@ -539,312 +548,241 @@ configure_pipe_slots:
         ld      a, (hl)
         ld      (cps_byte_x), a
 
-        ; Cache cap_top / cap_bot handler addresses for this pipe.
+        ; ─── Step 1: stamp BODY_TEMPLATE → slot column for this pipe ─
+        ; DE = slot[0][pipe] = SLOT_GRID_BASE + 1 + pipe*5
         ld      a, (cps_pipe)
+        ld      e, a
         add     a, a
-        ld      hl, cap_top_handler_addrs
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_th_nc
-        inc     h
-.cps_th_nc:
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        ld      (cps_cap_top_handler_addr), de
-
-        ld      a, (cps_pipe)
         add     a, a
-        ld      hl, cap_bot_handler_addrs
-        add     a, l
+        add     a, e                            ; A = pipe*5
         ld      l, a
-        jr      nc, .cps_bh_nc
-        inc     h
-.cps_bh_nc:
-        ld      e, (hl)
+        ld      h, 0
+        ld      de, SLOT_GRID_BASE + 1
+        add     hl, de
+        ex      de, hl                          ; DE = slot[0][pipe]
+        ld      hl, BODY_TEMPLATE
+        ld      b, GROUND_TOP                   ; 160 rows
+.cps_body_stamp_lp:
+        ; Copy 5 bytes from (HL) to (DE)
+        ld      a, (hl)
+        ld      (de), a
         inc     hl
-        ld      d, (hl)
-        ld      (cps_cap_bot_handler_addr), de
+        inc     de
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ; Advance DE by SLOT_ROW_STRIDE - 5 = 11 to next row's same pipe slot
+        push    hl
+        ld      hl, SLOT_ROW_STRIDE - 5
+        add     hl, de
+        ex      de, hl
+        pop     hl
+        djnz    .cps_body_stamp_lp
 
-        ; IY = slot[row_start][pipe] = SLOT_GRID_BASE + 1 + row_start*16 + pipe*5
-        ld      a, (cps_row_start)
+        ; ─── Step 2: stamp CAP_BLOCK at slot[cap_top_row][pipe] ─────
+        ; DE = slot[cap_top_row][pipe] = SLOT_GRID_BASE + 1 + cap_top_row*16 + pipe*5
+        ld      a, (cps_cap_top_row)
         ld      l, a
         ld      h, 0
         add     hl, hl
         add     hl, hl
         add     hl, hl
-        add     hl, hl                  ; HL = row_start * 16
+        add     hl, hl                          ; HL = cap_top_row * 16
         ld      a, (cps_pipe)
+        ld      e, a
+        add     a, a
+        add     a, a
+        add     a, e                            ; A = pipe*5
         ld      e, a
         ld      d, 0
         add     hl, de
-        add     hl, de
-        add     hl, de
-        add     hl, de
-        add     hl, de                  ; + pipe*5
         ld      de, SLOT_GRID_BASE + 1
         add     hl, de
+        ex      de, hl                          ; DE = slot[cap_top_row][pipe]
+        ld      hl, CAP_BLOCK
+        ld      b, 50                           ; 50 rows in cap block
+.cps_cap_stamp_lp:
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
         push    hl
-        pop     iy
-
-        ; IX = active list cursor.
-        ;   row_start == 0 → cursor = cps_sublist_base_table[pipe]
-        ;   otherwise     → cursor = cps_active_save (continuing from prior half)
-        ld      a, (cps_row_start)
-        or      a
-        jr      nz, .cps_ix_resume
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, cps_sublist_base_table
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_ix_nc
-        inc     h
-.cps_ix_nc:
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        jr      .cps_ix_set
-.cps_ix_resume:
-        ld      de, (cps_active_save)
-.cps_ix_set:
-        push    de
-        pop     ix
-
-        ; C = current row (starts at row_start).
-        ld      a, (cps_row_start)
-        ld      c, a
-
-        ; ─── Band 1: body, while C < min(cap_top_row, row_end) ────
-        ld      a, (cps_cap_top_row)
-        ld      b, a
-        ld      a, (cps_row_end)
-        cp      b
-        jr      nc, .b1_limit_set       ; row_end ≥ cap_top_row → keep cap_top_row
-        ld      b, a                    ; else limit = row_end
-.b1_limit_set:
-        ld      a, c
-        cp      b
-        jp      nc, .band2
-.band1_lp:
-        call    cps_emit_body
-        ld      de, SLOT_ROW_STRIDE
-        add     iy, de
-        inc     c
-        ld      a, c
-        cp      b
-        jp      c, .band1_lp
-
-.band2:
-        ; ─── Band 2: cap_top, if C == cap_top_row and C < row_end ─
-        ld      a, (cps_cap_top_row)
-        cp      c
-        jp      nz, .band3
-        ld      a, (cps_row_end)
-        cp      c
-        jp      z, .save_and_done
-        jp      c, .save_and_done
-        ld      hl, (cps_cap_top_handler_addr)
-        ld      (iy+0), $C3
-        ld      (iy+1), l
-        ld      (iy+2), h
-        ld      (iy+3), 0
-        ld      (iy+4), 0
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, cap_top_target_imm_addrs
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_ct_act_nc
-        inc     h
-.cps_ct_act_nc:
-        ld      a, (hl)
-        ld      (ix+0), a
-        inc     hl
-        ld      a, (hl)
-        ld      (ix+1), a
-        inc     ix
-        inc     ix
-        ld      de, SLOT_ROW_STRIDE
-        add     iy, de
-        inc     c
-
-.band3:
-        ; ─── Band 3: skip, while C < min(cap_bot_row, row_end) ────
-        ld      a, (cps_cap_bot_row)
-        ld      b, a
-        ld      a, (cps_row_end)
-        cp      b
-        jr      nc, .b3_limit_set
-        ld      b, a
-.b3_limit_set:
-        ld      a, c
-        cp      b
-        jp      nc, .band4
-.band3_lp:
-        ld      (iy+0), 0
-        ld      (iy+1), 0
-        ld      (iy+2), 0
-        ld      (iy+3), 0
-        ld      (iy+4), 0
-        ld      de, SLOT_ROW_STRIDE
-        add     iy, de
-        inc     c
-        ld      a, c
-        cp      b
-        jp      c, .band3_lp
-
-.band4:
-        ; ─── Band 4: cap_bot, if C == cap_bot_row and C < row_end ─
-        ld      a, (cps_cap_bot_row)
-        cp      c
-        jp      nz, .band5
-        ld      a, (cps_row_end)
-        cp      c
-        jp      z, .save_and_done
-        jp      c, .save_and_done
-        ld      hl, (cps_cap_bot_handler_addr)
-        ld      (iy+0), $C3
-        ld      (iy+1), l
-        ld      (iy+2), h
-        ld      (iy+3), 0
-        ld      (iy+4), 0
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, cap_bot_target_imm_addrs
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_cb_act_nc
-        inc     h
-.cps_cb_act_nc:
-        ld      a, (hl)
-        ld      (ix+0), a
-        inc     hl
-        ld      a, (hl)
-        ld      (ix+1), a
-        inc     ix
-        inc     ix
-        ld      de, SLOT_ROW_STRIDE
-        add     iy, de
-        inc     c
-
-.band5:
-        ; ─── Band 5: body, while C < row_end ──────────────────────
-        ld      a, (cps_row_end)
-        ld      b, a
-        ld      a, c
-        cp      b
-        jp      nc, .save_and_done
-.band5_lp:
-        call    cps_emit_body
-        ld      de, SLOT_ROW_STRIDE
-        add     iy, de
-        inc     c
-        ld      a, c
-        cp      b
-        jp      c, .band5_lp
-
-.save_and_done:
-        ; Save active cursor in case a second half follows.
-        push    ix
+        ld      hl, SLOT_ROW_STRIDE - 5
+        add     hl, de
+        ex      de, hl
         pop     hl
-        ld      (cps_active_save), hl
+        djnz    .cps_cap_stamp_lp
 
-        ; Post-loop must run on BOTH halves. If first half emits cap_top, the
-        ; cap_top_handler's _next SMC imm still points at the OLD slot address
-        ; until post_loop patches it. PIPE_PROGRAM on the interim frame would
-        ; fire the cap handler, jp to the OLD _next (BEFORE the new cap_top
-        ; row), loop back into cap_top, and freeze. Cap-imm writes are
-        ; idempotent so running the patch on both halves is safe.
+        ; ─── Step 3: patch cap-slot handler addresses (pipe-specific) ─
+        ; slot[cap_top_row][pipe] +1..+2 := cap_top_handler_pipe_<pipe>
+        ; slot[cap_bot_row][pipe] +1..+2 := cap_bot_handler_pipe_<pipe>
 
-.cps_post_loop:
-
-        ; ── Patch cap_top handler target imm ─────────────────────
-        ; target = line_table[cap_top_row] + byte_x + 3
+        ; cap_top: HL = slot[cap_top_row][pipe] + 1
         ld      a, (cps_cap_top_row)
         ld      l, a
         ld      h, 0
-        add     hl, hl                  ; row*2
-        ld      de, line_table
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        ld      a, (cps_pipe)
+        ld      e, a
+        add     a, a
+        add     a, a
+        add     a, e                            ; A = pipe*5
+        ld      e, a
+        ld      d, 0
         add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = line_addr
-        ld      a, (cps_byte_x)
-        add     a, 3
-        add     a, e
-        ld      l, a
-        ld      h, d
-        jr      nc, .cps_ct_patch_nc
-        inc     h
-.cps_ct_patch_nc:
-        ; HL = screen target; write to cap_top_target_imm_addrs[pipe]
-        push    hl                      ; save target
+        ld      de, SLOT_GRID_BASE + 2          ; +1 ($31 byte) + 1 (we want target byte)
+        add     hl, de                          ; HL = slot[cap_top_row][pipe] + 1
+        ; Look up cap_top_handler_pipe_<pipe> from cap_top_handler_addrs[pipe]
         ld      a, (cps_pipe)
         add     a, a
-        ld      de, cap_top_target_imm_addrs
+        ld      de, cap_top_handler_addrs
         add     a, e
         ld      e, a
-        jr      nc, .cps_ctw_nc
+        jr      nc, .cps_ctp_nc
         inc     d
-.cps_ctw_nc:
+.cps_ctp_nc:
         ld      a, (de)
-        ld      c, a
+        ld      (hl), a                         ; write handler.lo
+        inc     hl
         inc     de
         ld      a, (de)
-        ld      b, a                    ; BC = address of imm lo byte in handler
-        pop     hl                      ; restore target
-        ld      a, l
-        ld      (bc), a                 ; write lo byte
-        inc     bc
-        ld      a, h
-        ld      (bc), a                 ; write hi byte
+        ld      (hl), a                         ; write handler.hi
 
-        ; ── Patch cap_bot handler target imm ─────────────────────
+        ; cap_bot: HL = slot[cap_bot_row][pipe] + 1
         ld      a, (cps_cap_bot_row)
         ld      l, a
         ld      h, 0
         add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        ld      a, (cps_byte_x)
-        add     a, 3
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        ld      a, (cps_pipe)
+        ld      e, a
+        add     a, a
+        add     a, a
         add     a, e
-        ld      l, a
-        ld      h, d
-        jr      nc, .cps_cb_patch_nc
-        inc     h
-.cps_cb_patch_nc:
-        push    hl
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      de, SLOT_GRID_BASE + 2
+        add     hl, de
         ld      a, (cps_pipe)
         add     a, a
+        ld      de, cap_bot_handler_addrs
+        add     a, e
+        ld      e, a
+        jr      nc, .cps_cbp_nc
+        inc     d
+.cps_cbp_nc:
+        ld      a, (de)
+        ld      (hl), a
+        inc     hl
+        inc     de
+        ld      a, (de)
+        ld      (hl), a
+
+        ; ─── Step 4: patch cap-handler target imms from CAP_TARGET_TABLE ─
+        ; Entry index = gap_y/8 - 1. Each entry is 4 bytes:
+        ;   [+0..+1] cap_top_target, [+2..+3] cap_bot_target
+        ld      a, (cps_gap_y)
+        rrca
+        rrca
+        rrca                                    ; A = gap_y / 8
+        and     $0F                             ; mask off rotated bits
+        dec     a                               ; A = index (0..11)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl                          ; index * 4
+        ld      de, CAP_TARGET_TABLE
+        add     hl, de                          ; HL → entry
+
+        ; Patch cap_top_handler_pipe_<pipe>_target
+        ; (= contents of cap_top_target_imm_addrs[pipe])
+        ld      a, (cps_pipe)
+        add     a, a
+        push    hl                              ; save entry pointer
+        ld      de, cap_top_target_imm_addrs
+        add     a, e
+        ld      e, a
+        jr      nc, .cps_cttgt_nc
+        inc     d
+.cps_cttgt_nc:
+        ld      a, (de)
+        ld      c, a
+        inc     de
+        ld      a, (de)
+        ld      b, a                            ; BC = address of cap_top_handler_pipe_<pipe>_target imm
+        pop     hl                              ; restore entry pointer
+        ld      a, (hl)
+        ld      (bc), a                         ; write lo
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a                         ; write hi
+        inc     hl                              ; HL now points at entry+2 (cap_bot)
+
+        ; Patch cap_bot_handler_pipe_<pipe>_target
+        ld      a, (cps_pipe)
+        add     a, a
+        push    hl
         ld      de, cap_bot_target_imm_addrs
         add     a, e
         ld      e, a
-        jr      nc, .cps_cbw_nc
+        jr      nc, .cps_cbtgt_nc
         inc     d
-.cps_cbw_nc:
+.cps_cbtgt_nc:
         ld      a, (de)
         ld      c, a
         inc     de
         ld      a, (de)
         ld      b, a
         pop     hl
-        ld      a, l
+        ld      a, (hl)
         ld      (bc), a
         inc     bc
-        ld      a, h
+        inc     hl
+        ld      a, (hl)
         ld      (bc), a
 
-        ; ── Patch cap_top_next imm ────────────────────────────────
+        ; ─── Step 5: patch cap-handler _next imms via compute_next_slot ─
         ld      a, (cps_cap_top_row)
-        call    compute_next_slot       ; HL = next slot address
-        push    hl                      ; save next_slot
+        call    compute_next_slot               ; HL = next slot address
+        push    hl
         ld      a, (cps_pipe)
-        add     a, a                    ; pipe*2
+        add     a, a
         ld      de, cap_top_next_imm_addrs
         add     a, e
         ld      e, a
@@ -855,17 +793,16 @@ configure_pipe_slots:
         ld      c, a
         inc     de
         ld      a, (de)
-        ld      b, a                    ; BC = address of _next imm lo byte
-        pop     hl                      ; restore next_slot
+        ld      b, a
+        pop     hl
         ld      a, l
         ld      (bc), a
         inc     bc
         ld      a, h
         ld      (bc), a
 
-        ; ── Patch cap_bot_next imm ────────────────────────────────
         ld      a, (cps_cap_bot_row)
-        call    compute_next_slot       ; HL = next slot address
+        call    compute_next_slot
         push    hl
         ld      a, (cps_pipe)
         add     a, a
@@ -887,63 +824,44 @@ configure_pipe_slots:
         ld      a, h
         ld      (bc), a
 
-        ; ── Store new_gap_y → pipe_state[pipe*2 + 1] ─────────────
+        ; ─── Step 6: rebuild active sublist for this pipe ─────────
+        ; IX = sublist start (ACTIVE_PIPE_<pipe>)
         ld      a, (cps_pipe)
-        add     a, a                    ; pipe*2
-        inc     a                       ; pipe*2 + 1
-        ld      hl, pipe_state
+        add     a, a
+        ld      hl, cps_sublist_base_table
         add     a, l
         ld      l, a
-        jr      nc, .cps_store_nc
+        jr      nc, .cps_sl_nc
         inc     h
-.cps_store_nc:
-        ld      a, (cps_gap_y)
-        ld      (hl), a
-        ret
+.cps_sl_nc:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        push    de
+        pop     ix                              ; IX = ACTIVE_PIPE_<pipe>
 
-;----------------------------------------------------------------
-; cps_emit_body — body-slot emit helper used by configure_pipe_slots's band
-; loops. In: C = current row, IY = slot cursor, IX = active list cursor.
-; Writes 5 body bytes at IY; appends slot+1 to active list at IX; advances IX.
-; Clobbers AF, DE, HL.
-;----------------------------------------------------------------
-cps_emit_body:
-        ld      a, (cps_byte_x)
-        cp      29
-        jr      nz, .body_compute
-        ; Fast: target = screen_target_table_29[C]
-        ld      l, c
-        ld      h, 0
-        add     hl, hl
-        ld      de, screen_target_table_29
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        jr      .body_emit
-.body_compute:
-        ld      l, c
-        ld      h, 0
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        ld      a, (cps_byte_x)
-        add     a, 3
-        add     a, e
+        ; IY = slot[0][pipe], to scan slot first-bytes
+        ld      a, (cps_pipe)
         ld      e, a
-        jr      nc, .body_emit
-        inc     d
-.body_emit:
-        ; DE = screen target. Emit $31 / lo / hi / $D5 / $C5.
-        ld      (iy+0), $31
-        ld      (iy+1), e
-        ld      (iy+2), d
-        ld      (iy+3), $D5
-        ld      (iy+4), $C5
-        ; Active list entry = slot_addr + 1 (= IY+1).
+        add     a, a
+        add     a, a
+        add     a, e
+        ld      l, a
+        ld      h, 0
+        ld      de, SLOT_GRID_BASE + 1
+        add     hl, de
+        push    hl
+        pop     iy                              ; IY = slot[0][pipe]
+
+        ld      b, 0                            ; B = row counter
+.cps_act_lp:
+        ld      a, (iy+0)
+        or      a
+        jr      z, .cps_act_skip                ; zero = skip slot, no entry
+        cp      $C3
+        jr      z, .cps_act_cap
+
+        ; Body slot: write slot+1 (= iy+1) to (ix), advance ix by 2.
         push    iy
         pop     hl
         inc     hl
@@ -951,7 +869,74 @@ cps_emit_body:
         ld      (ix+1), h
         inc     ix
         inc     ix
+        jr      .cps_act_advance
+
+.cps_act_cap:
+        ; Cap slot: is this cap_top or cap_bot?
+        ld      a, b
+        ld      hl, cps_cap_top_row
+        cp      (hl)
+        jr      z, .cps_act_cap_top
+        ; cap_bot: write cap_bot_target_imm_addrs[pipe]
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      hl, cap_bot_target_imm_addrs
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_act_cb_nc
+        inc     h
+.cps_act_cb_nc:
+        ld      a, (hl)
+        ld      (ix+0), a
+        inc     hl
+        ld      a, (hl)
+        ld      (ix+1), a
+        inc     ix
+        inc     ix
+        jr      .cps_act_advance
+
+.cps_act_cap_top:
+        ; cap_top: write cap_top_target_imm_addrs[pipe]
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      hl, cap_top_target_imm_addrs
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_act_ct_nc
+        inc     h
+.cps_act_ct_nc:
+        ld      a, (hl)
+        ld      (ix+0), a
+        inc     hl
+        ld      a, (hl)
+        ld      (ix+1), a
+        inc     ix
+        inc     ix
+
+.cps_act_advance:
+.cps_act_skip:
+        ld      de, SLOT_ROW_STRIDE
+        add     iy, de
+        inc     b
+        ld      a, b
+        cp      GROUND_TOP
+        jp      nz, .cps_act_lp
+
+        ; ─── Step 7: store new gap_y back to pipe_state[pipe*2 + 1] ─
+        ld      a, (cps_pipe)
+        add     a, a
+        inc     a                               ; pipe*2 + 1
+        ld      hl, pipe_state
+        add     a, l
+        ld      l, a
+        jr      nc, .cps_gap_nc
+        inc     h
+.cps_gap_nc:
+        ld      a, (cps_gap_y)
+        ld      (hl), a
+
         ret
+
 
 ;----------------------------------------------------------------
 ; compute_next_slot: given a cap row and the current pipe, return the address
