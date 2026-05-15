@@ -456,9 +456,12 @@ bird_sprite_f2:                         ; wing DOWN — wing box rows 10–13
 ; aligned to char-row boundaries so the per-cell ATTR_CITY (white paper) only
 ; covers the building cells, not the whole row.
 cityscape_heights:
+        ; EXPERIMENT: uniform heights → flat-topped band → per-slot city/sky
+        ; decision is constant ("always city" for rows 128-159 in visible cols).
+        ; Lets us strip patch_city_slot_ptrs, city_base_lut, build_slot_targets.
         ; Cols 0-3 and 28-31 are buffer cols (invisible attr) — no city there.
-        db  0,  0,  0,  0, 16, 24, 16, 32, 16, 16, 24, 16, 32, 16, 32, 24
-        db 16, 24, 16, 16, 32, 16, 16, 24, 16, 32, 24, 16,  0,  0,  0,  0
+        db  0,  0,  0,  0, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32
+        db 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,  0,  0,  0,  0
 
 ; Ground tiles — 8x8 pattern, 4 phases of horizontal scroll.
 ;   Row 0: $FF — solid black top edge.
@@ -2692,10 +2695,8 @@ wrap_byte_x:
         ; WHITE is partially hidden in bottom blanking, so this is less visible
         ; than running it in RED at top of next frame.
         call    patch_pipe_targets
-        ; Update city slot ptr operands for new byte_x (CITY_BASE_LUT already has new values).
-        ; On recycle frames, configure_pipe_slots + build_slot_targets + patch_city_slot_ptrs
-        ; will run again at the top of redraw_pipes_v2 to handle the recycled pipe's new gap_y.
-        call    patch_city_slot_ptrs
+        ; (With uniform cityscape heights, city/sky decision per slot is fixed;
+        ;  no per-wrap patch_city_slot_ptrs needed.)
         ret
 
 patch_pipe_smc:
@@ -3390,8 +3391,9 @@ redraw_pipes_v2:
         ld      e, (hl)                 ; E = current gap_y
         pop     af
         call    configure_pipe_slots
-        call    build_slot_targets
-        call    patch_city_slot_ptrs    ; rebuild ptr operands after slot structure changed
+        ; (build_slot_targets + patch_city_slot_ptrs eliminated: with uniform
+        ;  cityscape heights, configure_pipe_slots writes correct (nn) operand
+        ;  in each city body slot directly via CITY_BASE_LUT lookup.)
 .skip_regen:
 
         ; --- Rest of redraw_pipes_v2 ---
