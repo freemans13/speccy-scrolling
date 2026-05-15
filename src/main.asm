@@ -1394,7 +1394,7 @@ advance_phase:
         ret     nz
 .wrap:
         call    wrap_byte_x
-        call    apply_pipe_attrs
+        call    apply_pipe_attrs_wrap   ; paints only NEW M1 (NEW M2 = OLD M1, already pipe-attr)
         ld      a, 1
         ld      (wrap_pending), a
         ret
@@ -2558,6 +2558,7 @@ update_pipe_attrs:
 ;----------------------------------------------------------------
 ; apply_pipe_attrs: for each pipe, overlay ATTR_PIPE at M1/M2 cells.
 ; Reads pipe_state; chooses the right per-row routine based on byte_x.
+; Used at init (paints both M1 and M2 from sky base).
 ;----------------------------------------------------------------
 apply_pipe_attrs:
         ld      iy, pipe_state
@@ -2573,6 +2574,37 @@ apply_pipe_attrs:
         ld      a, (iy+1)
         ld      e, a
         call    paint_pipe_attrs_inner
+.skip:
+        inc     iy
+        inc     iy
+        pop     bc
+        djnz    .lp
+        ret
+
+;----------------------------------------------------------------
+; apply_pipe_attrs_wrap: WRAP-TIME variant. Paints ATTR_PIPE only at
+; NEW M1 (col = byte_x). Skips NEW M2 (= OLD M1, already ATTR_PIPE
+; from last frame). Saves ~16 T per body row × ~14 rows × 3 pipes
+; ≈ 670 T per wrap frame vs the 2-col init-time variant.
+;
+; Range: byte_x in [4, 27] — wider than the init variant ([4, 26])
+; because we only need M1 visible, not M1+M2. Bonus: paints the
+; first-visible-row case (byte_x=27 → col 27 = right-edge of playfield).
+;----------------------------------------------------------------
+apply_pipe_attrs_wrap:
+        ld      iy, pipe_state
+        ld      b, NUM_PIPES
+.lp:
+        push    bc
+        ld      a, (iy+0)
+        cp      4
+        jr      c, .skip
+        cp      28
+        jr      nc, .skip
+        ld      c, a
+        ld      a, (iy+1)
+        ld      e, a
+        call    paint_pipe_attrs_inner_1col
 .skip:
         inc     iy
         inc     iy
@@ -2904,6 +2936,12 @@ paint_attr_rows:
         djnz    .row_lp
         pop     de                       ; restore caller's gap_y
         ret
+
+;----------------------------------------------------------------
+; paint_pipe_attrs_inner_1col / paint_attr_rows_1col live further down
+; (originally added for edge-case byte_x=32 single-cell paint).
+; apply_pipe_attrs_wrap reuses them — no duplication needed here.
+;----------------------------------------------------------------
 
 ;----------------------------------------------------------------
 ; restore_pipe_attrs_inner: mirror of paint_pipe_attrs_inner that copies
