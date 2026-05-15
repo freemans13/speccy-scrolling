@@ -488,6 +488,7 @@ init_pipe_program:
         ret
 
 ipp_byte_x:     ds 3, 0                 ; scratch: byte_x per pipe (3 bytes)
+init_pipe_bx_tmp: db 0                 ; scratch: byte_x for the pipe being configured at init
 
 ;----------------------------------------------------------------
 ; configure_pipe_slots(A=pipe 0..2, E=new_gap_y 1..111)
@@ -976,6 +977,49 @@ compute_next_slot:
         ld      hl, SLOT_GRID_END
         ret
 
+;----------------------------------------------------------------
+; shift_pipe_targets — decrement all of one pipe's active sublist
+; entries' target lo-bytes by C, with borrow propagation into the hi byte.
+;
+; Used at init only: BODY_TEMPLATE bakes byte_x=29 into slot targets,
+; but the initial pipe_state may set byte_x < 29 for some pipes (to
+; stagger them across the screen). This routine shifts those pipes'
+; slot targets down to match.
+;
+; In:  A = pipe (0..2)
+;      C = delta (0..28)  ; 0 = no-op
+; Clobbers: AF, BC, DE, HL, IX.
+;----------------------------------------------------------------
+shift_pipe_targets:
+        ; IX = sublist cursor (ACTIVE_PIPE_<pipe>)
+        add     a, a
+        ld      hl, cps_sublist_base_table
+        add     a, l
+        ld      l, a
+        jr      nc, .spt_sb_nc
+        inc     h
+.spt_sb_nc:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        push    de
+        pop     ix                              ; IX = sublist cursor
+        ld      b, 112                          ; 112 entries per pipe
+.spt_lp:
+        ld      l, (ix+0)
+        ld      h, (ix+1)                       ; HL = target imm addr
+        ld      a, (hl)
+        sub     c                               ; (HL) -= C
+        ld      (hl), a
+        jr      nc, .spt_no_borrow
+        inc     hl
+        dec     (hl)                            ; borrow into hi byte
+.spt_no_borrow:
+        inc     ix
+        inc     ix
+        djnz    .spt_lp
+        ret
+
 ; ── Scratch variables for configure_pipe_slots ───────────────────
 cps_pipe:               db 0
 cps_gap_y:              db 0
@@ -1175,14 +1219,30 @@ init_pipes:
         ld      h, 0
         add     hl, hl                       ; pipe * 2
         ld      de, pipe_state
-        add     hl, de
+        add     hl, de                       ; HL → byte_x byte for this pipe
+        push    hl                           ; save pipe_state_ptr (points at byte_x)
         inc     hl                           ; HL → gap_y byte
         ld      e, (hl)                      ; E = initial gap_y
+        pop     hl                           ; restore HL → byte_x
+        ld      a, (hl)                      ; A = initial byte_x
+        ld      (init_pipe_bx_tmp), a        ; save byte_x for shift step
         pop     af
         push    af
         ld      b, 0                         ; row_start = 0
         ld      c, GROUND_TOP                ; row_end = 160 (full pass)
         call    configure_pipe_slots
+        ; If byte_x < 29, shift this pipe's slot targets by (29 - byte_x).
+        ld      a, (init_pipe_bx_tmp)
+        cp      29
+        jr      z, .init_no_shift
+        ld      b, a                         ; B = byte_x temporarily
+        ld      a, 29
+        sub     b                            ; A = 29 - byte_x
+        ld      c, a                         ; C = delta
+        pop     af                           ; restore pipe index
+        push    af
+        call    shift_pipe_targets
+.init_no_shift:
         pop     af
         inc     a
         cp      NUM_PIPES
