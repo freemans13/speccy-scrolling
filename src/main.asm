@@ -1427,10 +1427,10 @@ frame_update:
         ; OUT-($fe) — saved 18 T-st of lead-time over the raster. The border
         ; band that used to mark "pipes phase" is gone; what was BLUE for
         ; restore-bird-bg now spans the full pipes+restore region. Worth it.
-        call    redraw_pipes_v2
+        call    restore_bird_bg         ; clear bird's old position BEFORE pipes
+        call    redraw_pipes_v2         ; pipes re-stamp over the cleared cols
         ld      a, 1                    ; PROFILE: BLUE = bird ops region
         out     ($fe), a
-        call    restore_bird_bg
         call    restore_bird_attrs
         call    read_input
         call    update_bird
@@ -2515,8 +2515,6 @@ restore_bird_bg:
         or      a
         ret     z
 
-        call    compute_bird_overlap    ; fill mask before we walk the rows
-
         ld      a, (bird_old_y)
         ld      h, 0
         ld      l, a
@@ -2525,25 +2523,17 @@ restore_bird_bg:
         add     hl, de
         ld      (saved_sp), sp
         ld      sp, hl
-        ld      iy, bird_overlap
         ld      b, BIRD_LINES
-        ; Background is uniform sky = $00. Write 0 directly instead of reading
-        ; from bg_buffer at $C000 — that region is overlaid by BODY_TEMPLATE
-        ; after init, so reads come back as pipe-slot machine code bytes and
-        ; paint garbage into the upper screen rows.
+        ; Unconditionally clear both bird cells. Pipes will re-stamp on the
+        ; following frame at any col they still cover — the compute_bird_overlap
+        ; skip wasn't catching every case where the new (denser) sprite's
+        ; pixels needed clearing, leaving the dotted trail.
 .lp:
         pop     hl
         set     3, l                    ; HL → screen[col 8]
-        bit     0, (iy+0)
-        jr      nz, .skip_col8          ; pipe covers col 8 here → leave pipe pixel
         ld      (hl), 0
-.skip_col8:
         inc     hl
-        bit     1, (iy+0)
-        jr      nz, .skip_col9
         ld      (hl), 0
-.skip_col9:
-        inc     iy
         djnz    .lp
         ld      sp, (saved_sp)
         ret
