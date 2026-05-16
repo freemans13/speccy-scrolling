@@ -25,7 +25,8 @@ ATTR_SKY        EQU $28                 ; paper cyan + ink black
 ATTR_GROUND     EQU $20                 ; paper green + ink black (ground band, row 20)
 ATTR_SCOREBOARD EQU $07                 ; paper black + ink white (rows 21..23)
 ATTR_PIPE       EQU $20                 ; paper green + ink black (dynamic, inner pipe cells)
-ATTR_BIRD       EQU $70                 ; bright yellow paper + black ink
+ATTR_BIRD       EQU $70                 ; bright yellow paper + black ink (col 8)
+ATTR_BIRD_R     EQU $78                 ; bright white paper + black ink (col 9, beak background)
 ATTR_BUFFER     EQU $2D                 ; paper cyan + ink cyan — invisible buffer cols (0-3, 28-31)
 GROUND_TOP      EQU 160                 ; first scan line of ground band — pipes stop here
 SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= ground+8)
@@ -269,7 +270,7 @@ bird_overlap:       ds BIRD_LINES, 0
 ; ink (sprite=1) inside the silhouette, masking the cyan paper.
 bird_attr_y:        db 0
 bird_attr_valid:    db 0
-bird_attr_save:     db 0
+bird_attr_save:     ds 2                ; [0]=col 8 (yellow), [1]=col 9 (white)
 
 BIRD_FRAME_BYTES    EQU 64              ; 16 rows × (mask + sprite) × 2 cols
 
@@ -319,16 +320,21 @@ bird_sprite:
         db $F8, $07, $0F, $F0           ; row 14  .....#######....
         db $FE, $01, $1F, $E0           ; row 15  .......####.....
 
-; Ground tiles — 8x8 pattern, 4 phases of horizontal scroll.
-;   Row 0: $FF — solid black top edge.
-;   Rows 1..6: "/" diagonal (period 4 horizontally).
-;   Row 7: $AA / $55 — dotted bottom edge (period 2 horizontally).
-; All rows cyclically shift left by 1 px per phase.
+; Ground tiles — 8x8 pattern, 8 phases of horizontal scroll.
+;   Row 0:    $FF — solid black top edge.
+;   Rows 1..6: "/" diagonal, period 8 (one diagonal slash per tile).
+;   Row 7:    $AA / $55 — dotted bottom edge (period 2 horizontally).
+; Each phase shifts the diagonal left by 1 px; bits falling off the left
+; wrap to bit 0 (since adjacent tiles share the same byte pattern).
 ground_tiles:
-        db $FF, $11, $22, $44, $88, $11, $22, $AA   ; phase 0
-        db $FF, $22, $44, $88, $11, $22, $44, $55   ; phase 1 (shifted left 1px)
-        db $FF, $44, $88, $11, $22, $44, $88, $AA   ; phase 2 (shifted left 2px)
-        db $FF, $88, $11, $22, $44, $88, $11, $55   ; phase 3 (shifted left 3px)
+        db $FF, $01, $02, $04, $08, $10, $20, $AA   ; phase 0
+        db $FF, $02, $04, $08, $10, $20, $40, $55   ; phase 1
+        db $FF, $04, $08, $10, $20, $40, $80, $AA   ; phase 2
+        db $FF, $08, $10, $20, $40, $80, $01, $55   ; phase 3
+        db $FF, $10, $20, $40, $80, $01, $02, $AA   ; phase 4
+        db $FF, $20, $40, $80, $01, $02, $04, $55   ; phase 5
+        db $FF, $40, $80, $01, $02, $04, $08, $AA   ; phase 6
+        db $FF, $80, $01, $02, $04, $08, $10, $55   ; phase 7
 
 ;----------------------------------------------------------------
 paint_attrs:
@@ -1476,9 +1482,9 @@ advance_phase:
 ;----------------------------------------------------------------
 draw_ground:
         ld      (saved_sp), sp
-        ; IY = ground_tiles + (phase mod 4) * 8
+        ; IY = ground_tiles + (phase mod 8) * 8
         ld      a, (phase)
-        and     3
+        and     7
         add     a, a
         add     a, a
         add     a, a                    ; A = phase * 8
@@ -2311,9 +2317,9 @@ bird_attr_addr:
         add     hl, de
         ret
 
-; paint_bird_attrs: paint exactly 1 char cell of yellow at col 8 of the char
-; row containing the bird's vertical centre ((y_high + 8) >> 3). Col 9 keeps
-; its cyan attr so the beak silhouette stays as black ink on sky.
+; paint_bird_attrs: paint 2 char cells on the bird's centre char row —
+; col 8 = ATTR_BIRD (yellow paper), col 9 = ATTR_BIRD_R (white paper).
+; Together they form the "1 yellow + 1 white" backdrop for the sprite.
 paint_bird_attrs:
         ld      a, (bird_y + 1)
         add     a, 8                    ; +8 snaps to char row containing bird centre
@@ -2326,9 +2332,13 @@ paint_bird_attrs:
         ld      a, (hl)
         ld      (bird_attr_save), a
         ld      (hl), ATTR_BIRD
+        inc     hl
+        ld      a, (hl)
+        ld      (bird_attr_save + 1), a
+        ld      (hl), ATTR_BIRD_R
         ret
 
-; restore_bird_attrs: write the saved attr byte back at bird_attr_y's row.
+; restore_bird_attrs: write both saved attr bytes back at bird_attr_y's row.
 restore_bird_attrs:
         ld      a, (bird_attr_valid)
         or      a
@@ -2336,6 +2346,9 @@ restore_bird_attrs:
         ld      a, (bird_attr_y)
         call    bird_attr_addr
         ld      a, (bird_attr_save)
+        ld      (hl), a
+        inc     hl
+        ld      a, (bird_attr_save + 1)
         ld      (hl), a
         ret
 
