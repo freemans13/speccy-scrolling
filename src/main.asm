@@ -1402,14 +1402,21 @@ init_pipes:
 ; — no RED bloom, no race-the-beam stutter on the next frame.
 ;
 ; Entry: pending_regen != 0 (caller checked).
-;   pending_regen == 2 → just-recycled, defer 1 more CYAN tick.
+;   pending_regen == 3 → just-recycled, defer 2 more CYAN ticks.
+;   pending_regen == 2 → defer 1 more CYAN tick.
 ;   pending_regen == 1 → run configure for recycled_pipe_idx; clear.
+;
+; Why 3-stage? Frame R+1 already has do_deferred_clears (~10 k T) in top
+; blanking. Running configure (~32 k T) in CYAN of that same frame would
+; push total work past 70 k T budget (halt miss). With 3-stage, configure
+; runs on R+2 instead — a frame with no clears — keeping each frame's
+; total under 60 k T.
 ;----------------------------------------------------------------
 deferred_configure:
         ld      a, (pending_regen)
         cp      1
         jr      z, .run
-        dec     a                               ; 2 → 1
+        dec     a                               ; 3→2 or 2→1
         ld      (pending_regen), a
         ret
 .run:
@@ -1773,8 +1780,12 @@ wrap_byte_x:
         call    random_gap_y            ; A = new random gap_y; IY/BC preserved
         pop     bc
         ld      (iy+1), a
-        ld      a, 2
-        ld      (pending_regen), a      ; defer 1 frame, then run full configure
+        ld      a, 3
+        ld      (pending_regen), a      ; 3-stage defer (3→2→1→run). Ensures the
+                                        ; configure frame doesn't coincide with the
+                                        ; clear frame, which would overrun 70 k T
+                                        ; budget (~10 k clears + 27 k frame_update
+                                        ; + 32 k configure = 69 k, no margin).
         ; Record which pipe recycled — B counts down from NUM_PIPES to 1, so index = NUM_PIPES - B.
         ld      a, NUM_PIPES
         sub     b
