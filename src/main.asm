@@ -1427,10 +1427,10 @@ frame_update:
         ; OUT-($fe) — saved 18 T-st of lead-time over the raster. The border
         ; band that used to mark "pipes phase" is gone; what was BLUE for
         ; restore-bird-bg now spans the full pipes+restore region. Worth it.
-        call    restore_bird_bg         ; clear bird's old position BEFORE pipes
-        call    redraw_pipes_v2         ; pipes re-stamp over the cleared cols
+        call    redraw_pipes_v2
         ld      a, 1                    ; PROFILE: BLUE = bird ops region
         out     ($fe), a
+        call    restore_bird_bg
         call    restore_bird_attrs
         call    read_input
         call    update_bird
