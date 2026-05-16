@@ -1425,9 +1425,11 @@ frame_update:
         ld      a, 1                    ; PROFILE: BLUE = bird ops region
         out     ($fe), a
         call    restore_bird_bg
+        call    restore_bird_attrs
         call    read_input
         call    update_bird
         call    draw_bird
+        call    paint_bird_attrs
         call    update_score
         ld      a, 4                    ; PROFILE: GREEN = ground
         out     ($fe), a
@@ -2512,23 +2514,21 @@ restore_bird_bg:
         ld      sp, hl
         ld      iy, bird_overlap
         ld      b, BIRD_LINES
+        ; Background is uniform sky = $00. Write 0 directly instead of reading
+        ; from bg_buffer at $C000 — that region is overlaid by BODY_TEMPLATE
+        ; after init, so reads come back as pipe-slot machine code bytes and
+        ; paint garbage into the upper screen rows.
 .lp:
         pop     hl
         set     3, l                    ; HL → screen[col 8]
-        ld      d, h
-        ld      e, l
-        set     7, d                    ; DE → bg_buffer at col 8
         bit     0, (iy+0)
         jr      nz, .skip_col8          ; pipe covers col 8 here → leave pipe pixel
-        ld      a, (de)
-        ld      (hl), a
+        ld      (hl), 0
 .skip_col8:
         inc     hl
-        inc     e
         bit     1, (iy+0)
         jr      nz, .skip_col9
-        ld      a, (de)
-        ld      (hl), a
+        ld      (hl), 0
 .skip_col9:
         inc     iy
         djnz    .lp
