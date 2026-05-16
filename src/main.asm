@@ -273,188 +273,50 @@ bird_attr_save:     db 0
 
 BIRD_FRAME_BYTES    EQU 64              ; 16 rows × (mask + sprite) × 2 cols
 
-; Pipe-cap technique applied to the bird. ATTR_BIRD paints ONE 8×8 char cell
-; of bright yellow paper at the screen char row containing the bird's centre.
-; The 14-row silhouette is rounder than v1, with an eye dot (2×2 ink at cols
-; 4–5 near the top of the body window), a wing detail (1×3 ink at cols 2–4
-; lower in the body), and a 5-row diamond beak (tip at col 12) in col 9:
+; Bird sprite — black ink drawing, threshold-extracted from ~/Downloads/bird.jpg.
+; The yellow paper attr cell is gone for this iteration: the whole bird is ink
+; on cyan sky. Per-row silhouette = leftmost-to-rightmost dark pixel, masked
+; so pipes behind the bird body don't bleed through.
 ;
-;     ..####..   row 1   (cyan, tapered crown)
-;     .######.   row 2
-;     ########   row 3   (dense — first row above the yellow band when phase=4)
-;     ########   row 4   ★ yellow body interior on yellow row
-;     ##oo####   row 5   ★ EYE (cols 4–5) + beak start col 9
-;     ##oo####.  row 6   ★ EYE + beak
-;     #########  row 7   ★ + beak tip (col 12)
-;     ##wwwww##  row 8   ★ WING (cols 2–4) + beak end
-;     #########  row 9   ★ + beak fade
-;     ########   row 10  ★
-;     ########   row 11  ★
-;     ########   row 12  (dense — first row below the yellow band when phase=4)
-;     .######.   row 13
-;     ..####..   row 14
+;     .....########...   row  0
+;     ...####.#..##...   row  1
+;     ..##....#..##...   row  2
+;     .##.....##.###..   row  3
+;     .#####...#...#..   row  4
+;     #######..#...#..   row  5
+;     #....##..######.   row  6
+;     #....##.###...##   row  7
+;     #...##..#......#   row  8
+;     #####...########   row  9
+;     ..##....########   row 10
+;     ...#.......##...   row 11
+;     ...##......##...   row 12
+;     ....###...##....   row 13
+;     .....######.....   row 14
+;     .......##.......   row 15
 ;
 ; Stored as 4 bytes/row: inv_maskL, spriteL, inv_maskR, spriteR.
 ; draw_bird does  screen = (screen AND inv_mask) OR sprite.
-;
-; The 8 y-phase variants align the yellow paper band to the bird's silhouette
-; regardless of bird_y % 8. On the 8 sprite rows that fall on the yellow attr
-; cell (col 8 only), the silhouette interior is sprite=0 (paper → yellow body).
-; On all other sprite rows inside the silhouette, sprite=1 (forced ink) so the
-; cyan paper of the neighbouring char cells never shows through the body —
-; exactly the trick the pipe caps use for their green→cyan boundary.
-; The col 9 cell is always cyan, so its silhouette interior is always forced
-; ink — the beak reads as a solid black triangle on the sky.
-;
-; Pointer dispatch: draw_bird looks up bird_sprite_table[y_high & 7] each frame.
+; inv_mask = 0 inside the row's silhouette (clear bg, then OR sprite ink),
+; inv_mask = 1 outside (keep bg = sky / pipe pixels show through).
 
-bird_sprite_y0:                         ; bird_y % 8 == 0  (yellow band rows 8..15)
-        db $FF, $00, $FF, $00           ; row  0
-        db $C3, $3C, $FF, $00           ; row  1  ..####.. (cyan crown)
-        db $81, $7E, $FF, $00           ; row  2  .######.
-        db $00, $FF, $FF, $00           ; row  3  ########
-        db $00, $FF, $FF, $00           ; row  4
-        db $00, $FF, $3F, $C0           ; row  5  ########  ##......  beak
-        db $00, $FF, $0F, $F0           ; row  6  ########  ####....
-        db $00, $FF, $07, $F8           ; row  7  ########  #####...  beak tip
-        db $00, $00, $0F, $F0           ; row  8  ★ yellow + beak
-        db $00, $0C, $3F, $C0           ; row  9  ★ EYE + beak
-        db $00, $0C, $FF, $00           ; row 10  ★ EYE
-        db $00, $00, $FF, $00           ; row 11  ★
-        db $00, $38, $FF, $00           ; row 12  ★ WING
-        db $81, $00, $FF, $00           ; row 13  ★ body taper
-        db $C3, $00, $FF, $00           ; row 14  ★ body taper
-        db $FF, $00, $FF, $00
-
-bird_sprite_y1:                         ; bird_y % 8 == 1  (yellow band rows 7..14)
-        db $FF, $00, $FF, $00
-        db $C3, $3C, $FF, $00
-        db $81, $7E, $FF, $00
-        db $00, $FF, $FF, $00
-        db $00, $FF, $FF, $00
-        db $00, $FF, $3F, $C0
-        db $00, $FF, $0F, $F0
-        db $00, $00, $07, $F8           ; row  7  ★ yellow + beak tip
-        db $00, $0C, $0F, $F0           ; row  8  ★ EYE + beak
-        db $00, $0C, $3F, $C0           ; row  9  ★ EYE + beak fade
-        db $00, $00, $FF, $00           ; row 10  ★
-        db $00, $38, $FF, $00           ; row 11  ★ WING
-        db $00, $00, $FF, $00           ; row 12  ★
-        db $81, $00, $FF, $00           ; row 13  ★ body taper
-        db $C3, $00, $FF, $00           ; row 14  ★ body taper
-        db $FF, $00, $FF, $00
-
-bird_sprite_y2:                         ; bird_y % 8 == 2  (yellow band rows 6..13)
-        db $FF, $00, $FF, $00
-        db $C3, $3C, $FF, $00
-        db $81, $7E, $FF, $00
-        db $00, $FF, $FF, $00
-        db $00, $FF, $FF, $00
-        db $00, $FF, $3F, $C0
-        db $00, $00, $0F, $F0           ; row  6  ★ yellow + beak
-        db $00, $0C, $07, $F8           ; row  7  ★ EYE + beak tip
-        db $00, $0C, $0F, $F0           ; row  8  ★ EYE + beak
-        db $00, $00, $3F, $C0           ; row  9  ★ + beak fade
-        db $00, $38, $FF, $00           ; row 10  ★ WING
-        db $00, $00, $FF, $00           ; row 11  ★
-        db $00, $00, $FF, $00           ; row 12  ★
-        db $81, $00, $FF, $00           ; row 13  ★ body taper
-        db $C3, $3C, $FF, $00           ; row 14  cyan taper
-        db $FF, $00, $FF, $00
-
-bird_sprite_y3:                         ; bird_y % 8 == 3  (yellow band rows 5..12)
-        db $FF, $00, $FF, $00
-        db $C3, $3C, $FF, $00
-        db $81, $7E, $FF, $00
-        db $00, $FF, $FF, $00
-        db $00, $FF, $FF, $00
-        db $00, $00, $3F, $C0           ; row  5  ★ yellow + beak
-        db $00, $0C, $0F, $F0           ; row  6  ★ EYE + beak
-        db $00, $0C, $07, $F8           ; row  7  ★ EYE + beak tip
-        db $00, $00, $0F, $F0           ; row  8  ★ + beak
-        db $00, $38, $3F, $C0           ; row  9  ★ WING + beak fade
-        db $00, $00, $FF, $00           ; row 10  ★
-        db $00, $00, $FF, $00           ; row 11  ★
-        db $00, $00, $FF, $00           ; row 12  ★
-        db $81, $7E, $FF, $00           ; row 13  cyan taper
-        db $C3, $3C, $FF, $00
-        db $FF, $00, $FF, $00
-
-bird_sprite_y4:                         ; bird_y % 8 == 4  (yellow band rows 4..11) — balanced
-        db $FF, $00, $FF, $00
-        db $C3, $3C, $FF, $00
-        db $81, $7E, $FF, $00
-        db $00, $FF, $FF, $00
-        db $00, $00, $FF, $00           ; row  4  ★ yellow
-        db $00, $0C, $3F, $C0           ; row  5  ★ EYE + beak
-        db $00, $0C, $0F, $F0           ; row  6  ★ EYE + beak
-        db $00, $00, $07, $F8           ; row  7  ★ + beak tip
-        db $00, $38, $0F, $F0           ; row  8  ★ WING + beak
-        db $00, $00, $3F, $C0           ; row  9  ★ + beak fade
-        db $00, $00, $FF, $00           ; row 10  ★
-        db $00, $00, $FF, $00           ; row 11  ★
-        db $00, $FF, $FF, $00           ; row 12  cyan dense
-        db $81, $7E, $FF, $00
-        db $C3, $3C, $FF, $00
-        db $FF, $00, $FF, $00
-
-bird_sprite_y5:                         ; bird_y % 8 == 5  (yellow band rows 3..10)
-        db $FF, $00, $FF, $00
-        db $C3, $3C, $FF, $00
-        db $81, $7E, $FF, $00
-        db $00, $00, $FF, $00           ; row  3  ★ yellow
-        db $00, $0C, $FF, $00           ; row  4  ★ EYE
-        db $00, $0C, $3F, $C0           ; row  5  ★ EYE + beak
-        db $00, $00, $0F, $F0           ; row  6  ★ + beak
-        db $00, $38, $07, $F8           ; row  7  ★ WING + beak tip
-        db $00, $00, $0F, $F0           ; row  8  ★ + beak
-        db $00, $00, $3F, $C0           ; row  9  ★ + beak fade
-        db $00, $00, $FF, $00           ; row 10  ★
-        db $00, $FF, $FF, $00           ; row 11  cyan dense
-        db $00, $FF, $FF, $00
-        db $81, $7E, $FF, $00
-        db $C3, $3C, $FF, $00
-        db $FF, $00, $FF, $00
-
-bird_sprite_y6:                         ; bird_y % 8 == 6  (yellow band rows 2..9)
-        db $FF, $00, $FF, $00
-        db $C3, $3C, $FF, $00
-        db $81, $00, $FF, $00           ; row  2  ★ yellow taper
-        db $00, $0C, $FF, $00           ; row  3  ★ EYE
-        db $00, $0C, $FF, $00           ; row  4  ★ EYE
-        db $00, $00, $3F, $C0           ; row  5  ★ + beak
-        db $00, $38, $0F, $F0           ; row  6  ★ WING + beak
-        db $00, $00, $07, $F8           ; row  7  ★ + beak tip
-        db $00, $00, $0F, $F0           ; row  8  ★ + beak
-        db $00, $00, $3F, $C0           ; row  9  ★ + beak fade
-        db $00, $FF, $FF, $00           ; row 10  cyan dense
-        db $00, $FF, $FF, $00
-        db $00, $FF, $FF, $00
-        db $81, $7E, $FF, $00
-        db $C3, $3C, $FF, $00
-        db $FF, $00, $FF, $00
-
-bird_sprite_y7:                         ; bird_y % 8 == 7  (yellow band rows 1..8)
-        db $FF, $00, $FF, $00
-        db $C3, $00, $FF, $00           ; row  1  ★ yellow taper
-        db $81, $0C, $FF, $00           ; row  2  ★ EYE (taper)
-        db $00, $0C, $FF, $00           ; row  3  ★ EYE
-        db $00, $00, $FF, $00           ; row  4  ★
-        db $00, $38, $3F, $C0           ; row  5  ★ WING + beak
-        db $00, $00, $0F, $F0           ; row  6  ★ + beak
-        db $00, $00, $07, $F8           ; row  7  ★ + beak tip
-        db $00, $00, $0F, $F0           ; row  8  ★ + beak
-        db $00, $FF, $3F, $C0           ; row  9  cyan dense + beak fade
-        db $00, $FF, $FF, $00
-        db $00, $FF, $FF, $00
-        db $00, $FF, $FF, $00
-        db $81, $7E, $FF, $00
-        db $C3, $3C, $FF, $00
-        db $FF, $00, $FF, $00
-
-bird_sprite_table:
-        dw bird_sprite_y0, bird_sprite_y1, bird_sprite_y2, bird_sprite_y3
-        dw bird_sprite_y4, bird_sprite_y5, bird_sprite_y6, bird_sprite_y7
+bird_sprite:
+        db $F8, $07, $07, $F0           ; row  0
+        db $E0, $1E, $07, $98           ; row  1
+        db $C0, $30, $07, $98           ; row  2
+        db $80, $60, $03, $DC           ; row  3
+        db $80, $7C, $03, $44           ; row  4
+        db $00, $FE, $03, $44           ; row  5
+        db $00, $86, $01, $7E           ; row  6
+        db $00, $86, $00, $E3           ; row  7
+        db $00, $8C, $00, $81           ; row  8
+        db $00, $F8, $00, $FF           ; row  9
+        db $C0, $30, $00, $FF           ; row 10
+        db $E0, $10, $07, $18           ; row 11
+        db $E0, $18, $07, $18           ; row 12
+        db $F0, $0E, $0F, $30           ; row 13
+        db $F8, $07, $1F, $E0           ; row 14
+        db $FE, $01, $7F, $80           ; row 15
 
 ; Ground tiles — 8x8 pattern, 4 phases of horizontal scroll.
 ;   Row 0: $FF — solid black top edge.
@@ -1562,11 +1424,9 @@ frame_update:
         ld      a, 1                    ; PROFILE: BLUE = bird ops region
         out     ($fe), a
         call    restore_bird_bg
-        call    restore_bird_attrs
         call    read_input
         call    update_bird
         call    draw_bird
-        call    paint_bird_attrs
         call    update_score
         ld      a, 4                    ; PROFILE: GREEN = ground
         out     ($fe), a
@@ -2531,27 +2391,15 @@ draw_bird:
         ld      a, 1
         ld      (bird_old_y_valid), a
 
-        ; sprite_ptr = bird_sprite_table[y_high & 7] — pick the variant whose
-        ; body interior bytes land exactly on the yellow attr cell rows.
-        ld      a, (bird_y + 1)
-        and     $07
-        add     a, a                    ; *2 for 16-bit table entry
-        ld      h, 0
-        ld      l, a
-        ld      de, bird_sprite_table
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = sprite ptr (kept alive past SP juggle)
-
         ld      a, (bird_y + 1)
         ld      h, 0
         ld      l, a
         add     hl, hl
-        ld      bc, line_table          ; use BC here so DE keeps the sprite ptr
-        add     hl, bc
+        ld      de, line_table
+        add     hl, de
         ld      (saved_sp), sp
         ld      sp, hl
+        ld      de, bird_sprite
         ld      b, BIRD_LINES
 .lp:
         pop     hl
