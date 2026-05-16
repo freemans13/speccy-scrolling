@@ -90,9 +90,18 @@ start:
 main_loop:
         halt
         di
-        ld      a, 2                    ; PROFILE: RED = pre-frame_update overhead (tiny)
+        ld      a, 2                    ; PROFILE: RED = top blanking work + render
         out     ($fe), a
+        ; clear_pipe_col deferred from previous frame's wrap_byte_x. Running
+        ; here in TOP BLANKING (pre-raster) means the writes finish before
+        ; the raster starts scanning the visible area — no race-the-beam.
+        ld      a, (clear_pending)
+        or      a
+        call    nz, do_deferred_clears
         call    frame_update
+        ld      a, 7                    ; PROFILE: WHITE = state prep
+        out     ($fe), a
+        call    do_white_work
         ld      a, 5                    ; PROFILE: CYAN = idle until next halt
         out     ($fe), a
         ld      a, (pending_regen)
@@ -100,6 +109,53 @@ main_loop:
         call    nz, deferred_configure  ; run configure in CYAN (after raster, no race-the-beam)
         ei
         jr      main_loop
+
+;----------------------------------------------------------------
+; do_deferred_clears: walks pipe_state and clears each pipe's OLD R col
+; (= byte_x + 3 since wrap_byte_x has already dec'd byte_x). Runs in
+; TOP BLANKING — pre-raster — so the writes are visible from the very
+; first line of the visible scan. PIPE_PROGRAM then renders at the NEW
+; byte_x position (slot targets were patched in previous frame's WHITE
+; band), so no PIPE_PROGRAM write conflicts with our clears.
+;
+; ~10 k T per call. Top blanking budget ~14 k T. Fits with margin.
+;----------------------------------------------------------------
+do_deferred_clears:
+        xor     a
+        ld      (clear_pending), a              ; reset flag
+        ld      iy, pipe_state
+        ld      b, NUM_PIPES
+.lp:
+        push    bc
+        ld      a, (iy+0)
+        add     a, 3                            ; trailing = NEW byte_x + 3 = OLD R col
+        cp      4
+        jr      c, .skip                         ; trailing < 4 → left buffer, skip
+        cp      28
+        jr      nc, .skip                        ; trailing >= 28 → right buffer, skip
+        ld      c, a
+        ld      e, (iy+1)
+        call    clear_pipe_col
+.skip:
+        inc     iy
+        inc     iy
+        pop     bc
+        djnz    .lp
+        ret
+
+;----------------------------------------------------------------
+; do_white_work: state-prep work that used to be in frame_update's WHITE
+; band. advance_phase × 2 + (wrap_byte_x — now WITHOUT clear) + restore_trailing.
+;----------------------------------------------------------------
+do_white_work:
+        call    advance_phase
+        call    advance_phase
+        ld      a, (wrap_pending)
+        or      a
+        ret     z
+        xor     a
+        ld      (wrap_pending), a
+        jp      restore_trailing_pipe_attrs
 
 ;----------------------------------------------------------------
 phase:      db 0
@@ -141,6 +197,8 @@ wrap_pending:  db 0                      ; set when a wrap happened this frame
 pending_regen: db 0                      ; set when a recycle happened; configure_pipe_slots deferred
 patch_pending: db 0                      ; set by wrap_byte_x when byte_x changed; cleared after patch_pipe_targets runs
 recycled_pipe_idx: db 0
+clear_pending: db 0                      ; set by wrap_byte_x; consumed by NEXT frame's
+                                         ; top-blanking do_deferred_clears (pre-raster).
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
@@ -1391,20 +1449,10 @@ frame_update:
         ld      a, 4                    ; PROFILE: GREEN = ground
         out     ($fe), a
         call    draw_ground
-        ld      a, 7                    ; PROFILE: WHITE = end-of-frame state prep
-        out     ($fe), a
-        call    advance_phase           ; 2 px/frame scroll, takes effect NEXT frame
-        call    advance_phase
-        ; Deferred wrap cleanup: restore OLD pipe positions to bg attrs.
-        ; Safe here because the raster has passed all pipe attr rows by now;
-        ; the restore affects NEXT frame's display, not this one's.
-        ld      a, (wrap_pending)
-        or      a
-        jr      z, .skip_restore
-        xor     a
-        ld      (wrap_pending), a
-        call    restore_trailing_pipe_attrs
-.skip_restore:
+        ; State prep (advance_phase × 2 with wrap-byte_x, restore_trailing)
+        ; was here in the WHITE band. Moved to main_loop's CYAN region so
+        ; clear_pipe_col's screen writes happen AFTER raster has scanned
+        ; the visible area — no race-the-beam on lower-half pipe rows.
 .no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
@@ -1702,39 +1750,28 @@ patch_pipe_targets:
 
 ;----------------------------------------------------------------
 ; wrap_byte_x: scroll all pipes left by one byte (8 px). For each pipe:
-;   - clear the old trailing column (paint_restore) if it is in visible playfield
 ;   - decrement byte_x; on byte_x == 1 → recycle (random gap_y, byte_x = 29,
 ;     defer slot regen by 2 frames via pending_regen)
 ; Tail-call patch_pipe_targets to decrement every active body slot's screen
 ; target by ROW_OFFSET (= 1) so they walk to the next column.
+;
+; clear_pipe_col (OLD R col erase) is NOT done here — it's deferred to the
+; NEXT frame's top blanking (do_deferred_clears) so the writes happen
+; pre-raster and don't race the beam on lower-half pipe rows.
 ;----------------------------------------------------------------
 wrap_byte_x:
         ld      iy, pipe_state
         ld      b, NUM_PIPES
 .outer:
-        push    bc
-        ld      a, (iy+0)
-        ; Clear OLD trailing col = old byte_x + 2. Skip clear if trailing is
-        ; in either buffer (cols 0-3 left, 28-31 right) since buffer attr
-        ; hides whatever pixels are there — no restore needed.
-        cp      2                       ; byte_x < 2 → trailing ≤ 3 (left buffer)
-        jr      c, .skip_clear
-        cp      26                      ; byte_x ≥ 26 → trailing ≥ 28 (right buffer)
-        jr      nc, .skip_clear
-        inc     a
-        inc     a                       ; trailing = byte_x + 2 (in 4..27)
-        ld      c, a
-        ld      e, (iy+1)
-        call    clear_pipe_col
-
-.skip_clear:
         ld      a, (iy+0)
         cp      1
         jr      z, .recycle
         dec     a
         jr      .save
 .recycle:
+        push    bc
         call    random_gap_y            ; A = new random gap_y; IY/BC preserved
+        pop     bc
         ld      (iy+1), a
         ld      a, 2
         ld      (pending_regen), a      ; defer 1 frame, then run full configure
@@ -1747,11 +1784,10 @@ wrap_byte_x:
         ld      (iy+0), a
         inc     iy
         inc     iy
-        pop     bc
         djnz    .outer
-        ; Run patch_pipe_targets in WHITE band (end-of-frame state prep).
-        ; WHITE is partially hidden in bottom blanking, so this is less visible
-        ; than running it in RED at top of next frame.
+        ld      a, 1
+        ld      (clear_pending), a      ; signal next frame's top blanking to clear OLD R cols
+        ; Run patch_pipe_targets so NEXT frame's PIPE_PROGRAM renders at NEW byte_x.
         call    patch_pipe_targets
         ret
 
