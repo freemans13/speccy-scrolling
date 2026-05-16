@@ -104,6 +104,11 @@ main_loop:
         call    do_white_work
         ld      a, 5                    ; PROFILE: CYAN = idle until next halt
         out     ($fe), a
+        ; Pre-compute cap byte imms for NEXT frame's PIPE_PROGRAM. Phase has
+        ; already been advanced in do_white_work, so the imms reflect the
+        ; render phase the next frame will use. Saves ~2 k T from next
+        ; frame's pre-PP block.
+        call    update_cap_imm_v2
         ld      a, (pending_regen)
         or      a
         call    nz, deferred_configure  ; run configure in CYAN (after raster, no race-the-beam)
@@ -1391,6 +1396,7 @@ init_pipes:
         ; the three per-pipe sublists at ACTIVE_PIPE_0..PIPE_2 contiguously).
         ld      hl, 336
         ld      (ACTIVE_COUNT_NEW), hl
+        call    update_cap_imm_v2       ; init cap imms for phase 0 (first render)
         call    redraw_pipes_v2
         ret
 
@@ -2007,8 +2013,9 @@ redraw_pipes_v2:
         ld      (body_b_bc), bc
         ld      (body_b_de), de
         exx
-        ; Refresh cap byte values for current phase
-        call    update_cap_imm_v2       ; clobbers BC, DE
+        ; (update_cap_imm_v2 moved to main_loop's CYAN region — pre-computes
+        ; cap byte imms for NEXT frame's PIPE_PROGRAM. Saves ~2 k T from
+        ; pre-PP block so PP starts BEFORE raster reaches pixel area.)
 
         ld      a, 3                    ; MAGENTA = PIPE_PROGRAM
         out     ($fe), a
