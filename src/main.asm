@@ -273,27 +273,28 @@ bird_attr_save:     db 0
 
 BIRD_FRAME_BYTES    EQU 64              ; 16 rows × (mask + sprite) × 2 cols
 
-; Bird sprite — black ink drawing, threshold-extracted from ~/Downloads/bird.jpg.
-; The yellow paper attr cell is gone for this iteration: the whole bird is ink
-; on cyan sky. Per-row silhouette = leftmost-to-rightmost dark pixel, masked
-; so pipes behind the bird body don't bleed through.
+; Bird sprite — black ink drawing, exported from Piskel (bird-shaded.piskel).
+; The PNG layer is a clean 16×16 binary mask: black ink + transparent. Per-row
+; silhouette = leftmost-to-rightmost dark pixel, so pipes behind the bird
+; body interior get masked rather than bleeding through. Body interior reads
+; as cyan sky paper (no yellow attr cell this iteration).
 ;
-;     .....########...   row  0
-;     ...####.#..##...   row  1
-;     ..##....#..##...   row  2
-;     .##.....##.###..   row  3
-;     .#####...#...#..   row  4
-;     #######..#...#..   row  5
-;     #....##..######.   row  6
-;     #....##.###...##   row  7
-;     #...##..#......#   row  8
-;     #####...########   row  9
-;     ..##....########   row 10
-;     ...#.......##...   row 11
-;     ...##......##...   row 12
-;     ....###...##....   row 13
-;     .....######.....   row 14
-;     .......##.......   row 15
+;     ......######....   row  0
+;     ....#########...   row  1
+;     ...####.###.##..   row  2
+;     .#####.#.#...#..   row  3
+;     ##...##.##..#.#.   row  4
+;     #.....#..#..#.#.   row  5
+;     #.....#..#....#.   row  6
+;     #.....#...#...#.   row  7
+;     #.....#....#####   row  8
+;     #.....#...#....#   row  9
+;     .#...#...#.#####   row 10
+;     ..####.#.#.....#   row 11
+;     ...####.#.#.#.##   row 12
+;     ....####.#.####.   row 13
+;     .....#######....   row 14
+;     .......####.....   row 15
 ;
 ; Stored as 4 bytes/row: inv_maskL, spriteL, inv_maskR, spriteR.
 ; draw_bird does  screen = (screen AND inv_mask) OR sprite.
@@ -301,22 +302,22 @@ BIRD_FRAME_BYTES    EQU 64              ; 16 rows × (mask + sprite) × 2 cols
 ; inv_mask = 1 outside (keep bg = sky / pipe pixels show through).
 
 bird_sprite:
-        db $F8, $07, $07, $F0           ; row  0
-        db $E0, $1E, $07, $98           ; row  1
-        db $C0, $30, $07, $98           ; row  2
-        db $80, $60, $03, $DC           ; row  3
-        db $80, $7C, $03, $44           ; row  4
-        db $00, $FE, $03, $44           ; row  5
-        db $00, $86, $01, $7E           ; row  6
-        db $00, $86, $00, $E3           ; row  7
-        db $00, $8C, $00, $81           ; row  8
-        db $00, $F8, $00, $FF           ; row  9
-        db $C0, $30, $00, $FF           ; row 10
-        db $E0, $10, $07, $18           ; row 11
-        db $E0, $18, $07, $18           ; row 12
-        db $F0, $0E, $0F, $30           ; row 13
-        db $F8, $07, $1F, $E0           ; row 14
-        db $FE, $01, $7F, $80           ; row 15
+        db $FC, $03, $0F, $F0           ; row  0  ......######....
+        db $F0, $0F, $07, $F8           ; row  1  ....#########...
+        db $E0, $1E, $03, $EC           ; row  2  ...####.###.##..
+        db $80, $7D, $03, $44           ; row  3  .#####.#.#...#..
+        db $00, $C6, $01, $CA           ; row  4  ##...##.##..#.#.
+        db $00, $82, $01, $4A           ; row  5  #.....#..#..#.#.
+        db $00, $82, $01, $42           ; row  6  #.....#..#....#.
+        db $00, $82, $01, $22           ; row  7  #.....#...#...#.
+        db $00, $82, $00, $1F           ; row  8  #.....#....#####
+        db $00, $82, $00, $21           ; row  9  #.....#...#....#
+        db $80, $44, $00, $5F           ; row 10  .#...#...#.#####
+        db $C0, $3D, $00, $41           ; row 11  ..####.#.#.....#
+        db $E0, $1E, $00, $AB           ; row 12  ...####.#.#.#.##
+        db $F0, $0F, $01, $5E           ; row 13  ....####.#.####.
+        db $F8, $07, $0F, $F0           ; row 14  .....#######....
+        db $FE, $01, $1F, $E0           ; row 15  .......####.....
 
 ; Ground tiles — 8x8 pattern, 4 phases of horizontal scroll.
 ;   Row 0: $FF — solid black top edge.
