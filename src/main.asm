@@ -2540,18 +2540,16 @@ draw_bird:
         add     hl, de
         ld      e, (hl)
         inc     hl
-        ld      d, (hl)
-        push    de                      ; stash sprite ptr; we need HL/DE for line lookup
+        ld      d, (hl)                 ; DE = sprite ptr (kept alive past SP juggle)
 
         ld      a, (bird_y + 1)
         ld      h, 0
         ld      l, a
         add     hl, hl
-        ld      de, line_table
-        add     hl, de
+        ld      bc, line_table          ; use BC here so DE keeps the sprite ptr
+        add     hl, bc
         ld      (saved_sp), sp
         ld      sp, hl
-        pop     de                      ; DE = sprite ptr
         ld      b, BIRD_LINES
 .lp:
         pop     hl
