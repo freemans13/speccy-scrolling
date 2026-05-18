@@ -112,6 +112,9 @@ main_loop:
         ld      a, (pending_regen)
         or      a
         call    nz, deferred_configure  ; run configure in CYAN (after raster, no race-the-beam)
+        ld      a, (gap_clear_pending)
+        or      a
+        call    nz, run_gap_clear       ; clear stale body bytes 1 frame after configure
         ei
         jr      main_loop
 
@@ -204,6 +207,11 @@ patch_pending: db 0                      ; set by wrap_byte_x when byte_x change
 recycled_pipe_idx: db 0
 clear_pending: db 0                      ; set by wrap_byte_x; consumed by NEXT frame's
                                          ; top-blanking do_deferred_clears (pre-raster).
+gap_clear_pending: db 0                  ; set by configure_pipe_slots (= recycled_pipe_idx+1)
+                                         ; consumed by NEXT frame's CYAN region (clears stale
+                                         ; body bytes in the new gap region). Deferred 1 frame
+                                         ; past configure to keep the configure frame under
+                                         ; 70k T budget.
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
@@ -1080,18 +1088,43 @@ configure_pipe_slots:
         ld      a, (cps_gap_y)
         ld      (hl), a
 
-        ; ─── Step 8: clear stale body pixels in the new gap region.
-        ; When a pipe recycles to a new gap_y, rows that USED to be body
-        ; (in an earlier gap_y) may have body bytes still on screen — the
-        ; trailing-col clear in clear_pipe_col only iterates the CURRENT body
-        ; rows, so any row that just transitioned body→gap keeps its stale
-        ; body bytes forever. Wipe cols 4..27 of the 50 cap-block rows.
-        ld      (cps_saved_sp), sp
-        ld      de, 0                           ; sky byte pair for stack-blast
-        ld      a, (cps_cap_top_row)
+        ; ─── Step 8: queue a gap-clear for the NEXT frame. The screen-clear
+        ; itself (cols 4..27 × 50 new gap rows) is ~12k T-states; running it
+        ; in the configure frame would push that frame from ~67k to ~79k,
+        ; missing the halt. Defer to next frame's CYAN region (run_gap_clear).
+        ; The 1-frame delay means stale body bytes flash for 20ms before
+        ; clearing — far better than dropping to 25Hz.
+        ld      a, (cps_pipe)
+        inc     a                               ; 1..3 = which pipe needs gap clear (0 = none)
+        ld      (gap_clear_pending), a
+        ret
+
+;----------------------------------------------------------------
+; run_gap_clear: clear cols 4..27 of the cap-block rows for the pipe that
+; just recycled. Runs ONE FRAME after configure_pipe_slots, in main_loop's
+; CYAN region. ~12k T-states.
+;
+; Reads gap_clear_pending (= pipe_idx + 1). Clears it to 0 on exit.
+;----------------------------------------------------------------
+run_gap_clear:
+        ld      a, (gap_clear_pending)
+        dec     a                               ; A = pipe index (0..2)
+        ; Look up that pipe's gap_y from pipe_state[pipe*2 + 1].
+        add     a, a                            ; pipe * 2
+        inc     a                               ; pipe * 2 + 1
+        ld      hl, pipe_state
+        add     a, l
+        ld      l, a
+        jr      nc, .rgc_nc
+        inc     h
+.rgc_nc:
+        ld      a, (hl)                         ; A = gap_y
+        dec     a                               ; A = cap_top_row
         ld      c, a                            ; C = current row (cap_top_row..cap_bot_row)
+        ld      (cps_saved_sp), sp              ; reuse the same scratch slot
+        ld      de, 0                           ; sky byte pair for stack-blast
         ld      b, 50                           ; 50 rows in cap block
-.cps_clr_gap_lp:
+.rgc_lp:
         ld      sp, (cps_saved_sp)              ; reset SP before any push bc
         push    bc                              ; preserve row + counter
         ld      h, 0
@@ -1104,10 +1137,10 @@ configure_pipe_slots:
         ld      h, (hl)
         ld      l, c                            ; HL = line_addr
         ld      bc, 28
-        add     hl, bc                          ; HL = line_addr + 28 (one past last visible col)
-        pop     bc                              ; restore row + counter
+        add     hl, bc                          ; HL = line_addr + 28
+        pop     bc
         ld      sp, hl
-        push    de                              ; 12 pushes × 2 bytes = 24 bytes (cols 4..27)
+        push    de                              ; 12 pushes = 24 bytes cleared (cols 4..27)
         push    de
         push    de
         push    de
@@ -1120,9 +1153,10 @@ configure_pipe_slots:
         push    de
         push    de
         inc     c
-        djnz    .cps_clr_gap_lp
+        djnz    .rgc_lp
         ld      sp, (cps_saved_sp)
-
+        xor     a
+        ld      (gap_clear_pending), a
         ret
 
 
