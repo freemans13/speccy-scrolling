@@ -185,12 +185,14 @@ cap_R_temp:     db 0
 ; the pipe wraps back to the right of the screen so it can score again.
 score:        dw 0
 score_last:   dw $FFFF                  ; force first render
-pipe_scored:  db 0, 0, 0
+pipe_scored:  db 0, 0, 0, 0            ; one byte per pipe (NUM_PIPES=4)
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
 wrap_pending:  db 0                      ; set when a wrap happened this frame
-; Phase 5: pending_regen and recycled_pipe_idx removed (deferred_configure gone).
-patch_pending: db 0                      ; set by wrap_byte_x when byte_x changed; cleared after patch_pipe_targets runs
+; Phase 5: pending_regen, recycled_pipe_idx and patch_pending removed.
 prep_pipe_idx:   db 3                  ; Phase 3: pipe 3 starts as the preparing column
+; Bug 2 fix: do_swap fallback defers prep_pipe_idx update until after wrap_byte_x loop.
+; 0 = no pending swap; N+1 = update prep_pipe_idx to N after loop exits.
+prep_pipe_swap_pending: db 0
 ; Phase 4: incremental-prepare state machine variables.
 ; prep_phase 0..6 = which configure sub-step we are on; 7 = done.
 ; prep_row  0..N  = current row within the current phase (phases 0, 2 use rows;
@@ -1483,6 +1485,15 @@ init_pipes:
         pop     bc
         djnz    .init_pipe3_lp
 
+        ; Defensive: zero-fill ACTIVE_PIPE_3 (224 bytes) so that if do_swap's
+        ; fallback path ever triggers patch_pipe_targets before phase 6 runs,
+        ; any stray decrements hit $0000 in ROM (silent, no corruption).
+        ld      hl, ACTIVE_PIPE_3
+        ld      de, ACTIVE_PIPE_3 + 1
+        ld      (hl), 0
+        ld      bc, 223
+        ldir
+
         ; ACTIVE_COUNT_NEW = 3 * 112 = 336 (patch_pipe_targets walks only the 3 active
         ; pipes at ACTIVE_PIPE_0..PIPE_2; pipe 3 is skipped — its column is all-NOPs
         ; and decrementing NOP bytes would produce $FF = RST $38, disastrous during
@@ -2327,6 +2338,17 @@ wrap_byte_x:
         inc     iy
         inc     iy
         djnz    .outer
+.wbx_apply_pending:
+        ; Bug 2 fix: apply deferred prep_pipe_idx update from fallback path.
+        ; prep_pipe_swap_pending == dep+1 if the fallback ran; 0 otherwise.
+        ld      a, (prep_pipe_swap_pending)
+        or      a
+        jr      z, .wbx_no_pending
+        dec     a                               ; recover dep
+        ld      (prep_pipe_idx), a
+        xor     a
+        ld      (prep_pipe_swap_pending), a     ; clear pending flag
+.wbx_no_pending:
         ; Run patch_pipe_targets so NEXT frame's PIPE_PROGRAM renders at NEW byte_x.
         call    patch_pipe_targets
         ret
@@ -2344,10 +2366,15 @@ wrap_byte_x:
 ;   - Pick new prep_gap_y; reset prep_phase=0, prep_row=0.
 ;
 ; If prep_phase != 7 (fallback):
-;   - Just re-randomise departing pipe's gap_y and set byte_x=29 in place.
-;   - No configure (old slot targets still valid for byte_x=29 since body
-;     BODY_TEMPLATE was baked for byte_x=29; the slot was configured last
-;     recycle and is still correct modulo the gap_y being stale for 1 cycle).
+;   - Re-randomise departing pipe's gap_y and set byte_x=29 in place.
+;     (byte_x=29 is intentional: pipe stays at 29 while its slot column is
+;     all-NOP, so pipe_state[dep].byte_x stays at 29 throughout dep's prep
+;     cycle — pipe_state drives attr routines, not the NOP column itself.)
+;   - Clear all 6 bytes of each of the departing pipe's 160 slot rows to $00
+;     (full NOP slide). Without clearing bytes 1-5, stray pushes would occur
+;     when the slot executes with a wrong SP.
+;   - Set prep_pipe_swap_pending = dep+1 (deferred; applied after wrap_byte_x
+;     loop exits to prevent the loop from walking the old prep pipe).
 ;
 ; In:  A = departing pipe index (0..3; NOT prep_pipe_idx).
 ; Clobbers: AF, BC, DE, HL.
@@ -2415,18 +2442,19 @@ do_swap:
         ld      a, (ds_tmp)
         ld      (hl), a                         ; gap_y = new random
 
-        ; Update prep state so prep_step rebuilds this pipe (new gap_y may differ)
+        ; Update prep state so prep_step rebuilds this pipe (new gap_y may differ).
+        ; NOTE: we do NOT update prep_pipe_idx here — the wrap_byte_x loop is still
+        ; running and relies on the OLD prep_pipe_idx to skip the old prep pipe.
+        ; Instead, set prep_pipe_swap_pending = dep+1; wrap_byte_x applies it after
+        ; its loop exits (see .wbx_apply_pending below).
         ld      a, (ds_dep)
-        ld      (prep_pipe_idx), a
+        inc     a                               ; dep+1 (0 means "no pending")
+        ld      (prep_pipe_swap_pending), a
         ld      a, (ds_tmp)
         ld      (prep_gap_y), a
         xor     a
         ld      (prep_phase), a
         ld      (prep_row), a
-
-        ; patch_pipe_targets must now skip the (still-same) prep pipe.
-        ; prep_pipe_idx is now dep, and dep is already absent from the walk
-        ; via the updated prep_pipe_idx in the skip path.
         ret
 
         ; ── Full swap ────────────────────────────────────────────────────
@@ -3179,8 +3207,16 @@ random_gap_y:
 update_score:
         ld      iy, pipe_state
         ld      hl, pipe_scored
-        ld      b, ACTIVE_PIPES                 ; Phase 3: score only active pipes 0..2
+        ld      b, NUM_PIPES                    ; iterate all 4 pipes, skip prep_pipe_idx
 .lp:
+        push    bc
+        ; current pipe index = NUM_PIPES - B (B counts down 4→1, idx = 0..3)
+        ld      a, NUM_PIPES
+        sub     b
+        ld      c, a                            ; C = current pipe index
+        ld      a, (prep_pipe_idx)
+        cp      c
+        jr      z, .next                        ; skip the preparing pipe
         ld      a, (iy+0)               ; byte_x
         cp      6
         jr      nc, .check_reset
@@ -3205,6 +3241,7 @@ update_score:
         inc     iy
         inc     iy
         inc     hl
+        pop     bc
         djnz    .lp
         ret
 
@@ -3531,9 +3568,16 @@ update_pipe_attrs:
 ;----------------------------------------------------------------
 apply_pipe_attrs:
         ld      iy, pipe_state
-        ld      b, ACTIVE_PIPES                 ; Phase 3: only active pipes 0..2
+        ld      b, NUM_PIPES                    ; iterate all 4 pipes, skip prep_pipe_idx
 .lp:
         push    bc
+        ; current pipe index = NUM_PIPES - B (B counts down 4→1, idx = 0..3)
+        ld      a, NUM_PIPES
+        sub     b
+        ld      c, a                            ; C = current pipe index
+        ld      a, (prep_pipe_idx)
+        cp      c
+        jr      z, .skip                        ; skip the preparing pipe
         ld      a, (iy+0)
         cp      4                       ; M1 must be visible (byte_x ≥ 4)
         jr      c, .skip
@@ -3562,9 +3606,16 @@ apply_pipe_attrs:
 ;----------------------------------------------------------------
 apply_pipe_attrs_wrap:
         ld      iy, pipe_state
-        ld      b, ACTIVE_PIPES                 ; Phase 3: only active pipes 0..2
+        ld      b, NUM_PIPES                    ; iterate all 4 pipes, skip prep_pipe_idx
 .lp:
         push    bc
+        ; current pipe index = NUM_PIPES - B (B counts down 4→1, idx = 0..3)
+        ld      a, NUM_PIPES
+        sub     b
+        ld      c, a                            ; C = current pipe index
+        ld      a, (prep_pipe_idx)
+        cp      c
+        jr      z, .skip                        ; skip the preparing pipe
         ld      a, (iy+0)
         cp      4
         jr      c, .skip
@@ -3626,9 +3677,16 @@ backup_base_attrs:
 ;----------------------------------------------------------------
 restore_pipe_attrs:
         ld      iy, pipe_state
-        ld      b, ACTIVE_PIPES                 ; Phase 3: only active pipes 0..2
+        ld      b, NUM_PIPES                    ; iterate all 4 pipes, skip prep_pipe_idx
 .lp:
         push    bc
+        ; current pipe index = NUM_PIPES - B (B counts down 4→1, idx = 0..3)
+        ld      a, NUM_PIPES
+        sub     b
+        ld      c, a                            ; C = current pipe index
+        ld      a, (prep_pipe_idx)
+        cp      c
+        jr      z, .skip                        ; skip the preparing pipe
         ld      a, (iy+0)
         cp      4                       ; M1 must be in visible playfield (≥4)
         jr      c, .skip
@@ -3654,9 +3712,16 @@ restore_pipe_attrs:
 ;----------------------------------------------------------------
 restore_trailing_pipe_attrs:
         ld      iy, pipe_state
-        ld      b, ACTIVE_PIPES                 ; Phase 3: only active pipes 0..2
+        ld      b, NUM_PIPES                    ; iterate all 4 pipes, skip prep_pipe_idx
 .lp:
         push    bc
+        ; current pipe index = NUM_PIPES - B (B counts down 4→1, idx = 0..3)
+        ld      a, NUM_PIPES
+        sub     b
+        ld      c, a                            ; C = current pipe index
+        ld      a, (prep_pipe_idx)
+        cp      c
+        jr      z, .skip                        ; skip the preparing pipe
         ld      a, (iy+0)
         add     a, 2                    ; OLD M2 = current byte_x + 2
         cp      4
