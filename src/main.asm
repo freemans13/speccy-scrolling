@@ -631,6 +631,27 @@ configure_pipe_slots:
         add     a, PIPE_GAP
         ld      (cps_cap_bot_row), a
 
+        ; Defensive: refresh cap_*_target_imm_addrs in case anything has
+        ; corrupted them at runtime. Snapshot analysis on 2026-05-18 showed
+        ; cap_top_target_imm_addrs[0] high byte being flipped from $8A to
+        ; $AA (one bit), causing pipe 0's cap-top imm to be written into
+        ; $AAEB instead of $8AEB — pipe 0's cap_top then stuck on a bogus
+        ; screen target across recycles ("shortest top pipe missing cap"
+        ; bug). Source of corruption not yet identified; this self-repairs
+        ; the table every configure so the patch lands in the right place.
+        ld      hl, cap_top_handler_pipe_0_target
+        ld      (cap_top_target_imm_addrs), hl
+        ld      hl, cap_top_handler_pipe_1_target
+        ld      (cap_top_target_imm_addrs + 2), hl
+        ld      hl, cap_top_handler_pipe_2_target
+        ld      (cap_top_target_imm_addrs + 4), hl
+        ld      hl, cap_bot_handler_pipe_0_target
+        ld      (cap_bot_target_imm_addrs), hl
+        ld      hl, cap_bot_handler_pipe_1_target
+        ld      (cap_bot_target_imm_addrs + 2), hl
+        ld      hl, cap_bot_handler_pipe_2_target
+        ld      (cap_bot_target_imm_addrs + 4), hl
+
         ; ─── Step 1: stamp BODY_TEMPLATE → body rows only (skip cap range) ─
         ; Region A: rows [0, cap_top_row-1]    (count = cap_top_row)
         ; Region B: rows [cap_bot_row+1, 159]  (count = 159 - cap_bot_row)
