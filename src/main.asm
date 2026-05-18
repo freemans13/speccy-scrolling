@@ -2297,21 +2297,28 @@ advance_bird_anim:
         inc     a
         and     3                       ; 4-frame cycle 0..3
         ld      (bird_anim_phase), a
-        ; ptr = bird_sprite_f0 + phase * BIRD_FRAME_BYTES (=64)
+        jr      .update_ptr
+.store_tick:
+        ld      (hl), a
+        ld      a, (bird_anim_phase)
+.update_ptr:
+        ; ptr = bird_sprite_f0 + phase * BIRD_FRAME_BYTES (=96)
+        ; Multiplying by 96 = 64 + 32 = (phase<<6) + (phase<<5), or just 96*phase.
+        ; phase ∈ {0,1,2,3} so max = 288. Compute as phase*64 + phase*32.
         ld      h, 0
         ld      l, a
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
+        add     hl, hl                  ; *2
+        add     hl, hl                  ; *4
+        add     hl, hl                  ; *8
+        add     hl, hl                  ; *16
+        add     hl, hl                  ; *32
+        ld      d, h
+        ld      e, l                    ; DE = phase * 32
         add     hl, hl                  ; HL = phase * 64
+        add     hl, de                  ; HL = phase * 96
         ld      de, bird_sprite_f0
         add     hl, de
         ld      (bird_sprite_ptr), hl
-        ret
-.store_tick:
-        ld      (hl), a
         ret
 
 ;----------------------------------------------------------------
