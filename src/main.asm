@@ -25,8 +25,7 @@ ATTR_SKY        EQU $28                 ; paper cyan + ink black
 ATTR_GROUND     EQU $20                 ; paper green + ink black (ground band, row 20)
 ATTR_SCOREBOARD EQU $07                 ; paper black + ink white (rows 21..23)
 ATTR_PIPE       EQU $20                 ; paper green + ink black (dynamic, inner pipe cells)
-ATTR_BIRD       EQU $70                 ; bright yellow paper + black ink (col 8)
-ATTR_BIRD_R     EQU $78                 ; bright white paper + black ink (col 9, beak background)
+ATTR_BIRD       EQU $70                 ; bright yellow paper + black ink (col 8 only, centred under sprite)
 ATTR_BUFFER     EQU $2D                 ; paper cyan + ink cyan — invisible buffer cols (0-3, 28-31)
 GROUND_TOP      EQU 160                 ; first scan line of ground band — pipes stop here
 SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= ground+8)
@@ -270,116 +269,99 @@ bird_overlap:       ds BIRD_LINES, 0
 ; ink (sprite=1) inside the silhouette, masking the cyan paper.
 bird_attr_y:        db 0
 bird_attr_valid:    db 0
-bird_attr_save:     ds 2                ; [0]=col 8 (yellow), [1]=col 9 (white)
+bird_attr_save:     db 0                ; single yellow cell (col 8)
 
 ; Bird wing animation — 4 frames cycling 0→1→2→3→0, one phase step every
 ; BIRD_ANIM_RATE frames. bird_sprite_ptr always points at the current
 ; frame's data; draw_bird reads it instead of a fixed label.
 BIRD_ANIM_RATE      EQU 4
-BIRD_FRAME_BYTES    EQU 64              ; 16 rows × 4 bytes/row
+BIRD_FRAME_BYTES    EQU 96              ; 16 rows × 6 bytes/row (3 cells × 2)
 bird_anim_tick:     db 0
 bird_anim_phase:    db 0
 bird_sprite_ptr:    dw bird_sprite_f0
 
-; Bird sprite — black ink drawing, exported from Piskel (bird-shaded.piskel).
-; The PNG layer is a clean 16×16 binary mask: black ink + transparent. Per-row
-; silhouette = leftmost-to-rightmost dark pixel, so pipes behind the bird
-; body interior get masked rather than bleeding through. Body interior reads
-; as cyan sky paper (no yellow attr cell this iteration).
+; Bird sprite — black ink drawing, exported from Piskel.
+; Pre-shifted 4 px LEFT so the 16-px-wide sprite spans 3 char cells (cols 7,8,9)
+; instead of 2. The yellow paper attr cell at col 8 then sits centred under the
+; sprite (4 px of sprite to its left in col 7, 4 px to its right in col 9), so
+; the colour-clash boundary is the same on both sides → reads as deliberate.
 ;
-;     ....########....   row  0
-;     ..###########...   row  1
-;     .######.###.##..   row  2
-;     ######.#.#...#..   row  3
-;     ##...##.##..#.#.   row  4
-;     #.....#..#..#.#.   row  5
-;     #.....#..#....#.   row  6
-;     #...#.#...#...#.   row  7
-;     #...#.#....#####   row  8
-;     #..#..#...#....#   row  9
-;     #.....#..#.#####   row 10
-;     ##...#.#.#.....#   row 11
-;     .######.#.#.#.##   row 12
-;     ..####.#.#.####.   row 13
-;     ...#########....   row 14
-;     ....#######.....   row 15
-;
-; Stored as 4 bytes/row: inv_maskL, spriteL, inv_maskR, spriteR.
+; Stored as 6 bytes/row: mask_c7, sprite_c7, mask_c8, sprite_c8, mask_c9, sprite_c9.
 ; draw_bird does  screen = (screen AND inv_mask) OR sprite.
 ; inv_mask = 0 inside the row's silhouette (clear bg, then OR sprite ink),
 ; inv_mask = 1 outside (keep bg = sky / pipe pixels show through).
 
 bird_sprite_f0:
-        db $F0, $0F, $0F, $F0           ; row  0  ....########....
-        db $C0, $3F, $07, $F8           ; row  1  ..###########...
-        db $80, $7E, $03, $EC           ; row  2  .######.###.##..
-        db $00, $FD, $03, $44           ; row  3  ######.#.#...#..
-        db $00, $C6, $01, $CA           ; row  4  ##...##.##..#.#.
-        db $00, $82, $01, $4A           ; row  5  #.....#..#..#.#.
-        db $00, $82, $01, $42           ; row  6  #.....#..#....#.
-        db $00, $8A, $01, $22           ; row  7  #...#.#...#...#.
-        db $00, $8A, $00, $1F           ; row  8  #...#.#....#####
-        db $00, $92, $00, $21           ; row  9  #..#..#...#....#
-        db $00, $82, $00, $5F           ; row 10  #.....#..#.#####
-        db $00, $C5, $00, $41           ; row 11  ##...#.#.#.....#
-        db $80, $7E, $00, $AB           ; row 12  .######.#.#.#.##
-        db $C0, $3D, $01, $5E           ; row 13  ..####.#.#.####.
-        db $E0, $1F, $0F, $F0           ; row 14  ...#########....
-        db $F0, $0F, $1F, $E0           ; row 15  ....#######.....
+        db $FF, $00, $00, $FF, $FF, $00     ; row  0 ....########....
+        db $FC, $03, $00, $FF, $7F, $80     ; row  1 ..###########...
+        db $F8, $07, $00, $EE, $3F, $C0     ; row  2 .######.###.##..
+        db $F0, $0F, $00, $D4, $3F, $40     ; row  3 ######.#.#...#..
+        db $F0, $0C, $00, $6C, $1F, $A0     ; row  4 ##...##.##..#.#.
+        db $F0, $08, $00, $24, $1F, $A0     ; row  5 #.....#..#..#.#.
+        db $F0, $08, $00, $24, $1F, $20     ; row  6 #.....#..#....#.
+        db $F0, $08, $00, $A2, $1F, $20     ; row  7 #...#.#...#...#.
+        db $F0, $08, $00, $A1, $0F, $F0     ; row  8 #...#.#....#####
+        db $F0, $09, $00, $22, $0F, $10     ; row  9 #..#..#...#....#
+        db $F0, $08, $00, $25, $0F, $F0     ; row 10 #.....#..#.#####
+        db $F0, $0C, $00, $54, $0F, $10     ; row 11 ##...#.#.#.....#
+        db $F8, $07, $00, $EA, $0F, $B0     ; row 12 .######.#.#.#.##
+        db $FC, $03, $00, $D5, $1F, $E0     ; row 13 ..####.#.#.####.
+        db $FE, $01, $00, $FF, $FF, $00     ; row 14 ...#########....
+        db $FF, $00, $01, $FE, $FF, $00     ; row 15 ....#######.....
 
 bird_sprite_f1:
-        db $F0, $0F, $0F, $F0           ; row  0  ....########....
-        db $C0, $3F, $07, $F8           ; row  1  ..###########...
-        db $80, $7E, $03, $EC           ; row  2  .######.###.##..
-        db $00, $FD, $03, $44           ; row  3  ######.#.#...#..
-        db $00, $C6, $01, $CA           ; row  4  ##...##.##..#.#.
-        db $00, $82, $01, $4A           ; row  5  #.....#..#..#.#.
-        db $00, $8A, $01, $42           ; row  6  #...#.#..#....#.
-        db $00, $92, $01, $22           ; row  7  #..#..#...#...#.
-        db $00, $82, $00, $1F           ; row  8  #.....#....#####
-        db $00, $C4, $00, $21           ; row  9  ##...#....#....#
-        db $00, $B8, $00, $5F           ; row 10  #.###....#.#####
-        db $00, $D5, $00, $41           ; row 11  ##.#.#.#.#.....#
-        db $80, $6A, $00, $AB           ; row 12  .##.#.#.#.#.#.##
-        db $C0, $3D, $01, $5E           ; row 13  ..####.#.#.####.
-        db $E0, $1F, $0F, $F0           ; row 14  ...#########....
-        db $F0, $0F, $1F, $E0           ; row 15  ....#######.....
+        db $FF, $00, $00, $FF, $FF, $00     ; row  0 ....########....
+        db $FC, $03, $00, $FF, $7F, $80     ; row  1 ..###########...
+        db $F8, $07, $00, $EE, $3F, $C0     ; row  2 .######.###.##..
+        db $F0, $0F, $00, $D4, $3F, $40     ; row  3 ######.#.#...#..
+        db $F0, $0C, $00, $6C, $1F, $A0     ; row  4 ##...##.##..#.#.
+        db $F0, $08, $00, $24, $1F, $A0     ; row  5 #.....#..#..#.#.
+        db $F0, $08, $00, $A4, $1F, $20     ; row  6 #...#.#..#....#.
+        db $F0, $09, $00, $22, $1F, $20     ; row  7 #..#..#...#...#.
+        db $F0, $08, $00, $21, $0F, $F0     ; row  8 #.....#....#####
+        db $F0, $0C, $00, $42, $0F, $10     ; row  9 ##...#....#....#
+        db $F0, $0B, $00, $85, $0F, $F0     ; row 10 #.###....#.#####
+        db $F0, $0D, $00, $54, $0F, $10     ; row 11 ##.#.#.#.#.....#
+        db $F8, $06, $00, $AA, $0F, $B0     ; row 12 .##.#.#.#.#.#.##
+        db $FC, $03, $00, $D5, $1F, $E0     ; row 13 ..####.#.#.####.
+        db $FE, $01, $00, $FF, $FF, $00     ; row 14 ...#########....
+        db $FF, $00, $01, $FE, $FF, $00     ; row 15 ....#######.....
 
 bird_sprite_f2:
-        db $F0, $0F, $0F, $F0           ; row  0  ....########....
-        db $C0, $3F, $07, $F8           ; row  1  ..###########...
-        db $80, $7E, $03, $EC           ; row  2  .######.###.##..
-        db $00, $FD, $03, $44           ; row  3  ######.#.#...#..
-        db $00, $C6, $01, $CA           ; row  4  ##...##.##..#.#.
-        db $00, $8A, $01, $4A           ; row  5  #...#.#..#..#.#.
-        db $00, $B2, $01, $42           ; row  6  #.##..#..#....#.
-        db $00, $C4, $01, $22           ; row  7  ##...#....#...#.
-        db $00, $B8, $00, $1F           ; row  8  #.###......#####
-        db $00, $80, $00, $21           ; row  9  #.........#....#
-        db $00, $A0, $00, $5F           ; row 10  #.#......#.#####
-        db $00, $D5, $00, $41           ; row 11  ##.#.#.#.#.....#
-        db $80, $6A, $00, $AB           ; row 12  .##.#.#.#.#.#.##
-        db $C0, $3D, $01, $5E           ; row 13  ..####.#.#.####.
-        db $E0, $1F, $0F, $F0           ; row 14  ...#########....
-        db $F0, $0F, $1F, $E0           ; row 15  ....#######.....
+        db $FF, $00, $00, $FF, $FF, $00     ; row  0 ....########....
+        db $FC, $03, $00, $FF, $7F, $80     ; row  1 ..###########...
+        db $F8, $07, $00, $EE, $3F, $C0     ; row  2 .######.###.##..
+        db $F0, $0F, $00, $D4, $3F, $40     ; row  3 ######.#.#...#..
+        db $F0, $0C, $00, $6C, $1F, $A0     ; row  4 ##...##.##..#.#.
+        db $F0, $08, $00, $A4, $1F, $A0     ; row  5 #...#.#..#..#.#.
+        db $F0, $0B, $00, $24, $1F, $20     ; row  6 #.##..#..#....#.
+        db $F0, $0C, $00, $42, $1F, $20     ; row  7 ##...#....#...#.
+        db $F0, $0B, $00, $81, $0F, $F0     ; row  8 #.###......#####
+        db $F0, $08, $00, $02, $0F, $10     ; row  9 #.........#....#
+        db $F0, $0A, $00, $05, $0F, $F0     ; row 10 #.#......#.#####
+        db $F0, $0D, $00, $54, $0F, $10     ; row 11 ##.#.#.#.#.....#
+        db $F8, $06, $00, $AA, $0F, $B0     ; row 12 .##.#.#.#.#.#.##
+        db $FC, $03, $00, $D5, $1F, $E0     ; row 13 ..####.#.#.####.
+        db $FE, $01, $00, $FF, $FF, $00     ; row 14 ...#########....
+        db $FF, $00, $01, $FE, $FF, $00     ; row 15 ....#######.....
 
 bird_sprite_f3:
-        db $F0, $0F, $0F, $F0           ; row  0  ....########....
-        db $C0, $3F, $07, $F8           ; row  1  ..###########...
-        db $80, $7E, $03, $EC           ; row  2  .######.###.##..
-        db $00, $FD, $03, $44           ; row  3  ######.#.#...#..
-        db $00, $C6, $01, $CA           ; row  4  ##...##.##..#.#.
-        db $00, $8A, $01, $4A           ; row  5  #...#.#..#..#.#.
-        db $00, $FC, $01, $42           ; row  6  ######...#....#.
-        db $00, $80, $01, $22           ; row  7  #.........#...#.
-        db $00, $80, $00, $1F           ; row  8  #..........#####
-        db $00, $80, $00, $21           ; row  9  #.........#....#
-        db $00, $A0, $00, $5F           ; row 10  #.#......#.#####
-        db $00, $D5, $00, $41           ; row 11  ##.#.#.#.#.....#
-        db $80, $6A, $00, $AB           ; row 12  .##.#.#.#.#.#.##
-        db $C0, $3D, $01, $5E           ; row 13  ..####.#.#.####.
-        db $E0, $1F, $0F, $F0           ; row 14  ...#########....
-        db $F0, $0F, $1F, $E0           ; row 15  ....#######.....
+        db $FF, $00, $00, $FF, $FF, $00     ; row  0 ....########....
+        db $FC, $03, $00, $FF, $7F, $80     ; row  1 ..###########...
+        db $F8, $07, $00, $EE, $3F, $C0     ; row  2 .######.###.##..
+        db $F0, $0F, $00, $D4, $3F, $40     ; row  3 ######.#.#...#..
+        db $F0, $0C, $00, $6C, $1F, $A0     ; row  4 ##...##.##..#.#.
+        db $F0, $08, $00, $A4, $1F, $A0     ; row  5 #...#.#..#..#.#.
+        db $F0, $0F, $00, $C4, $1F, $20     ; row  6 ######...#....#.
+        db $F0, $08, $00, $02, $1F, $20     ; row  7 #.........#...#.
+        db $F0, $08, $00, $01, $0F, $F0     ; row  8 #..........#####
+        db $F0, $08, $00, $02, $0F, $10     ; row  9 #.........#....#
+        db $F0, $0A, $00, $05, $0F, $F0     ; row 10 #.#......#.#####
+        db $F0, $0D, $00, $54, $0F, $10     ; row 11 ##.#.#.#.#.....#
+        db $F8, $06, $00, $AA, $0F, $B0     ; row 12 .##.#.#.#.#.#.##
+        db $FC, $03, $00, $D5, $1F, $E0     ; row 13 ..####.#.#.####.
+        db $FE, $01, $00, $FF, $FF, $00     ; row 14 ...#########....
+        db $FF, $00, $01, $FE, $FF, $00     ; row 15 ....#######.....
 
 ; Ground tiles — 8x8 pattern, 8 phases of horizontal scroll.
 ;   Row 0:    $FF — solid black top edge.
@@ -2474,9 +2456,10 @@ bird_attr_addr:
         add     hl, de
         ret
 
-; paint_bird_attrs: paint 2 char cells on the bird's centre char row —
-; col 8 = ATTR_BIRD (yellow paper), col 9 = ATTR_BIRD_R (white paper).
-; Together they form the "1 yellow + 1 white" backdrop for the sprite.
+; paint_bird_attrs: paint ONE char cell of yellow at col 8 of the char
+; row containing the bird's vertical centre. Sprite is centred at col 8 so
+; the colour-clash boundary is symmetric (4 px of sprite each side in cols
+; 7 and 9, which keep their cyan sky attr).
 paint_bird_attrs:
         ld      a, (bird_y + 1)
         add     a, 8                    ; +8 snaps to char row containing bird centre
@@ -2489,13 +2472,9 @@ paint_bird_attrs:
         ld      a, (hl)
         ld      (bird_attr_save), a
         ld      (hl), ATTR_BIRD
-        inc     hl
-        ld      a, (hl)
-        ld      (bird_attr_save + 1), a
-        ld      (hl), ATTR_BIRD_R
         ret
 
-; restore_bird_attrs: write both saved attr bytes back at bird_attr_y's row.
+; restore_bird_attrs: write saved attr byte back at bird_attr_y's row.
 restore_bird_attrs:
         ld      a, (bird_attr_valid)
         or      a
@@ -2503,9 +2482,6 @@ restore_bird_attrs:
         ld      a, (bird_attr_y)
         call    bird_attr_addr
         ld      a, (bird_attr_save)
-        ld      (hl), a
-        inc     hl
-        ld      a, (bird_attr_save + 1)
         ld      (hl), a
         ret
 
@@ -2553,11 +2529,10 @@ update_bird:
         ld      (bird_vy), hl
         ret
 
-; draw_bird: masked draw at fixed col BIRD_X=8. Sprite data is interleaved
-; 4 bytes/row: inv_maskL, spriteL, inv_maskR, spriteR. Per byte we do
-;   screen = (screen AND inv_mask) OR sprite
-; so the bird's body footprint is cleared to paper colour before the outline
-; is laid on top — pipe pixels behind the bird don't bleed through.
+; draw_bird: masked draw across 3 cells (cols 7, 8, 9). Sprite is pre-shifted
+; 4 px left so the 16-px-wide bird spans cols 7..9 with col 8 centred. Per
+; row we read 6 sprite bytes: mask_c7, sprite_c7, mask_c8, sprite_c8,
+; mask_c9, sprite_c9. Per cell: screen = (screen AND inv_mask) OR sprite.
 draw_bird:
         ld      a, (bird_y + 1)
         ld      (bird_old_y), a
@@ -2576,21 +2551,35 @@ draw_bird:
         ld      b, BIRD_LINES
 .lp:
         pop     hl
-        set     3, l                    ; HL → screen[col BIRD_X=8]
-        ld      a, (de)                 ; inv_maskL
+        ld      a, l
+        or      7                       ; bits 0..2 → col 7 (sprite starts here)
+        ld      l, a
+        ; col 7
+        ld      a, (de)
         and     (hl)
         ld      c, a
         inc     de
-        ld      a, (de)                 ; spriteL
+        ld      a, (de)
         or      c
         ld      (hl), a
         inc     de
-        inc     hl
-        ld      a, (de)                 ; inv_maskR
+        inc     hl                      ; → col 8
+        ; col 8
+        ld      a, (de)
         and     (hl)
         ld      c, a
         inc     de
-        ld      a, (de)                 ; spriteR
+        ld      a, (de)
+        or      c
+        ld      (hl), a
+        inc     de
+        inc     hl                      ; → col 9
+        ; col 9
+        ld      a, (de)
+        and     (hl)
+        ld      c, a
+        inc     de
+        ld      a, (de)
         or      c
         ld      (hl), a
         inc     de
@@ -2681,15 +2670,17 @@ restore_bird_bg:
         ld      (saved_sp), sp
         ld      sp, hl
         ld      b, BIRD_LINES
-        ; Unconditionally clear both bird cells. Pipes will re-stamp on the
-        ; following frame at any col they still cover — the compute_bird_overlap
-        ; skip wasn't catching every case where the new (denser) sprite's
-        ; pixels needed clearing, leaving the dotted trail.
+        ; Clear all 3 bird cells (cols 7, 8, 9). Pipes will re-stamp on the
+        ; following frame at any col they still cover.
 .lp:
         pop     hl
-        set     3, l                    ; HL → screen[col 8]
+        ld      a, l
+        or      7                       ; → col 7
+        ld      l, a
         ld      (hl), 0
-        inc     hl
+        inc     hl                      ; → col 8
+        ld      (hl), 0
+        inc     hl                      ; → col 9
         ld      (hl), 0
         djnz    .lp
         ld      sp, (saved_sp)
