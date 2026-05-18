@@ -112,9 +112,17 @@ main_loop:
         ld      a, (pending_regen)
         or      a
         call    nz, deferred_configure  ; run configure in CYAN (after raster, no race-the-beam)
+        ; Gap-clear countdown: configure sets it to 2 → this frame decs to 1
+        ; (no run) → next frame decs to 0 (RUN). One full frame separation
+        ; between configure and the heavy 12k-T clear keeps both under 70k.
         ld      a, (gap_clear_pending)
         or      a
-        call    nz, run_gap_clear       ; clear stale body bytes 1 frame after configure
+        jr      z, .no_gap_clear
+        dec     a
+        ld      (gap_clear_pending), a
+        or      a
+        call    z, run_gap_clear
+.no_gap_clear:
         ei
         jr      main_loop
 
@@ -207,11 +215,11 @@ patch_pending: db 0                      ; set by wrap_byte_x when byte_x change
 recycled_pipe_idx: db 0
 clear_pending: db 0                      ; set by wrap_byte_x; consumed by NEXT frame's
                                          ; top-blanking do_deferred_clears (pre-raster).
-gap_clear_pending: db 0                  ; set by configure_pipe_slots (= recycled_pipe_idx+1)
-                                         ; consumed by NEXT frame's CYAN region (clears stale
-                                         ; body bytes in the new gap region). Deferred 1 frame
-                                         ; past configure to keep the configure frame under
-                                         ; 70k T budget.
+gap_clear_pending: db 0                  ; countdown: 2 = set by configure, wait 1 frame
+                                         ;           1 = next-frame, runs run_gap_clear
+                                         ;           0 = idle
+                                         ; Deferred to keep the configure frame under budget.
+gap_clear_pipe_idx: db 0                 ; which pipe's gap to clear
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
@@ -1092,23 +1100,24 @@ configure_pipe_slots:
         ; itself (cols 4..27 × 50 new gap rows) is ~12k T-states; running it
         ; in the configure frame would push that frame from ~67k to ~79k,
         ; missing the halt. Defer to next frame's CYAN region (run_gap_clear).
-        ; The 1-frame delay means stale body bytes flash for 20ms before
-        ; clearing — far better than dropping to 25Hz.
+        ; gap_clear_pending = 2: main_loop will decrement to 1 this frame
+        ; (we're called from CYAN, same frame), then to 0 next frame → run.
         ld      a, (cps_pipe)
-        inc     a                               ; 1..3 = which pipe needs gap clear (0 = none)
+        ld      (gap_clear_pipe_idx), a
+        ld      a, 2
         ld      (gap_clear_pending), a
         ret
 
 ;----------------------------------------------------------------
 ; run_gap_clear: clear cols 4..27 of the cap-block rows for the pipe that
-; just recycled. Runs ONE FRAME after configure_pipe_slots, in main_loop's
+; just recycled. Runs the frame AFTER configure_pipe_slots, in main_loop's
 ; CYAN region. ~12k T-states.
 ;
-; Reads gap_clear_pending (= pipe_idx + 1). Clears it to 0 on exit.
+; Reads gap_clear_pipe_idx for which pipe.  Caller has already zeroed
+; gap_clear_pending; this routine only does the clear.
 ;----------------------------------------------------------------
 run_gap_clear:
-        ld      a, (gap_clear_pending)
-        dec     a                               ; A = pipe index (0..2)
+        ld      a, (gap_clear_pipe_idx)
         ; Look up that pipe's gap_y from pipe_state[pipe*2 + 1].
         add     a, a                            ; pipe * 2
         inc     a                               ; pipe * 2 + 1
@@ -1155,8 +1164,6 @@ run_gap_clear:
         inc     c
         djnz    .rgc_lp
         ld      sp, (cps_saved_sp)
-        xor     a
-        ld      (gap_clear_pending), a
         ret
 
 
