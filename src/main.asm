@@ -107,6 +107,8 @@ main_loop:
         call    advance_bird_anim
         call    draw_bird
         call    paint_bird_attrs
+        ld      a, 3                    ; PROFILE: MAGENTA = PIPE_PROGRAM
+        out     ($fe), a
         call    frame_update
         ld      a, 7                    ; PROFILE: WHITE = state prep
         out     ($fe), a
@@ -1503,11 +1505,10 @@ deferred_configure:
 
 ;----------------------------------------------------------------
 frame_update:
-        ; PIPE_PROGRAM runs FIRST to keep its head start over the raster.
-        ; Bird ops moved to main_loop's CYAN region (end of frame) so writes
-        ; land before next frame's raster — uniform 1-frame lag at all bird
-        ; positions, no flicker. PIPE_PROGRAM has full top-blanking head
-        ; start so the top rows render without tearing.
+        ; PIPE_PROGRAM runs FIRST (after the bird ops in main_loop's RED
+        ; top-blanking region). Bird writes already landed before the raster
+        ; reached row 0 → uniform 0-frame lag at every bird Y, no flicker.
+        ; PIPE_PROGRAM starts at T~5.6k with ~8k T head start over the raster.
         call    redraw_pipes_v2
         ld      a, 1                    ; PROFILE: BLUE = ground/score region
         out     ($fe), a
