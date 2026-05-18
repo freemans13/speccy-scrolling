@@ -1503,12 +1503,10 @@ deferred_configure:
 ;----------------------------------------------------------------
 frame_update:
         ; PIPE_PROGRAM runs FIRST to keep its head start over the raster.
-        ; Bird ops moved to main_loop's CYAN region (end of frame) — drawing
-        ; bird BEFORE pipes worked for the top-screen flicker but pushed
-        ; PIPE_PROGRAM behind raster on deferred-clear frames → tearing on
-        ; top rows. End-of-frame bird gives consistent 1-frame lag at all
-        ; bird positions (writes land before next frame's raster) — no
-        ; flicker (uniform lag) and no tearing (PIPE_PROGRAM has full lead).
+        ; Bird ops moved to main_loop's CYAN region (end of frame) so writes
+        ; land before next frame's raster — uniform 1-frame lag at all bird
+        ; positions, no flicker. PIPE_PROGRAM has full top-blanking head
+        ; start so the top rows render without tearing.
         call    redraw_pipes_v2
         ld      a, 1                    ; PROFILE: BLUE = ground/score region
         out     ($fe), a
@@ -1837,11 +1835,11 @@ wrap_byte_x:
         pop     bc
         ld      (iy+1), a
         ld      a, 3
-        ld      (pending_regen), a      ; 3-stage defer (3→2→1→run). Ensures the
-                                        ; configure frame doesn't coincide with the
-                                        ; clear frame, which would overrun 70 k T
-                                        ; budget (~10 k clears + 27 k frame_update
-                                        ; + 32 k configure = 69 k, no margin).
+        ld      (pending_regen), a      ; 3-stage defer (3→2→1→run). Configure
+                                        ; runs 3 frames after the wrap so the
+                                        ; ~32 k T configure cost lands on a frame
+                                        ; that doesn't also carry wrap-time
+                                        ; bookkeeping (patch_pipe_targets etc).
         ; Record which pipe recycled — B counts down from NUM_PIPES to 1, so index = NUM_PIPES - B.
         ld      a, NUM_PIPES
         sub     b
