@@ -36,7 +36,7 @@ SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= 
 ; The epilogue sits immediately after row 159's last slot so PIPE_PROGRAM
 ; falls straight through into `ld sp,(saved_sp) ; ret` with no NOP slide.
 SLOT_GRID_BASE         EQU $DB00
-SLOT_GRID_END          EQU SLOT_GRID_BASE + 160 * SLOT_ROW_STRIDE   ; Phase 1: $DB00 + 160*20 = $E380
+SLOT_GRID_END          EQU SLOT_GRID_BASE + 160 * SLOT_ROW_STRIDE   ; Phase 1: $DB00 + 160*20 = $E780
 PIPE_PROGRAM           EQU SLOT_GRID_BASE              ; entry point alias
 
 ; Phase 1: 1 EXX + 3 * 6-byte slots = 19 bytes/row; pad to 20 for fast row*20 indexing.
@@ -55,7 +55,7 @@ SLOT_STRIDE            EQU 6
 ;                                    word(cap_top_target), word(cap_bot_target))
 TEMPLATE_BASE          EQU $C000
 BODY_TEMPLATE          EQU TEMPLATE_BASE                  ; $C000..$C3BF (Phase 1: 160*6=960 bytes)
-CAP_BLOCK              EQU BODY_TEMPLATE + 960            ; Phase 1: 160 rows × 6 bytes/slot
+CAP_BLOCK              EQU BODY_TEMPLATE + 960            ; Phase 1: body=160*6=960 bytes → cap_block starts here
 CAP_TARGET_TABLE       EQU CAP_BLOCK + 300                ; Phase 1: 50 rows × 6 bytes/slot
 TEMPLATE_END           EQU CAP_TARGET_TABLE + 48
 
@@ -1403,7 +1403,7 @@ init_screen_target_table:
 ;----------------------------------------------------------------
 ; build_slot_templates — one-shot init builder for the template store.
 ; Walks line_table to populate:
-;   BODY_TEMPLATE:    160 rows × ($31, lo+32, hi, $D5, $C5) for byte_x=29
+;   BODY_TEMPLATE:    160 rows × ($31, lo+34, hi, $E5, $D5, $C5) for byte_x=29
 ;   CAP_BLOCK:         50 rows: cap_top stub, 48 skip rows, cap_bot stub
 ;   CAP_TARGET_TABLE:  12 (gap_y) entries × (cap_top_target, cap_bot_target)
 ;
@@ -2221,7 +2221,10 @@ redraw_pipes_v2:
         ld      bc, (body_b_bc)
         ld      de, (body_b_de)               ; B → main
         ; Save SP for the slot grid's epilogue (ld sp,(saved_sp); ret) to restore.
-        ld      hl, 0                   ; Phase 1: extra push HL writes trailing-zero pair per slot
+        ld      hl, 0                   ; Phase 1: trailing-zero pair — main bank HL = 0
+        exx
+        ld      hl, 0                   ; Phase 1: trailing-zero pair — shadow bank HL = 0
+        exx                             ; back to main (B-pattern active)
         ld      (saved_sp), sp
         call    PIPE_PROGRAM
         ret
