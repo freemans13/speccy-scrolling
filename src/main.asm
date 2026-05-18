@@ -126,11 +126,14 @@ main_loop:
         ; render phase the next frame will use. Saves ~2 k T from next
         ; frame's pre-PP block.
         call    update_cap_imm_v2
+        ; Phase 4: incrementally prepare pipe 3's slot column one step per frame.
+        ; prep_step runs in CYAN (post-raster, safe for SMC writes to PIPE_PROGRAM).
+        call    prep_step
         ld      a, (pending_regen)
         or      a
         call    nz, deferred_configure  ; run configure in CYAN (after raster, no race-the-beam)
         ; Phase 2: bird ops moved to top blanking. CYAN is now for
-        ; update_cap_imm_v2 (already above) and any background work.
+        ; update_cap_imm_v2, prep_step (Phase 4), and any background work.
         ei
         jr      main_loop
 
@@ -190,6 +193,14 @@ pending_regen: db 0                      ; set when a recycle happened; configur
 patch_pending: db 0                      ; set by wrap_byte_x when byte_x changed; cleared after patch_pipe_targets runs
 recycled_pipe_idx: db 0
 prep_pipe_idx:   db 3                  ; Phase 3: pipe 3 starts as the preparing column
+; Phase 4: incremental-prepare state machine variables.
+; prep_phase 0..6 = which configure sub-step we are on; 7 = done.
+; prep_row  0..N  = current row within the current phase (phases 0, 2 use rows;
+;                   phases 1 uses rows into cap range; phase 6 uses entry index).
+; prep_gap_y      = gap_y for pipe 3 (set at game start from pipe_state[3*2+1]).
+prep_phase:      db 0
+prep_row:        db 0
+prep_gap_y:      db 8
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
@@ -1480,6 +1491,24 @@ init_pipes:
         ; PIPE_PROGRAM execution. Phase 4/5 will activate pipe 3 properly.)
         ld      hl, 336
         ld      (ACTIVE_COUNT_NEW), hl
+
+        ; Phase 4: initialise prep state machine. prep_step will prepare pipe 3's
+        ; slot column incrementally over the next ~112 frames, starting from phase 0.
+        ; prep_gap_y is taken from pipe_state[3*2+1] (gap_y of pipe 3 at init).
+        xor     a
+        ld      (prep_phase), a
+        ld      (prep_row), a
+        ld      a, (pipe_state + 3*2 + 1)
+        ld      (prep_gap_y), a
+        ; Also initialise ps_cap_top_row/ps_cap_bot_row so phase 5 can use them
+        ; (they're set during phase 3, but init them to valid values for safety).
+        ld      a, (prep_gap_y)
+        dec     a
+        ld      (ps_cap_top_row), a
+        ld      a, (prep_gap_y)
+        add     a, PIPE_GAP
+        ld      (ps_cap_bot_row), a
+
         call    update_cap_imm_v2       ; init cap imms for phase 0 (first render)
         call    redraw_pipes_v2
         ret
@@ -1523,6 +1552,412 @@ deferred_configure:
         xor     a
         ld      (pending_regen), a
         ret
+
+;----------------------------------------------------------------
+; ps_slot_addr_for_row — compute slot[row][3] address for pipe 3.
+; In:  A = row (0..159)
+; Out: HL = slot[row][3] = SLOT_GRID_BASE + 1 + row*32 + 3*SLOT_STRIDE
+; Clobbers: DE, HL.
+;----------------------------------------------------------------
+ps_slot_addr_for_row:
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; row*2
+        add     hl, hl                          ; row*4
+        add     hl, hl                          ; row*8
+        add     hl, hl                          ; row*16
+        add     hl, hl                          ; row*32
+        ld      de, SLOT_GRID_BASE + 1 + 3*SLOT_STRIDE
+        add     hl, de                          ; HL = slot[row][3]
+        ret
+
+;----------------------------------------------------------------
+; prep_step — Phase 4 incremental-prepare state machine.
+;
+; Called from main_loop's CYAN region each frame. Each call does a
+; small slice of work (~200-300 T) that together amounts to one full
+; configure_pipe_slots invocation for pipe 3. Spread across ~112
+; frames → ~270 T/frame overhead, eliminating the ~30 k T recycle spike.
+;
+; State bytes: prep_phase (0..7), prep_row (row cursor),
+;              prep_gap_y (gap_y for pipe 3).
+;
+; Phase 0: stamp body (ROM target $0000) at rows [0..cap_top_row-1]. 5 rows/call.
+; Phase 1: stamp all-NOP at cap range rows [cap_top_row..cap_bot_row]. 5 rows/call.
+; Phase 2: stamp body (ROM target $0000) at rows [cap_bot_row+1..159]. 5 rows/call.
+; Phase 3: one-shot — patch $C3+handler addr into cap_top and cap_bot slots.
+; Phase 4: one-shot — patch cap handler target imms from CAP_TARGET_TABLE.
+; Phase 5: one-shot — patch cap handler _next imms via compute_next_slot.
+; Phase 6: one-shot — build ACTIVE_PIPE_3 sublist via SP-hijack (~4.2k T).
+; Phase 7: done — immediate return.
+;
+; Pipe-3 body slots use target=$0000 (ROM). Writes via ld sp,$0000; push land
+; in ROM → silent. Pipe 3 is NOT in patch_pipe_targets' walk list
+; (ACTIVE_COUNT_NEW = 336 = 3×112), so ROM target bytes stay at $0000.
+;
+; Cap slots stay all-NOP until phase 3, so no accidental JP until fully armed.
+;
+; Clobbers: AF, BC, DE, HL.
+; ps_saved_sp saves real SP across SP-hijack in phase 6.
+;----------------------------------------------------------------
+prep_step:
+        ld      a, (prep_phase)
+        or      a
+        jp      z, ps_phase0
+        cp      1
+        jp      z, ps_phase1
+        cp      2
+        jp      z, ps_phase2
+        cp      3
+        jp      z, ps_phase3
+        cp      4
+        jp      z, ps_phase4
+        cp      5
+        jp      z, ps_phase5
+        cp      6
+        jp      z, ps_phase6
+        ; phase 7 = done
+        ret
+
+; ─── Phase 0: body rows [0 .. cap_top_row-1], 5 rows/call ────────────────────
+ps_phase0:
+        ; cap_top_row = prep_gap_y - 1
+        ld      a, (prep_gap_y)
+        dec     a                               ; A = cap_top_row
+        ld      b, a                            ; B = cap_top_row
+        ld      a, (prep_row)
+        ld      c, a                            ; C = current prep_row
+        ld      a, b
+        sub     c                               ; A = rows remaining
+        jr      z, .p0_advance
+        jr      c, .p0_advance                  ; safety: overshot
+        cp      5
+        jr      c, .p0_rows_set
+        ld      a, 5
+.p0_rows_set:
+        ld      (ps_count), a                   ; save count for prep_row update
+        ld      b, a                            ; B = loop counter
+        ld      a, c                            ; A = actual row = prep_row (band1 starts at 0)
+        call    ps_slot_addr_for_row            ; HL = slot[prep_row][3]
+        ex      de, hl                          ; DE = slot addr for inc de usage
+.p0_lp:
+        ; Write: $31 $00 $00 $E5 $D5 $C5  (ld sp,$0000; push hl; push de; push bc)
+        ld      a, $31
+        ld      (de), a
+        inc     de
+        xor     a
+        ld      (de), a                         ; target.lo = $00 (ROM)
+        inc     de
+        ld      (de), a                         ; target.hi = $00 (ROM)
+        inc     de
+        ld      a, $E5
+        ld      (de), a                         ; push hl
+        inc     de
+        ld      a, $D5
+        ld      (de), a                         ; push de
+        inc     de
+        ld      a, $C5
+        ld      (de), a                         ; push bc
+        inc     de
+        ; advance DE to next row's pipe-3 slot: +26 bytes
+        ld      hl, SLOT_ROW_STRIDE - SLOT_STRIDE
+        add     hl, de
+        ex      de, hl
+        djnz    .p0_lp
+        ; prep_row += count
+        ld      a, (prep_row)
+        ld      b, a
+        ld      a, (ps_count)
+        add     a, b
+        ld      (prep_row), a
+        ret
+.p0_advance:
+        xor     a
+        ld      (prep_row), a
+        ld      a, 1
+        ld      (prep_phase), a
+        ret
+
+; ─── Phase 1: NOP-fill cap range [cap_top_row..cap_bot_row], 5 rows/call ─────
+; prep_row = 0..49 (offset within 50-row cap block)
+ps_phase1:
+        ld      a, (prep_row)
+        ld      c, a                            ; C = prep_row (offset in cap block)
+        ld      a, 50
+        sub     c                               ; A = remaining rows in cap block
+        jr      z, .p1_advance
+        jr      c, .p1_advance
+        cp      5
+        jr      c, .p1_rows_set
+        ld      a, 5
+.p1_rows_set:
+        ld      (ps_count), a
+        ld      b, a                            ; B = loop counter
+        ; actual row = cap_top_row + prep_row = (prep_gap_y - 1) + C
+        ld      a, (prep_gap_y)
+        dec     a                               ; A = cap_top_row
+        add     a, c                            ; A = cap_top_row + prep_row
+        call    ps_slot_addr_for_row            ; HL = slot[actual_row][3]
+        ex      de, hl
+.p1_lp:
+        xor     a
+        ld      (de), a                         ; NOP byte 0
+        inc     de
+        ld      (de), a                         ; NOP byte 1
+        inc     de
+        ld      (de), a                         ; NOP byte 2
+        inc     de
+        ld      (de), a                         ; NOP byte 3
+        inc     de
+        ld      (de), a                         ; NOP byte 4
+        inc     de
+        ld      (de), a                         ; NOP byte 5
+        inc     de
+        ld      hl, SLOT_ROW_STRIDE - SLOT_STRIDE
+        add     hl, de
+        ex      de, hl
+        djnz    .p1_lp
+        ld      a, (prep_row)
+        ld      b, a
+        ld      a, (ps_count)
+        add     a, b
+        ld      (prep_row), a
+        ret
+.p1_advance:
+        xor     a
+        ld      (prep_row), a
+        ld      a, 2
+        ld      (prep_phase), a
+        ret
+
+; ─── Phase 2: body rows [cap_bot_row+1..159], 5 rows/call ────────────────────
+; prep_row = 0..M-1 where M = 111 - prep_gap_y
+ps_phase2:
+        ; total M = 111 - prep_gap_y
+        ld      a, (prep_gap_y)
+        ld      c, a
+        ld      a, 111
+        sub     c                               ; A = M (total rows in band2)
+        ld      b, a                            ; B = M
+        ld      a, (prep_row)
+        ld      c, a                            ; C = prep_row
+        ld      a, b
+        sub     c                               ; A = remaining rows
+        jr      z, .p2_advance
+        jr      c, .p2_advance                  ; safety
+        cp      5
+        jr      c, .p2_rows_set
+        ld      a, 5
+.p2_rows_set:
+        ld      (ps_count), a
+        ld      b, a                            ; B = loop counter
+        ; actual row = cap_bot_row + 1 + prep_row = (prep_gap_y + PIPE_GAP + 1) + C
+        ld      a, (prep_gap_y)
+        add     a, PIPE_GAP + 1                 ; A = cap_bot_row + 1
+        add     a, c                            ; A += prep_row
+        call    ps_slot_addr_for_row            ; HL = slot[actual_row][3]
+        ex      de, hl
+.p2_lp:
+        ld      a, $31
+        ld      (de), a
+        inc     de
+        xor     a
+        ld      (de), a                         ; target.lo = $00
+        inc     de
+        ld      (de), a                         ; target.hi = $00
+        inc     de
+        ld      a, $E5
+        ld      (de), a
+        inc     de
+        ld      a, $D5
+        ld      (de), a
+        inc     de
+        ld      a, $C5
+        ld      (de), a
+        inc     de
+        ld      hl, SLOT_ROW_STRIDE - SLOT_STRIDE
+        add     hl, de
+        ex      de, hl
+        djnz    .p2_lp
+        ld      a, (prep_row)
+        ld      b, a
+        ld      a, (ps_count)
+        add     a, b
+        ld      (prep_row), a
+        ret
+.p2_advance:
+        xor     a
+        ld      (prep_row), a
+        ld      a, 3
+        ld      (prep_phase), a
+        ret
+
+; ─── Phase 3: one-shot — compute cap_top_row, cap_bot_row; store in scratch ──
+; NOTE: Phase 3 does NOT write $C3 into the cap slots. Cap slots remain all-NOP
+; (safe, no JP fires) throughout Phase 4. Phase 5 (implementation) swap will
+; atomically write $C3 + handler + target + _next when activating pipe 3.
+; This prevents cap handler execution with uninitialized _target/$0000 SP, which
+; would corrupt the top of RAM stack area.
+ps_phase3:
+        ; ps_cap_top_row = prep_gap_y - 1
+        ld      a, (prep_gap_y)
+        dec     a
+        ld      (ps_cap_top_row), a
+        ; ps_cap_bot_row = prep_gap_y + PIPE_GAP
+        ld      a, (prep_gap_y)
+        add     a, PIPE_GAP
+        ld      (ps_cap_bot_row), a
+
+        ld      a, 4
+        ld      (prep_phase), a
+        ret
+
+; ─── Phase 4: one-shot — pre-compute cap target imms (stored in ps_*) ────────
+; Phase 4 does NOT write the real screen addresses into the cap handlers yet,
+; because that would cause cap handlers to fire and write outside-screen bytes
+; every PIPE_PROGRAM frame until Phase 5 swap. Instead, store the computed
+; targets in scratch bytes; Phase 5 swap will use them when activating pipe 3.
+; Cap handler targets remain at $0000 (ROM, silent writes) until Phase 5.
+ps_phase4:
+        ; Entry index = prep_gap_y/8 - 1; each entry is 4 bytes
+        ld      a, (prep_gap_y)
+        rrca
+        rrca
+        rrca                                    ; A = prep_gap_y / 8
+        and     $0F
+        dec     a                               ; A = index (0..11)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl                          ; index * 4
+        ld      de, CAP_TARGET_TABLE
+        add     hl, de                          ; HL → entry[0]
+
+        ; Read cap_top_target (entry[0..1]) into ps_cap_top_target scratch
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        inc     hl
+        ld      a, e
+        ld      (ps_cap_top_target), a
+        ld      a, d
+        ld      (ps_cap_top_target + 1), a
+
+        ; Read cap_bot_target (entry[2..3]) into ps_cap_bot_target scratch
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      a, e
+        ld      (ps_cap_bot_target), a
+        ld      a, d
+        ld      (ps_cap_bot_target + 1), a
+
+        ; Cap handler targets remain $0000 (ROM) — Phase 5 swap will set them.
+        ; Targets at $0000 mean cap writes go to ROM = silent, no screen corruption.
+
+        ld      a, 5
+        ld      (prep_phase), a
+        ret
+
+; ─── Phase 5: one-shot — pre-compute cap _next values; stored in scratch ─────
+; Like phase 4, does NOT write to handlers yet. Cap slots remain all-NOP.
+; ps_cap_top_next / ps_cap_bot_next hold the computed values; Phase 5
+; (implementation) swap will write them to handlers when activating pipe 3.
+ps_phase5:
+        ; compute_next_slot reads cps_pipe — set to 3
+        ld      a, 3
+        ld      (cps_pipe), a
+
+        ld      a, (ps_cap_top_row)
+        call    compute_next_slot               ; HL = next slot addr
+        ld      a, l
+        ld      (ps_cap_top_next), a
+        ld      a, h
+        ld      (ps_cap_top_next + 1), a
+
+        ld      a, (ps_cap_bot_row)
+        call    compute_next_slot
+        ld      a, l
+        ld      (ps_cap_bot_next), a
+        ld      a, h
+        ld      (ps_cap_bot_next + 1), a
+
+        ld      a, 6
+        ld      (prep_phase), a
+        ret
+
+; ─── Phase 6: one-shot — build ACTIVE_PIPE_3 sublist (~4.2k T) ───────────────
+; Mirrors configure_pipe_slots Step 6 for pipe 3. One-shot since the SP-hijack
+; push-loop can't easily resume mid-list, and 4.2k T is safe as a one-shot.
+ps_phase6:
+        ld      (ps_saved_sp), sp
+
+        ld      hl, ACTIVE_PIPE_3 + 224
+        ld      sp, hl                          ; SP = end of list
+
+        ld      de, $FFE0                       ; DE = -32 (backward one row)
+
+        ; Band 2: M = 111 - prep_gap_y entries (rows cap_bot_row+1..159, reversed)
+        ld      a, (prep_gap_y)
+        ld      c, a
+        ld      a, 111
+        sub     c                               ; A = M
+        jr      z, .act_b2_done
+        jr      c, .act_b2_done
+        ld      b, a                            ; B = M counter
+        ld      hl, SLOT_GRID_BASE + 2 + 160*32 + 3*SLOT_STRIDE
+.act_b2_lp:
+        add     hl, de                          ; HL -= 32
+        push    hl
+        djnz    .act_b2_lp
+.act_b2_done:
+
+        ; cap_bot entry
+        ld      hl, cap_bot_handler_pipe_3_target
+        push    hl
+
+        ; cap_top entry
+        ld      hl, cap_top_handler_pipe_3_target
+        push    hl
+
+        ; Band 1: N = cap_top_row = prep_gap_y - 1 entries
+        ld      a, (prep_gap_y)
+        dec     a                               ; A = N = cap_top_row
+        jr      z, .act_b1_done
+        ld      b, a
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; N * 32
+        ld      de, SLOT_GRID_BASE + 2 + 3*SLOT_STRIDE
+        add     hl, de                          ; HL = slot[N][3]+1
+        ld      de, $FFE0                       ; restore DE = -32
+.act_b1_lp:
+        add     hl, de
+        push    hl
+        djnz    .act_b1_lp
+.act_b1_done:
+
+        ld      sp, (ps_saved_sp)
+        ld      a, 7
+        ld      (prep_phase), a
+        ret
+
+; ── Scratch for prep_step ────────────────────────────────────────
+ps_cap_top_row:    db 0
+ps_cap_bot_row:    db 0
+ps_saved_sp:       dw 0
+ps_count:          db 0                ; row count saved across djnz for prep_row update
+; Pre-computed cap targets (from prep_step phase 4) and _next addrs (phase 5).
+; Phase 5 (implementation) swap writes these to the cap handlers when activating
+; pipe 3. Until then, cap handlers have $0000 targets (ROM writes = silent).
+ps_cap_top_target: dw 0
+ps_cap_bot_target: dw 0
+ps_cap_top_next:   dw 0
+ps_cap_bot_next:   dw 0
 
 ;----------------------------------------------------------------
 frame_update:
