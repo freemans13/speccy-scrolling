@@ -1571,11 +1571,13 @@ deferred_configure:
 
 ;----------------------------------------------------------------
 frame_update:
-        ; ── Pipes go FIRST so X_0 is as low as possible. Skipped the magenta
-        ; OUT-($fe) — saved 18 T-st of lead-time over the raster. The border
-        ; band that used to mark "pipes phase" is gone; what was BLUE for
-        ; restore-bird-bg now spans the full pipes+restore region. Worth it.
-        call    redraw_pipes_v2
+        ; ── Bird FIRST so the writes happen during top blanking (before
+        ; raster reaches row 0). Otherwise, when the bird is at the top of
+        ; the screen, draw_bird runs AFTER raster has already scanned those
+        ; rows → bird only becomes visible next frame → visible flicker
+        ; between "previous-frame bird position" and "current restore-cleared
+        ; old position". Trade-off: when a pipe overlaps the bird's cols 7-9,
+        ; PIPE_PROGRAM stamps body over the bird at the overlap (pipe-in-front).
         ld      a, 1                    ; PROFILE: BLUE = bird ops region
         out     ($fe), a
         call    restore_bird_bg
@@ -1585,6 +1587,7 @@ frame_update:
         call    advance_bird_anim
         call    draw_bird
         call    paint_bird_attrs
+        call    redraw_pipes_v2
         call    update_score
         ld      a, 4                    ; PROFILE: GREEN = ground
         out     ($fe), a
