@@ -272,7 +272,14 @@ bird_attr_y:        db 0
 bird_attr_valid:    db 0
 bird_attr_save:     ds 2                ; [0]=col 8 (yellow), [1]=col 9 (white)
 
-BIRD_FRAME_BYTES    EQU 64              ; 16 rows × (mask + sprite) × 2 cols
+; Bird wing animation — 4 frames cycling 0→1→2→3→0, one phase step every
+; BIRD_ANIM_RATE frames. bird_sprite_ptr always points at the current
+; frame's data; draw_bird reads it instead of a fixed label.
+BIRD_ANIM_RATE      EQU 4
+BIRD_FRAME_BYTES    EQU 64              ; 16 rows × 4 bytes/row
+bird_anim_tick:     db 0
+bird_anim_phase:    db 0
+bird_sprite_ptr:    dw bird_sprite_f0
 
 ; Bird sprite — black ink drawing, exported from Piskel (bird-shaded.piskel).
 ; The PNG layer is a clean 16×16 binary mask: black ink + transparent. Per-row
@@ -302,7 +309,7 @@ BIRD_FRAME_BYTES    EQU 64              ; 16 rows × (mask + sprite) × 2 cols
 ; inv_mask = 0 inside the row's silhouette (clear bg, then OR sprite ink),
 ; inv_mask = 1 outside (keep bg = sky / pipe pixels show through).
 
-bird_sprite:
+bird_sprite_f0:
         db $F0, $0F, $0F, $F0           ; row  0  ....########....
         db $C0, $3F, $07, $F8           ; row  1  ..###########...
         db $80, $7E, $03, $EC           ; row  2  .######.###.##..
@@ -316,6 +323,60 @@ bird_sprite:
         db $00, $82, $00, $5F           ; row 10  #.....#..#.#####
         db $00, $C5, $00, $41           ; row 11  ##...#.#.#.....#
         db $80, $7E, $00, $AB           ; row 12  .######.#.#.#.##
+        db $C0, $3D, $01, $5E           ; row 13  ..####.#.#.####.
+        db $E0, $1F, $0F, $F0           ; row 14  ...#########....
+        db $F0, $0F, $1F, $E0           ; row 15  ....#######.....
+
+bird_sprite_f1:
+        db $F0, $0F, $0F, $F0           ; row  0  ....########....
+        db $C0, $3F, $07, $F8           ; row  1  ..###########...
+        db $80, $7E, $03, $EC           ; row  2  .######.###.##..
+        db $00, $FD, $03, $44           ; row  3  ######.#.#...#..
+        db $00, $C6, $01, $CA           ; row  4  ##...##.##..#.#.
+        db $00, $82, $01, $4A           ; row  5  #.....#..#..#.#.
+        db $00, $8A, $01, $42           ; row  6  #...#.#..#....#.
+        db $00, $92, $01, $22           ; row  7  #..#..#...#...#.
+        db $00, $82, $00, $1F           ; row  8  #.....#....#####
+        db $00, $C4, $00, $21           ; row  9  ##...#....#....#
+        db $00, $B8, $00, $5F           ; row 10  #.###....#.#####
+        db $00, $D5, $00, $41           ; row 11  ##.#.#.#.#.....#
+        db $80, $6A, $00, $AB           ; row 12  .##.#.#.#.#.#.##
+        db $C0, $3D, $01, $5E           ; row 13  ..####.#.#.####.
+        db $E0, $1F, $0F, $F0           ; row 14  ...#########....
+        db $F0, $0F, $1F, $E0           ; row 15  ....#######.....
+
+bird_sprite_f2:
+        db $F0, $0F, $0F, $F0           ; row  0  ....########....
+        db $C0, $3F, $07, $F8           ; row  1  ..###########...
+        db $80, $7E, $03, $EC           ; row  2  .######.###.##..
+        db $00, $FD, $03, $44           ; row  3  ######.#.#...#..
+        db $00, $C6, $01, $CA           ; row  4  ##...##.##..#.#.
+        db $00, $8A, $01, $4A           ; row  5  #...#.#..#..#.#.
+        db $00, $B2, $01, $42           ; row  6  #.##..#..#....#.
+        db $00, $C4, $01, $22           ; row  7  ##...#....#...#.
+        db $00, $B8, $00, $1F           ; row  8  #.###......#####
+        db $00, $80, $00, $21           ; row  9  #.........#....#
+        db $00, $A0, $00, $5F           ; row 10  #.#......#.#####
+        db $00, $D5, $00, $41           ; row 11  ##.#.#.#.#.....#
+        db $80, $6A, $00, $AB           ; row 12  .##.#.#.#.#.#.##
+        db $C0, $3D, $01, $5E           ; row 13  ..####.#.#.####.
+        db $E0, $1F, $0F, $F0           ; row 14  ...#########....
+        db $F0, $0F, $1F, $E0           ; row 15  ....#######.....
+
+bird_sprite_f3:
+        db $F0, $0F, $0F, $F0           ; row  0  ....########....
+        db $C0, $3F, $07, $F8           ; row  1  ..###########...
+        db $80, $7E, $03, $EC           ; row  2  .######.###.##..
+        db $00, $FD, $03, $44           ; row  3  ######.#.#...#..
+        db $00, $C6, $01, $CA           ; row  4  ##...##.##..#.#.
+        db $00, $8A, $01, $4A           ; row  5  #...#.#..#..#.#.
+        db $00, $FC, $01, $42           ; row  6  ######...#....#.
+        db $00, $80, $01, $22           ; row  7  #.........#...#.
+        db $00, $80, $00, $1F           ; row  8  #..........#####
+        db $00, $80, $00, $21           ; row  9  #.........#....#
+        db $00, $A0, $00, $5F           ; row 10  #.#......#.#####
+        db $00, $D5, $00, $41           ; row 11  ##.#.#.#.#.....#
+        db $80, $6A, $00, $AB           ; row 12  .##.#.#.#.#.#.##
         db $C0, $3D, $01, $5E           ; row 13  ..####.#.#.####.
         db $E0, $1F, $0F, $F0           ; row 14  ...#########....
         db $F0, $0F, $1F, $E0           ; row 15  ....#######.....
@@ -1477,6 +1538,7 @@ frame_update:
         call    restore_bird_attrs
         call    read_input
         call    update_bird
+        call    advance_bird_anim
         call    draw_bird
         call    paint_bird_attrs
         call    update_score
@@ -2216,6 +2278,41 @@ init_bird:
         xor     a
         ld      (bird_old_y_valid), a
         ld      (bird_attr_valid), a
+        ld      (bird_anim_tick), a
+        ld      (bird_anim_phase), a
+        ld      hl, bird_sprite_f0
+        ld      (bird_sprite_ptr), hl
+        ret
+
+; advance_bird_anim: every BIRD_ANIM_RATE frames, advance phase 0→1→2→3→0
+; and refresh bird_sprite_ptr. Called once per frame from frame_update.
+advance_bird_anim:
+        ld      hl, bird_anim_tick
+        ld      a, (hl)
+        inc     a
+        cp      BIRD_ANIM_RATE
+        jr      c, .store_tick
+        xor     a                       ; tick wraps to 0
+        ld      (hl), a
+        ld      a, (bird_anim_phase)
+        inc     a
+        and     3                       ; 4-frame cycle 0..3
+        ld      (bird_anim_phase), a
+        ; ptr = bird_sprite_f0 + phase * BIRD_FRAME_BYTES (=64)
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                  ; HL = phase * 64
+        ld      de, bird_sprite_f0
+        add     hl, de
+        ld      (bird_sprite_ptr), hl
+        ret
+.store_tick:
+        ld      (hl), a
         ret
 
 ;----------------------------------------------------------------
@@ -2458,7 +2555,7 @@ draw_bird:
         add     hl, de
         ld      (saved_sp), sp
         ld      sp, hl
-        ld      de, bird_sprite
+        ld      de, (bird_sprite_ptr)
         ld      b, BIRD_LINES
 .lp:
         pop     hl
