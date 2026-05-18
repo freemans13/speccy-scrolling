@@ -1037,6 +1037,49 @@ configure_pipe_slots:
         ld      a, (cps_gap_y)
         ld      (hl), a
 
+        ; ─── Step 8: clear stale body pixels in the new gap region.
+        ; When a pipe recycles to a new gap_y, rows that USED to be body
+        ; (in an earlier gap_y) may have body bytes still on screen — the
+        ; trailing-col clear in clear_pipe_col only iterates the CURRENT body
+        ; rows, so any row that just transitioned body→gap keeps its stale
+        ; body bytes forever. Wipe cols 4..27 of the 50 cap-block rows.
+        ld      (cps_saved_sp), sp
+        ld      de, 0                           ; sky byte pair for stack-blast
+        ld      a, (cps_cap_top_row)
+        ld      c, a                            ; C = current row (cap_top_row..cap_bot_row)
+        ld      b, 50                           ; 50 rows in cap block
+.cps_clr_gap_lp:
+        ld      sp, (cps_saved_sp)              ; reset SP before any push bc
+        push    bc                              ; preserve row + counter
+        ld      h, 0
+        ld      l, c
+        add     hl, hl                          ; row * 2
+        ld      bc, line_table
+        add     hl, bc
+        ld      c, (hl)
+        inc     hl
+        ld      h, (hl)
+        ld      l, c                            ; HL = line_addr
+        ld      bc, 28
+        add     hl, bc                          ; HL = line_addr + 28 (one past last visible col)
+        pop     bc                              ; restore row + counter
+        ld      sp, hl
+        push    de                              ; 12 pushes × 2 bytes = 24 bytes (cols 4..27)
+        push    de
+        push    de
+        push    de
+        push    de
+        push    de
+        push    de
+        push    de
+        push    de
+        push    de
+        push    de
+        push    de
+        inc     c
+        djnz    .cps_clr_gap_lp
+        ld      sp, (cps_saved_sp)
+
         ret
 
 
