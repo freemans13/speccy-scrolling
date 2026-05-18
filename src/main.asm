@@ -2284,9 +2284,26 @@ init_bird:
         ld      (bird_sprite_ptr), hl
         ret
 
-; advance_bird_anim: every BIRD_ANIM_RATE frames, advance phase 0→1→2→3→0
-; and refresh bird_sprite_ptr. Called once per frame from frame_update.
+; advance_bird_anim: wing flap state machine.
+;   - Bird falling (vy >= 0):  freeze on bird_sprite_f3 (wings fully spread,
+;                              gliding pose). Reset tick/phase so the next
+;                              flap restarts the cycle at f0.
+;   - Bird rising  (vy <  0):  cycle phase 0→1→2→3→0 every BIRD_ANIM_RATE
+;                              frames. Real birds only flap on the up-stroke.
 advance_bird_anim:
+        ld      a, (bird_vy + 1)
+        bit     7, a
+        jr      nz, .rising
+
+        ; Falling: lock to f3 (wings spread).
+        xor     a
+        ld      (bird_anim_tick), a
+        ld      (bird_anim_phase), a
+        ld      hl, bird_sprite_f3
+        ld      (bird_sprite_ptr), hl
+        ret
+
+.rising:
         ld      hl, bird_anim_tick
         ld      a, (hl)
         inc     a
