@@ -123,6 +123,18 @@ main_loop:
         or      a
         call    z, run_gap_clear
 .no_gap_clear:
+        ; Bird ops in CYAN (= end of frame, after raster has scanned visible
+        ; area). Writes land BEFORE next frame's raster reaches them → bird
+        ; visible at correct position next frame, with consistent 1-frame
+        ; lag at every Y. Keeps PIPE_PROGRAM's head start intact so the top
+        ; rows render without tearing.
+        call    restore_bird_bg
+        call    restore_bird_attrs
+        call    read_input
+        call    update_bird
+        call    advance_bird_anim
+        call    draw_bird
+        call    paint_bird_attrs
         ei
         jr      main_loop
 
@@ -1571,23 +1583,16 @@ deferred_configure:
 
 ;----------------------------------------------------------------
 frame_update:
-        ; ── Bird FIRST so the writes happen during top blanking (before
-        ; raster reaches row 0). Otherwise, when the bird is at the top of
-        ; the screen, draw_bird runs AFTER raster has already scanned those
-        ; rows → bird only becomes visible next frame → visible flicker
-        ; between "previous-frame bird position" and "current restore-cleared
-        ; old position". Trade-off: when a pipe overlaps the bird's cols 7-9,
-        ; PIPE_PROGRAM stamps body over the bird at the overlap (pipe-in-front).
-        ld      a, 1                    ; PROFILE: BLUE = bird ops region
-        out     ($fe), a
-        call    restore_bird_bg
-        call    restore_bird_attrs
-        call    read_input
-        call    update_bird
-        call    advance_bird_anim
-        call    draw_bird
-        call    paint_bird_attrs
+        ; PIPE_PROGRAM runs FIRST to keep its head start over the raster.
+        ; Bird ops moved to main_loop's CYAN region (end of frame) — drawing
+        ; bird BEFORE pipes worked for the top-screen flicker but pushed
+        ; PIPE_PROGRAM behind raster on deferred-clear frames → tearing on
+        ; top rows. End-of-frame bird gives consistent 1-frame lag at all
+        ; bird positions (writes land before next frame's raster) — no
+        ; flicker (uniform lag) and no tearing (PIPE_PROGRAM has full lead).
         call    redraw_pipes_v2
+        ld      a, 1                    ; PROFILE: BLUE = ground/score region
+        out     ($fe), a
         call    update_score
         ld      a, 4                    ; PROFILE: GREEN = ground
         out     ($fe), a
