@@ -96,12 +96,6 @@ main_loop:
         di
         ld      a, 2                    ; PROFILE: RED = top blanking work + render
         out     ($fe), a
-        ; clear_pipe_col deferred from previous frame's wrap_byte_x. Running
-        ; here in TOP BLANKING (pre-raster) means the writes finish before
-        ; the raster starts scanning the visible area — no race-the-beam.
-        ld      a, (clear_pending)
-        or      a
-        call    nz, do_deferred_clears
         call    frame_update
         ld      a, 7                    ; PROFILE: WHITE = state prep
         out     ($fe), a
@@ -116,17 +110,6 @@ main_loop:
         ld      a, (pending_regen)
         or      a
         call    nz, deferred_configure  ; run configure in CYAN (after raster, no race-the-beam)
-        ; Gap-clear countdown: configure sets it to 2 → this frame decs to 1
-        ; (no run) → next frame decs to 0 (RUN). One full frame separation
-        ; between configure and the heavy 12k-T clear keeps both under 70k.
-        ld      a, (gap_clear_pending)
-        or      a
-        jr      z, .no_gap_clear
-        dec     a
-        ld      (gap_clear_pending), a
-        or      a
-        call    z, run_gap_clear
-.no_gap_clear:
         ; Bird ops in CYAN (= end of frame, after raster has scanned visible
         ; area). Writes land BEFORE next frame's raster reaches them → bird
         ; visible at correct position next frame, with consistent 1-frame
@@ -141,39 +124,6 @@ main_loop:
         call    paint_bird_attrs
         ei
         jr      main_loop
-
-;----------------------------------------------------------------
-; do_deferred_clears: walks pipe_state and clears each pipe's OLD R col
-; (= byte_x + 3 since wrap_byte_x has already dec'd byte_x). Runs in
-; TOP BLANKING — pre-raster — so the writes are visible from the very
-; first line of the visible scan. PIPE_PROGRAM then renders at the NEW
-; byte_x position (slot targets were patched in previous frame's WHITE
-; band), so no PIPE_PROGRAM write conflicts with our clears.
-;
-; ~10 k T per call. Top blanking budget ~14 k T. Fits with margin.
-;----------------------------------------------------------------
-do_deferred_clears:
-        xor     a
-        ld      (clear_pending), a              ; reset flag
-        ld      iy, pipe_state
-        ld      b, NUM_PIPES
-.lp:
-        push    bc
-        ld      a, (iy+0)
-        add     a, 3                            ; trailing = NEW byte_x + 3 = OLD R col
-        cp      4
-        jr      c, .skip                         ; trailing < 4 → left buffer, skip
-        cp      28
-        jr      nc, .skip                        ; trailing >= 28 → right buffer, skip
-        ld      c, a
-        ld      e, (iy+1)
-        call    clear_pipe_col
-.skip:
-        inc     iy
-        inc     iy
-        pop     bc
-        djnz    .lp
-        ret
 
 ;----------------------------------------------------------------
 ; do_white_work: state-prep work that used to be in frame_update's WHITE
@@ -229,13 +179,6 @@ wrap_pending:  db 0                      ; set when a wrap happened this frame
 pending_regen: db 0                      ; set when a recycle happened; configure_pipe_slots deferred
 patch_pending: db 0                      ; set by wrap_byte_x when byte_x changed; cleared after patch_pipe_targets runs
 recycled_pipe_idx: db 0
-clear_pending: db 0                      ; set by wrap_byte_x; consumed by NEXT frame's
-                                         ; top-blanking do_deferred_clears (pre-raster).
-gap_clear_pending: db 0                  ; countdown: 2 = set by configure, wait 1 frame
-                                         ;           1 = next-frame, runs run_gap_clear
-                                         ;           0 = idle
-                                         ; Deferred to keep the configure frame under budget.
-gap_clear_pipe_idx: db 0                 ; which pipe's gap to clear
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
@@ -1170,76 +1113,7 @@ configure_pipe_slots:
         ld      a, (cps_gap_y)
         ld      (hl), a
 
-        ; ─── Step 8: queue a gap-clear for the NEXT frame. The screen-clear
-        ; itself (cols 4..27 × 50 new gap rows) is ~12k T-states; running it
-        ; in the configure frame would push that frame from ~67k to ~79k,
-        ; missing the halt. Defer to next frame's CYAN region (run_gap_clear).
-        ; gap_clear_pending = 2: main_loop will decrement to 1 this frame
-        ; (we're called from CYAN, same frame), then to 0 next frame → run.
-        ld      a, (cps_pipe)
-        ld      (gap_clear_pipe_idx), a
-        ld      a, 2
-        ld      (gap_clear_pending), a
         ret
-
-;----------------------------------------------------------------
-; run_gap_clear: clear cols 4..27 of the cap-block rows for the pipe that
-; just recycled. Runs the frame AFTER configure_pipe_slots, in main_loop's
-; CYAN region. ~12k T-states.
-;
-; Reads gap_clear_pipe_idx for which pipe.  Caller has already zeroed
-; gap_clear_pending; this routine only does the clear.
-;----------------------------------------------------------------
-run_gap_clear:
-        ld      a, (gap_clear_pipe_idx)
-        ; Look up that pipe's gap_y from pipe_state[pipe*2 + 1].
-        add     a, a                            ; pipe * 2
-        inc     a                               ; pipe * 2 + 1
-        ld      hl, pipe_state
-        add     a, l
-        ld      l, a
-        jr      nc, .rgc_nc
-        inc     h
-.rgc_nc:
-        ld      a, (hl)                         ; A = gap_y
-        dec     a                               ; A = cap_top_row
-        ld      c, a                            ; C = current row (cap_top_row..cap_bot_row)
-        ld      (cps_saved_sp), sp              ; reuse the same scratch slot
-        ld      de, 0                           ; sky byte pair for stack-blast
-        ld      b, 50                           ; 50 rows in cap block
-.rgc_lp:
-        ld      sp, (cps_saved_sp)              ; reset SP before any push bc
-        push    bc                              ; preserve row + counter
-        ld      h, 0
-        ld      l, c
-        add     hl, hl                          ; row * 2
-        ld      bc, line_table
-        add     hl, bc
-        ld      c, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, c                            ; HL = line_addr
-        ld      bc, 28
-        add     hl, bc                          ; HL = line_addr + 28
-        pop     bc
-        ld      sp, hl
-        push    de                              ; 12 pushes = 24 bytes cleared (cols 4..27)
-        push    de
-        push    de
-        push    de
-        push    de
-        push    de
-        push    de
-        push    de
-        push    de
-        push    de
-        push    de
-        push    de
-        inc     c
-        djnz    .rgc_lp
-        ld      sp, (cps_saved_sp)
-        ret
-
 
 ;----------------------------------------------------------------
 ; compute_next_slot: given a cap row and the current pipe, return the address
@@ -1598,11 +1472,9 @@ init_pipes:
 ;   pending_regen == 2 → defer 1 more CYAN tick.
 ;   pending_regen == 1 → run configure for recycled_pipe_idx; clear.
 ;
-; Why 3-stage? Frame R+1 already has do_deferred_clears (~10 k T) in top
-; blanking. Running configure (~32 k T) in CYAN of that same frame would
-; push total work past 70 k T budget (halt miss). With 3-stage, configure
-; runs on R+2 instead — a frame with no clears — keeping each frame's
-; total under 60 k T.
+; Why 3-stage? Running configure (~32 k T) in CYAN immediately after a wrap
+; would push total work past 70 k T budget (halt miss). With 3-stage, configure
+; runs on R+2 instead — a lighter frame — keeping each frame's total under 60 k T.
 ;----------------------------------------------------------------
 deferred_configure:
         ld      a, (pending_regen)
@@ -1645,9 +1517,7 @@ frame_update:
         out     ($fe), a
         call    draw_ground
         ; State prep (advance_phase × 2 with wrap-byte_x, restore_trailing)
-        ; was here in the WHITE band. Moved to main_loop's CYAN region so
-        ; clear_pipe_col's screen writes happen AFTER raster has scanned
-        ; the visible area — no race-the-beam on lower-half pipe rows.
+        ; was here in the WHITE band. Moved to main_loop's CYAN region.
 .no_regen:
         ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
         ld      hl, (score)
@@ -1950,9 +1820,7 @@ patch_pipe_targets:
 ; Tail-call patch_pipe_targets to decrement every active body slot's screen
 ; target by ROW_OFFSET (= 1) so they walk to the next column.
 ;
-; clear_pipe_col (OLD R col erase) is NOT done here — it's deferred to the
-; NEXT frame's top blanking (do_deferred_clears) so the writes happen
-; pre-raster and don't race the beam on lower-half pipe rows.
+; Column clearing is handled by the trailing-zero pair in every pipe stamp.
 ;----------------------------------------------------------------
 wrap_byte_x:
         ld      iy, pipe_state
@@ -1984,8 +1852,6 @@ wrap_byte_x:
         inc     iy
         inc     iy
         djnz    .outer
-        ld      a, 1
-        ld      (clear_pending), a      ; signal next frame's top blanking to clear OLD R cols
         ; Run patch_pipe_targets so NEXT frame's PIPE_PROGRAM renders at NEW byte_x.
         call    patch_pipe_targets
         ret
@@ -2313,77 +2179,6 @@ update_cap_imm_v2:
         inc     iy
         pop     bc
         djnz    .bot_lp
-        ret
-
-;----------------------------------------------------------------
-clear_pipe_col:
-        ld      a, e
-        or      a
-        jr      z, .no_top
-        push    de
-        ld      b, e
-        xor     a
-        call    paint_restore
-        pop     de
-.no_top:
-        ld      a, e
-        add     a, PIPE_GAP
-        cp      GROUND_TOP              ; stop at ground — pipe doesn't paint below
-        ret     nc
-        ld      d, a
-        neg
-        add     a, GROUND_TOP           ; count = GROUND_TOP - (gap_y + PIPE_GAP)
-        ld      b, a
-        ld      a, d
-        jp      paint_restore
-
-;----------------------------------------------------------------
-; paint_restore: write sky byte ($00) to screen[col] for B scan lines
-; starting at line A. Used as the "erase" when pipe leaves a col.
-;
-; Background is uniform sky (cityscape removed in commit 9ae48ac); the
-; old BG_BUFFER-read path was a 23 T/line tax for a known constant 0,
-; and the buffer at $C000 is overlaid by BODY_TEMPLATE after init.
-;
-; 4x-unrolled per iteration to amortize the djnz / loop overhead.
-; Per line: 32 T (pop + col-add + ld(hl),0) — was 52 T with BG read.
-; Save ~20 T × ~336 lines per wrap ≈ 6.7 k T per wrap frame.
-;----------------------------------------------------------------
-paint_restore:
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-        srl     b
-        srl     b                       ; B = line groups of 4
-        ret     z                       ; (caller never passes B<4 in practice)
-        ld      e, 0                    ; pre-load sky byte once; clear via ld (hl), e (7T) vs ld (hl), 0 (10T)
-.lp:
-        pop     hl                      ; line N
-        ld      a, c
-        add     a, l
-        ld      l, a
-        ld      (hl), e
-        pop     hl                      ; line N+1
-        ld      a, c
-        add     a, l
-        ld      l, a
-        ld      (hl), e
-        pop     hl                      ; line N+2
-        ld      a, c
-        add     a, l
-        ld      l, a
-        ld      (hl), e
-        pop     hl                      ; line N+3
-        ld      a, c
-        add     a, l
-        ld      l, a
-        ld      (hl), e
-        djnz    .lp
-        ld      sp, (saved_sp)
         ret
 
 ;----------------------------------------------------------------
