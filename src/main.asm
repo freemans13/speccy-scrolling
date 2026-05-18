@@ -94,8 +94,19 @@ start:
 main_loop:
         halt
         di
-        ld      a, 2                    ; PROFILE: RED = top blanking work + render
+        ld      a, 2                    ; PROFILE: RED = top blanking
         out     ($fe), a
+        ; Phase 2: bird ops run BEFORE PIPE_PROGRAM in top blanking.
+        ; All bird writes complete before raster reaches row 0, so the
+        ; bird is visible same-frame at every Y with no flicker.
+        ; PIPE_PROGRAM still has ~8 k T head start over the raster.
+        call    restore_bird_bg
+        call    restore_bird_attrs
+        call    read_input
+        call    update_bird
+        call    advance_bird_anim
+        call    draw_bird
+        call    paint_bird_attrs
         call    frame_update
         ld      a, 7                    ; PROFILE: WHITE = state prep
         out     ($fe), a
@@ -110,18 +121,8 @@ main_loop:
         ld      a, (pending_regen)
         or      a
         call    nz, deferred_configure  ; run configure in CYAN (after raster, no race-the-beam)
-        ; Bird ops in CYAN (= end of frame, after raster has scanned visible
-        ; area). Writes land BEFORE next frame's raster reaches them → bird
-        ; visible at correct position next frame, with consistent 1-frame
-        ; lag at every Y. Keeps PIPE_PROGRAM's head start intact so the top
-        ; rows render without tearing.
-        call    restore_bird_bg
-        call    restore_bird_attrs
-        call    read_input
-        call    update_bird
-        call    advance_bird_anim
-        call    draw_bird
-        call    paint_bird_attrs
+        ; Phase 2: bird ops moved to top blanking. CYAN is now for
+        ; update_cap_imm_v2 (already above) and any background work.
         ei
         jr      main_loop
 
