@@ -2534,6 +2534,17 @@ do_swap:
 
         ; ── Full swap ────────────────────────────────────────────────────
 .ds_full_swap:
+        ; Capture dep's OLD gap_y for later band-boundary computations.
+        ; Must happen BEFORE step 3 overwrites pipe_state[inc].
+        ld      a, (ds_dep)
+        add     a, a                            ; dep*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
+        add     hl, de                          ; HL = &pipe_state[dep].gap_y
+        ld      a, (hl)                         ; A = OLD gap_y
+        ld      (ds_old_gap_y), a
+
         ld      a, (prep_pipe_idx)
         ld      (ds_inc), a                     ; incoming = old prep_pipe_idx
 
@@ -2773,6 +2784,7 @@ ds_tmp:     db 0                               ; temp (fallback gap_y)
 ds_pipe6:   db 0                               ; incoming pipe index × 6
 ds_cap_top: db 0                               ; temp scratch (reused for dep*6 in cap deactivate)
 ds_cap_bot: db 0                               ; (unused in full_swap path; kept for alignment)
+ds_old_gap_y: db 0                             ; dep's OLD gap_y, captured at .ds_full_swap entry
 
 active_pipe_addrs:
         dw      ACTIVE_PIPE_0
