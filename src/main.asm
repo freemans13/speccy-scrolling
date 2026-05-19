@@ -1343,14 +1343,24 @@ build_slot_templates:
         inc     hl
         djnz    .bst_cap_top_zero
         ; 48 skip rows × 6 bytes = 288 zero bytes
-        ld      bc, 288
+        ; 48 skip rows × 6 bytes — JR +4 pattern. At PIPE_PROGRAM run
+        ; time the slot jumps 6 bytes in 12 T instead of 6 NOPs in 24 T.
+        ; JR e: PC += 2 + e; e = $04 → PC+6 from slot start = next slot.
+        ld      b, 48
 .bst_cap_skip_lp:
+        ld      (hl), $18                       ; opcode: JR e
+        inc     hl
+        ld      (hl), $04                       ; displacement: skip 6 bytes
+        inc     hl
         ld      (hl), 0
         inc     hl
-        dec     bc
-        ld      a, b
-        or      c
-        jr      nz, .bst_cap_skip_lp
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        djnz    .bst_cap_skip_lp
         ; cap_bot stub
         ld      (hl), $C3
         inc     hl
@@ -2763,21 +2773,29 @@ do_swap:
         ld      a, (ds_cap_top)
         or      a
         jp      z, .ds_band1_done               ; G=1 → cap_top_row=0, band 1 empty
-        ld      b, a                            ; B = band-1 row count
 
         ; --- Save real HL' on stack, then load table base into alt HL ---
         exx
         push    hl                              ; save real alt HL
         exx
         ld      hl, screen_target_table_29
-        exx                                     ; alt HL = table base; main HL = junk
-        ; --- Compute grid HL = slot[0][dep]+1 in main bank ---
+        exx                                     ; (3 setup exx so far — ODD)
+        ; --- Compute grid HL in current "main" register ---
         ld      a, (ds_pipe6)
         ld      l, a
         ld      h, 0
-        ld      de, SLOT_GRID_BASE + 2          ; +1 (EXX byte) + 1 (skip $31 opcode)
-        add     hl, de                          ; main HL = slot[0][dep]+1
-        ld      de, SLOT_ROW_STRIDE - 1         ; 31: stride after the inc hl on +2
+        ld      de, SLOT_GRID_BASE + 2
+        add     hl, de                          ; current HL = slot[0][dep]+1
+        ld      de, SLOT_ROW_STRIDE - 1         ; 31
+        ; --- Set B (= row count) HERE, after setup's odd exx count. The loop has
+        ; 4 exx per iter (even), so djnz fires with B intact at this value. If we
+        ; set B before any exx, the odd setup exx swaps it into B' and djnz fires
+        ; on alt bank's stale B (= random) → runaway loop that corrupts cap-skip
+        ; rows. (Snapshot at first 1st-swap showed slot[104][2] corrupted with
+        ; line_addr[104]+34 target bytes, proving band 1 walked ~105 iters
+        ; instead of 87 due to this exact bug.)
+        ld      a, (ds_cap_top)
+        ld      b, a
 .ds_band1_lp:
         exx
         ld      a, (hl)                         ; A = target.lo
@@ -2805,7 +2823,7 @@ do_swap:
         sub     b                               ; A = 159 - old_cap_bot_row
         jp      z, .ds_band2_done               ; band 2 empty
         jp      c, .ds_band2_done               ; overshoot (shouldn't happen)
-        ld      b, a                            ; B = band-2 row count
+        ld      (ds_tmp), a                     ; stash row count for after-exx setup
 
         ; --- Save real HL' on stack ---
         exx
@@ -2819,8 +2837,8 @@ do_swap:
         ld      d, 0
         ld      hl, screen_target_table_29
         add     hl, de                          ; main HL = table addr
-        exx                                     ; alt HL = table addr; main HL = junk
-        ; --- Compute grid HL = slot[start_row][dep]+1 in main bank ---
+        exx                                     ; (3 setup exx so far — ODD)
+        ; --- Compute grid HL in current register ---
         ld      a, (ds_cap_bot)
         inc     a                               ; A = start_row
         ld      l, a
@@ -2835,8 +2853,12 @@ do_swap:
         ld      d, 0
         add     hl, de                          ; HL += dep*6
         ld      de, SLOT_GRID_BASE + 2
-        add     hl, de                          ; main HL = slot[start_row][dep]+1
+        add     hl, de                          ; HL = slot[start_row][dep]+1
         ld      de, SLOT_ROW_STRIDE - 1         ; 31
+        ; Set B (= row count) here, after the odd setup exx count, so the loop's
+        ; 4 exx per iter return to the correct bank for djnz. See band 1 comment.
+        ld      a, (ds_tmp)
+        ld      b, a
 .ds_band2_lp:
         exx
         ld      a, (hl)
