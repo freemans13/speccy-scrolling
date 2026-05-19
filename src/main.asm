@@ -119,20 +119,25 @@ main_loop:
         ld      a, 7                    ; PROFILE: WHITE = state prep
         out     ($fe), a
         call    do_white_work
-        ld      a, 5                    ; PROFILE: CYAN = idle until next halt
+        ld      a, 5                    ; PROFILE: CYAN = update_cap_imm_v2
         out     ($fe), a
-        ; Pre-compute cap byte imms for NEXT frame's PIPE_PROGRAM. Phase has
-        ; already been advanced in do_white_work, so the imms reflect the
-        ; render phase the next frame will use. Saves ~2 k T from next
-        ; frame's pre-PP block.
         call    update_cap_imm_v2
-        ; Phase 4: incrementally prepare pipe 3's slot column one step per frame.
-        ; prep_step runs in CYAN (post-raster, safe for SMC writes to PIPE_PROGRAM).
+        ld      a, 6                    ; PROFILE: YELLOW = prep_step
+        out     ($fe), a
+        ; Skip prep_step on swap frame to free ~2k T budget; do_swap already
+        ; reset prep state, so missing one frame just delays prep by 1 frame
+        ; (still well under the 28-frame swap interval at 10 rows/frame).
+        ld      a, (do_swap_fired)
+        or      a
+        jr      nz, .skip_prep_step
         call    prep_step
-        ; Phase 5: deferred_configure / pending_regen removed. Recycle is now
-        ; handled by do_swap (O(1), runs in WHITE wrap_byte_x). No CYAN defer needed.
-        ; Phase 2: bird ops moved to top blanking. CYAN is now for
-        ; update_cap_imm_v2, prep_step (Phase 4), and any background work.
+        jr      .post_prep_step
+.skip_prep_step:
+        xor     a
+        ld      (do_swap_fired), a
+.post_prep_step:
+        ld      a, 0                    ; PROFILE: BLACK = idle before halt
+        out     ($fe), a
         ei
         jr      main_loop
 
@@ -1607,7 +1612,7 @@ prep_step:
         ; phase 7 = done
         ret
 
-; ─── Phase 0: body rows [0 .. cap_top_row-1], 5 rows/call ────────────────────
+; ─── Phase 0: body rows [0 .. cap_top_row-1], 10 rows/call ───────────────────
 ; Target = line_table[row]+34 (= byte_x=29 buffer col, invisible writes).
 ; After swap, active pipe's body slots already point at byte_x=29 → no
 ; body-target-write needed in do_swap.
@@ -1622,9 +1627,9 @@ ps_phase0:
         sub     c                               ; A = rows remaining
         jr      z, .p0_advance
         jr      c, .p0_advance                  ; safety: overshot
-        cp      5
+        cp      10
         jr      c, .p0_rows_set
-        ld      a, 5
+        ld      a, 10
 .p0_rows_set:
         ld      (ps_count), a                   ; save count for prep_row update
         ld      b, a                            ; B = loop counter
@@ -1683,7 +1688,7 @@ ps_phase0:
         ld      (prep_phase), a
         ret
 
-; ─── Phase 1: NOP-fill cap range [cap_top_row..cap_bot_row], 5 rows/call ─────
+; ─── Phase 1: NOP-fill cap range [cap_top_row..cap_bot_row], 10 rows/call ────
 ; prep_row = 0..49 (offset within 50-row cap block)
 ps_phase1:
         ld      a, (prep_row)
@@ -1692,9 +1697,9 @@ ps_phase1:
         sub     c                               ; A = remaining rows in cap block
         jr      z, .p1_advance
         jr      c, .p1_advance
-        cp      5
+        cp      10
         jr      c, .p1_rows_set
-        ld      a, 5
+        ld      a, 10
 .p1_rows_set:
         ld      (ps_count), a
         ld      b, a                            ; B = loop counter
@@ -1735,7 +1740,7 @@ ps_phase1:
         ld      (prep_phase), a
         ret
 
-; ─── Phase 2: body rows [cap_bot_row+1..159], 5 rows/call ────────────────────
+; ─── Phase 2: body rows [cap_bot_row+1..159], 10 rows/call ───────────────────
 ; prep_row = 0..M-1 where M = 111 - prep_gap_y
 ; Target = line_table[actual_row]+34 (= byte_x=29 buffer col, invisible).
 ps_phase2:
@@ -1751,9 +1756,9 @@ ps_phase2:
         sub     c                               ; A = remaining rows
         jr      z, .p2_advance
         jr      c, .p2_advance                  ; safety
-        cp      5
+        cp      10
         jr      c, .p2_rows_set
-        ld      a, 5
+        ld      a, 10
 .p2_rows_set:
         ld      (ps_count), a
         ld      b, a                            ; B = loop counter
@@ -2427,6 +2432,30 @@ wrap_byte_x:
 do_swap:
         ld      (ds_dep), a                     ; save departing pipe index
 
+        ; Zero-fill ACTIVE_PIPE_<dep> (224 bytes = 112 words) via SP-hijack.
+        ; ~1.3 k T vs ~4.7 k T for LDIR. Keeps swap-frame budget under 70 k.
+        ; Stale entries from dep's previous active period would otherwise let
+        ; patch_pipe_targets corrupt slot bytes via $00→$FF wraps when dep
+        ; becomes active again before phase 6 rebuilds the list.
+        add     a, a                            ; dep*2
+        ld      e, a
+        ld      d, 0
+        ld      hl, active_pipe_addrs
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = ACTIVE_PIPE_<dep>
+        ld      hl, 224
+        add     hl, de                          ; HL = ACTIVE_PIPE_<dep> + 224 (end)
+        ld      (saved_sp_inner), sp            ; save real SP (reuse patch's slot)
+        ld      sp, hl                          ; SP = end of buffer
+        ld      hl, 0
+        ; 112 pushes × 11 T = 1232 T
+        REPT 112
+            push hl
+        ENDR
+        ld      sp, (saved_sp_inner)            ; restore real SP
+
         ; Guard: only do full swap when prep is complete (phase 7).
         ld      a, (prep_phase)
         cp      7
@@ -2457,7 +2486,8 @@ do_swap:
         ld      h, 0
         ld      de, SLOT_GRID_BASE + 1
         add     hl, de                          ; HL = slot[0][dep]
-        ld      de, SLOT_ROW_STRIDE - SLOT_STRIDE ; 26 (advance to next row after 6 bytes)
+        ld      de, SLOT_ROW_STRIDE - SLOT_STRIDE + 1 ; 27: HL at slot+5 after 5 incs;
+                                                      ; +27 reaches next row's slot+0.
         ld      b, GROUND_TOP                   ; 160
         xor     a
 .ds_fb_clr:
@@ -2679,14 +2709,16 @@ do_swap:
         ;    (= byte_x=29 buffer col) instead of $0000. After swap the incoming
         ;    pipe's body slots already point at byte_x=29. No per-swap rewrite needed.
 
-        ; 5. Dep body-slot target rewrite (~13.8 k T, ~86 T/row × 160 rows).
-        ;    Rewrites only the 2 target imm bytes (slot+1, slot+2) in each of dep's
-        ;    160 slot rows to line_addr+34 (= byte_x=29 buffer position, invisible).
-        ;    This prevents stale body-slot targets from writing visible pixels before
-        ;    prep_step overwrites the slot content over subsequent frames.
-        ;    Dep's old bytes 0,3,4,5 are left intact for now: body slots keep their
-        ;    $31/$E5/$D5/$C5 opcodes and cap slots keep their $C3 opcode (deactivated
-        ;    separately below). Prep_step phases 0-1-2 will overwrite all 6 bytes.
+        ; 5. Clear dep's slot column to all NOPs (6 bytes × 160 rows = 960 bytes).
+        ;    Earlier attempt rewrote only bytes 1, 2 (target) assuming all 160 of
+        ;    dep's slots were body slots. BUG: dep's cap-skip rows (50 rows between
+        ;    cap_top and cap_bot) were NOP slides pre-swap. Partial rewrite turned
+        ;    them into `$00 <lo> <hi> $00 $00 $00` — e.g., row 104 with gap_y=88
+        ;    decoded as `NOP ; JP NZ $0048 ; NOP × 3`, jumping into ROM when ZF
+        ;    was clear → CPU reset.
+        ;    Clearing all 6 bytes makes every slot a harmless NOP slide until
+        ;    prep_step (phases 0/1/2) rebuilds the body template + cap NOPs.
+        ;    Cost ~16 k T (96 T/row × 160).
 
         ; Compute dep*6 for slot column base.
         ld      a, (ds_dep)
@@ -2698,104 +2730,27 @@ do_swap:
         add     a, e    ; dep*6
         ld      l, a
         ld      h, 0
-        ld      de, SLOT_GRID_BASE + 2          ; HL = slot[0][dep]+1 (target.lo byte)
+        ld      de, SLOT_GRID_BASE + 1          ; HL = slot[0][dep] byte 0
         add     hl, de
-        ; HL now = slot[0][dep]+1 = first target.lo byte for dep's column.
-        ; Set up DE = SLOT_ROW_STRIDE - 1 = 31 for post-hi-write slot advance.
-        ; After writing target.hi (at slot[row][dep]+2), HL+31 = slot[row+1][dep]+1. ✓
-        ld      de, SLOT_ROW_STRIDE - 1         ; 31
-        ; Use alt HL' as table pointer (preserving whatever was in HL' before).
-        exx
-        push    hl                              ; save HL'
-        ld      hl, screen_target_table_29      ; HL' = table[0]
-        exx
-        ld      b, GROUND_TOP                   ; B = 160 (djnz counter)
-.ds_dep_tgt_lp:
-        ; Read target.lo from table (HL'), write to slot[row][dep]+1 (HL)
-        exx
-        ld      a, (hl)
-        inc     hl
-        exx
-        ld      (hl), a                         ; write target.lo
-        inc     hl                              ; HL = slot[row][dep]+2
-        ; Read target.hi from table (HL'), write to slot[row][dep]+2 (HL)
-        exx
-        ld      a, (hl)
-        inc     hl
-        exx
-        ld      (hl), a                         ; write target.hi
-        add     hl, de                          ; HL += 31 → slot[row+1][dep]+1
-        djnz    .ds_dep_tgt_lp
-        exx
-        pop     hl                              ; restore HL'
-        exx
-
-        ; 6. Dep cap-slot deactivate (~50 T).
-        ;    Write $00 (NOP, clobbers the $C3 JP opcode) to byte 0 of dep's old
-        ;    cap_top and cap_bot slots. This prevents stale jp cap_handler fires
-        ;    before prep_step phase 1 NOP-fills the cap range.
-        ;    Dep's cap rows: cap_top = pipe_state[dep].gap_y - 1
-        ;                    cap_bot = pipe_state[dep].gap_y + PIPE_GAP
-        ;    pipe_state[dep] is still intact at this point (not yet overwritten).
-
-        ; Read dep's gap_y from pipe_state[dep*2+1]
-        ld      a, (ds_dep)
-        add     a, a                            ; dep*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
-        add     hl, de                          ; HL = &pipe_state[dep].gap_y
-        ld      a, (hl)                         ; A = dep's gap_y
-
-        ; Compute dep*6 again for slot address (DE was clobbered above)
-        ld      c, a                            ; C = dep's gap_y (save for cap_bot)
-        ld      a, (ds_dep)
-        ld      e, a
-        add     a, a    ; dep*2
-        add     a, e    ; dep*3
-        add     a, e    ; dep*4
-        add     a, e    ; dep*5
-        add     a, e    ; dep*6
-        ld      (ds_cap_top), a                 ; reuse scratch: dep*6
-
-        ; cap_top_row = gap_y - 1
-        ld      a, c
-        dec     a                               ; A = dep cap_top_row
-        ; slot[cap_top_row][dep] byte 0 = SLOT_GRID_BASE+1 + cap_top_row*32 + dep*6
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; HL = cap_top_row * 32
-        ld      a, (ds_cap_top)                 ; A = dep*6
-        ld      e, a
-        ld      d, 0
-        add     hl, de
-        ld      de, SLOT_GRID_BASE + 1
-        add     hl, de                          ; HL = slot[cap_top_row][dep] byte 0
+        ld      de, SLOT_ROW_STRIDE - SLOT_STRIDE + 1  ; 27: HL is at slot+5 after
+                                                       ; 5 inc-hl's; +27 reaches slot+5+27
+                                                       ; = slot+32 = next row's slot+0.
+        ld      b, GROUND_TOP                   ; 160
         xor     a
-        ld      (hl), a                         ; write $00 → deactivate cap_top JP
-
-        ; cap_bot_row = gap_y + PIPE_GAP
-        ld      a, c
-        add     a, PIPE_GAP                     ; A = dep cap_bot_row
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; HL = cap_bot_row * 32
-        ld      a, (ds_cap_top)                 ; A = dep*6
-        ld      e, a
-        ld      d, 0
-        add     hl, de
-        ld      de, SLOT_GRID_BASE + 1
-        add     hl, de                          ; HL = slot[cap_bot_row][dep] byte 0
-        xor     a
-        ld      (hl), a                         ; write $00 → deactivate cap_bot JP
+.ds_dep_clr_lp:
+        ld      (hl), a                         ; byte 0
+        inc     hl
+        ld      (hl), a                         ; byte 1
+        inc     hl
+        ld      (hl), a                         ; byte 2
+        inc     hl
+        ld      (hl), a                         ; byte 3
+        inc     hl
+        ld      (hl), a                         ; byte 4
+        inc     hl
+        ld      (hl), a                         ; byte 5
+        add     hl, de                          ; advance to next row's dep slot
+        djnz    .ds_dep_clr_lp
 
         ; 7. Update prep_pipe_idx, pick new gap_y, reset prep state.
         ld      a, (ds_dep)
@@ -2806,15 +2761,24 @@ do_swap:
         xor     a
         ld      (prep_phase), a                 ; reset to phase 0 (start fresh)
         ld      (prep_row), a
+        ld      a, 1
+        ld      (do_swap_fired), a              ; tell main_loop to skip prep_step this frame
         ret
 
 ; ── Scratch variables for do_swap ────────────────────────────────
+do_swap_fired: db 0                            ; main_loop reads and clears each frame
 ds_dep:     db 0                               ; departing pipe index
 ds_inc:     db 0                               ; incoming pipe index
 ds_tmp:     db 0                               ; temp (fallback gap_y)
 ds_pipe6:   db 0                               ; incoming pipe index × 6
 ds_cap_top: db 0                               ; temp scratch (reused for dep*6 in cap deactivate)
 ds_cap_bot: db 0                               ; (unused in full_swap path; kept for alignment)
+
+active_pipe_addrs:
+        dw      ACTIVE_PIPE_0
+        dw      ACTIVE_PIPE_1
+        dw      ACTIVE_PIPE_2
+        dw      ACTIVE_PIPE_3
 
 ;----------------------------------------------------------------
 ; Cap handlers (JP'd to by cap_top / cap_bot slots — never CALLed).
