@@ -2763,7 +2763,6 @@ do_swap:
         ld      a, (ds_cap_top)
         or      a
         jp      z, .ds_band1_done               ; G=1 → cap_top_row=0, band 1 empty
-        ld      b, a                            ; B = band-1 row count
 
         ; --- Save real HL' on stack, then load table base into alt HL ---
         exx
@@ -2778,6 +2777,10 @@ do_swap:
         ld      de, SLOT_GRID_BASE + 2          ; +1 (EXX byte) + 1 (skip $31 opcode)
         add     hl, de                          ; main HL = slot[0][dep]+1
         ld      de, SLOT_ROW_STRIDE - 1         ; 31: stride after the inc hl on +2
+        ; Set B AFTER the 3 setup exx (odd count) so djnz operates on the
+        ; current-bank B. Loop body has 4 exx per iter (even) → preserved.
+        ld      a, (ds_cap_top)
+        ld      b, a                            ; B = band-1 row count
 .ds_band1_lp:
         exx
         ld      a, (hl)                         ; A = target.lo
@@ -2805,7 +2808,7 @@ do_swap:
         sub     b                               ; A = 159 - old_cap_bot_row
         jp      z, .ds_band2_done               ; band 2 empty
         jp      c, .ds_band2_done               ; overshoot (shouldn't happen)
-        ld      b, a                            ; B = band-2 row count
+        ld      (ds_band2_count), a             ; save row count; set B after setup exx
 
         ; --- Save real HL' on stack ---
         exx
@@ -2837,6 +2840,9 @@ do_swap:
         ld      de, SLOT_GRID_BASE + 2
         add     hl, de                          ; main HL = slot[start_row][dep]+1
         ld      de, SLOT_ROW_STRIDE - 1         ; 31
+        ; Set B AFTER the 3 setup exx (odd count) so djnz sees correct count.
+        ld      a, (ds_band2_count)
+        ld      b, a
 .ds_band2_lp:
         exx
         ld      a, (hl)
@@ -2926,6 +2932,7 @@ ds_pipe6:   db 0                               ; incoming pipe index × 6
 ds_cap_top: db 0                               ; temp scratch (reused for dep*6 in cap deactivate)
 ds_cap_bot: db 0                               ; (unused in full_swap path; kept for alignment)
 ds_old_gap_y: db 0                             ; dep's OLD gap_y, captured at .ds_full_swap entry
+ds_band2_count: db 0                           ; band 2 row count, set before setup exx & loaded after
 
 active_pipe_addrs:
         dw      ACTIVE_PIPE_0
