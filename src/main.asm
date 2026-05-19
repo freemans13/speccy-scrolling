@@ -1342,15 +1342,24 @@ build_slot_templates:
         ld      (hl), 0
         inc     hl
         djnz    .bst_cap_top_zero
-        ; 48 skip rows × 6 bytes = 288 zero bytes
-        ld      bc, 288
+        ; 48 skip rows × 6 bytes — JR +4 pattern so PIPE_PROGRAM
+        ; jumps the slot in 12 T instead of executing 6 NOPs in 24 T.
+        ; JR e: PC += 2 + e; e = $04 → +6 from slot start = next slot.
+        ld      b, 48
 .bst_cap_skip_lp:
+        ld      (hl), $18                       ; opcode: JR e
+        inc     hl
+        ld      (hl), $04                       ; displacement: skip 6 bytes
+        inc     hl
         ld      (hl), 0
         inc     hl
-        dec     bc
-        ld      a, b
-        or      c
-        jr      nz, .bst_cap_skip_lp
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        djnz    .bst_cap_skip_lp
         ; cap_bot stub
         ld      (hl), $C3
         inc     hl
