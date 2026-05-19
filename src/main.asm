@@ -2366,6 +2366,15 @@ wrap_byte_x:
         dec     a
         jr      .wbx_save
 .swap_with_prep:
+        ; Pipe reached byte_x=1. Only swap if prep is fully ready (phase 7).
+        ; Otherwise DEFER: leave byte_x=1 (no save), retry next wrap.
+        ; patch_pipe_targets keeps decrementing the deferred pipe's targets,
+        ; so it scrolls visibly off-screen left into buffer cols 0..3 then
+        ; into ROM (silent writes). Next wrap re-evaluates when prep may be
+        ; ready. Avoids fallback path's half-configured-OLD-prep corruption.
+        ld      a, (prep_phase)
+        cp      7
+        jr      nz, .wbx_skip                   ; defer — prep not ready
         ; Phase 5: pipe reached byte_x=1. Swap with the prep pipe.
         push    bc
         push    iy
