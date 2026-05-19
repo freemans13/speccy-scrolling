@@ -2432,11 +2432,17 @@ wrap_byte_x:
 do_swap:
         ld      (ds_dep), a                     ; save departing pipe index
 
-        ; Zero-fill ACTIVE_PIPE_<dep> (224 bytes = 112 words) via SP-hijack.
-        ; ~1.3 k T vs ~4.7 k T for LDIR. Keeps swap-frame budget under 70 k.
-        ; Stale entries from dep's previous active period would otherwise let
-        ; patch_pipe_targets corrupt slot bytes via $00→$FF wraps when dep
-        ; becomes active again before phase 6 rebuilds the list.
+        ; Guard: only do full swap when prep is complete (phase 7).
+        ld      a, (prep_phase)
+        cp      7
+        jp      z, .ds_full_swap
+
+        ; ── Fallback: prep not ready. Fast in-place recycle. ────────────
+        ; First, zero-fill ACTIVE_PIPE_<dep> (224 bytes) so stale entries
+        ; can't corrupt slot bytes via patch_pipe_targets when dep eventually
+        ; becomes active again. The full-swap path skips this — phase 6 has
+        ; rebuilt the sublist there. Fallback path lacks that guarantee.
+        ld      a, (ds_dep)
         add     a, a                            ; dep*2
         ld      e, a
         ld      d, 0
@@ -2447,7 +2453,7 @@ do_swap:
         ld      d, (hl)                         ; DE = ACTIVE_PIPE_<dep>
         ld      hl, 224
         add     hl, de                          ; HL = ACTIVE_PIPE_<dep> + 224 (end)
-        ld      (saved_sp_inner), sp            ; save real SP (reuse patch's slot)
+        ld      (saved_sp_inner), sp            ; save real SP
         ld      sp, hl                          ; SP = end of buffer
         ld      hl, 0
         ; 112 pushes × 11 T = 1232 T
@@ -2456,12 +2462,6 @@ do_swap:
         ENDR
         ld      sp, (saved_sp_inner)            ; restore real SP
 
-        ; Guard: only do full swap when prep is complete (phase 7).
-        ld      a, (prep_phase)
-        cp      7
-        jr      z, .ds_full_swap
-
-        ; ── Fallback: prep not ready. Fast in-place recycle. ────────────
         ; Just pick new random gap_y and reset byte_x=29 for the departing pipe.
         ; The departing pipe's slot column stays configured (body targets at old byte_x=1
         ; position, which is the LEFT buffer → invisible writes for 1 frame until
