@@ -558,6 +558,36 @@ init_pipe_program:
         cp      NUM_PIPES
         jr      nz, .ipp_pipe_lp
 
+        ; ── Write row-trailer JP at byte +25 of this row ────────
+        ; IY = slot[row][0] + 24 (= slot[row][3]+6 = first pad byte).
+        ; Normal rows: JP base + (row+1)*32 = next row's EXX byte.
+        ; Row 159   : JP SLOT_GRID_END (epilogue: ld sp,(saved_sp); ret).
+        ld      (iy+0), $C3                     ; opcode: jp nn
+        ld      a, b
+        cp      GROUND_TOP - 1                  ; row 159?
+        jr      z, .ipp_trailer_last
+
+        ; HL = SLOT_GRID_BASE + (row+1) * 32
+        ld      a, b
+        inc     a                               ; row+1
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; *2
+        add     hl, hl                          ; *4
+        add     hl, hl                          ; *8
+        add     hl, hl                          ; *16
+        add     hl, hl                          ; *32
+        ld      de, SLOT_GRID_BASE
+        add     hl, de                          ; HL = base + (row+1)*32
+        jr      .ipp_trailer_write
+
+.ipp_trailer_last:
+        ld      hl, SLOT_GRID_END
+
+.ipp_trailer_write:
+        ld      (iy+1), l
+        ld      (iy+2), h
+
 .ipp_row_done:
         pop     bc                      ; restore B=row
         inc     b
