@@ -2099,6 +2099,30 @@ ps_phase6:
 
         ld      sp, (ps_saved_sp)
 
+        ; ── Self-repair cap_*_target_imm_addrs tables ───────────────────────
+        ; Mirrors configure_pipe_slots' defensive re-stamp. An unidentified
+        ; runtime corruption flips a bit in cap_top_target_imm_addrs, leaving
+        ; one pipe's cap_top stuck on a bogus screen target (missing cap).
+        ; configure_pipe_slots only runs at init, so recycles never repaired
+        ; it. ps_phase6 is the per-recycle configure point — re-stamp here,
+        ; BEFORE the cap-arming code below reads these tables.
+        ld      hl, cap_top_handler_pipe_0_target
+        ld      (cap_top_target_imm_addrs), hl
+        ld      hl, cap_top_handler_pipe_1_target
+        ld      (cap_top_target_imm_addrs + 2), hl
+        ld      hl, cap_top_handler_pipe_2_target
+        ld      (cap_top_target_imm_addrs + 4), hl
+        ld      hl, cap_top_handler_pipe_3_target
+        ld      (cap_top_target_imm_addrs + 6), hl
+        ld      hl, cap_bot_handler_pipe_0_target
+        ld      (cap_bot_target_imm_addrs), hl
+        ld      hl, cap_bot_handler_pipe_1_target
+        ld      (cap_bot_target_imm_addrs + 2), hl
+        ld      hl, cap_bot_handler_pipe_2_target
+        ld      (cap_bot_target_imm_addrs + 4), hl
+        ld      hl, cap_bot_handler_pipe_3_target
+        ld      (cap_bot_target_imm_addrs + 6), hl
+
         ; ── Arm incoming cap slots in PIPE_PROGRAM (relocated from do_swap) ──
         ; Runs once at build completion: after the column has been (re)built and
         ; ps_phase1's NOP-fill of the cap range is done. Arming here ensures the
