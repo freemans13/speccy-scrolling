@@ -224,6 +224,7 @@ body_a_bc:      dw 0
 body_a_de:      dw 0
 body_b_bc:      dw 0
 body_b_de:      dw 0
+live_grid:      dw PIPE_PROGRAM         ; base of the grid redraw_pipes_v2 renders
 
 ; Scratch bytes for update_cap_imm_v2's phase-shifted cap values
 cap_L_temp:     db 0
@@ -3142,7 +3143,11 @@ redraw_pipes_v2:
         ld      hl, 0                   ; Phase 1: trailing-zero pair — shadow bank HL = 0
         exx                             ; back to main (B-pattern active)
         ld      (saved_sp), sp
-        call    PIPE_PROGRAM
+        ld      hl, .pp_return
+        push    hl                      ; return address for the grid epilogue's RET
+        ld      hl, (live_grid)
+        jp      (hl)
+.pp_return:
         ret
 
 ;----------------------------------------------------------------
