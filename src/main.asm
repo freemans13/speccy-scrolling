@@ -2740,6 +2740,206 @@ rolling_rebuild_step:
         ld      (rc_grid_base), hl
         jp      rebuild_column
 
+;================================================================
+; Stage 8: row-sliced incremental column rebuild (recycle path).
+;
+; rc_arm(A=pipe) caches the pipe's geometry and starts a two-pass
+; rebuild: pass 1 stamps GRID_A and regenerates ACTIVE_PIPE_<pipe>;
+; pass 2 stamps GRID_B. rc_step processes ROWS_PER_STEP rows per call;
+; the main_loop driver calls it each frame until rcs_state returns to 0.
+; The rebuilt pipe is the parked pipe (byte_x=29, invisible buffer col),
+; so a half-rebuilt column never tears — every row is always a valid
+; slot (JR-skip from do_swap, or freshly-stamped body/cap/skip).
+;================================================================
+ROWS_PER_STEP   EQU 16
+
+rcs_state:      db 0            ; 0=idle, 1=GRID_A pass, 2=GRID_B pass
+rcs_row:        db 0            ; next row to stamp (0..160)
+rcs_act_ptr:    dw 0            ; active-list write cursor (GRID_A pass)
+rcs_slot1:      dw 0            ; scratch: slot+1 = body target-imm addr
+
+;----------------------------------------------------------------
+; rc_arm — start an incremental rebuild of pipe A.
+; pipe_state[A] must already hold the final byte_x (29) and new gap_y.
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+rc_arm:
+        ld      (rc_pipe), a
+        ; cache byte_x + gap_y-derived cap rows
+        add     a, a                            ; pipe*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state
+        add     hl, de                          ; HL = &pipe_state[pipe].byte_x
+        ld      a, (hl)
+        ld      (rc_byte_x), a
+        inc     hl
+        ld      a, (hl)                         ; A = gap_y
+        ld      e, a
+        dec     a
+        ld      (rc_cap_top_row), a             ; gap_y - 1
+        ld      a, e
+        add     a, PIPE_GAP
+        ld      (rc_cap_bot_row), a             ; gap_y + PIPE_GAP
+        ; rc_pipe6 = pipe*6
+        ld      a, (rc_pipe)
+        ld      e, a
+        add     a, a
+        add     a, e
+        add     a, e
+        add     a, e
+        add     a, e
+        ld      (rc_pipe6), a
+        ; active-list write cursor = ACTIVE_PIPE_<pipe>
+        ld      a, (rc_pipe)
+        add     a, a
+        ld      hl, cps_sublist_base_table
+        add     a, l
+        ld      l, a
+        jr      nc, .rca_nc
+        inc     h
+.rca_nc:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        ld      (rcs_act_ptr), de
+        ; start GRID_A pass
+        ld      hl, GRID_A
+        ld      (rc_grid_base), hl
+        xor     a
+        ld      (rcs_row), a
+        ld      a, 1
+        ld      (rcs_state), a
+        ret
+
+;----------------------------------------------------------------
+; rc_step — advance the incremental rebuild by ROWS_PER_STEP rows.
+; Returns immediately when idle. Switches GRID_A→GRID_B pass, then
+; sets rcs_state=0 when both grids are complete.
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+rc_step:
+        ld      a, (rcs_state)
+        or      a
+        ret     z                               ; idle
+        ld      b, ROWS_PER_STEP
+.rcs_lp:
+        ld      a, (rcs_row)
+        cp      160
+        jr      z, .rcs_grid_done
+        push    bc
+        call    rc_stamp_row
+        pop     bc
+        djnz    .rcs_lp
+        ret
+.rcs_grid_done:
+        ld      a, (rcs_state)
+        dec     a
+        jr      nz, .rcs_all_done               ; state 2 → both grids done
+        ; GRID_A pass complete → start GRID_B pass
+        ld      a, 2
+        ld      (rcs_state), a
+        xor     a
+        ld      (rcs_row), a
+        ld      hl, GRID_B
+        ld      (rc_grid_base), hl
+        ret
+.rcs_all_done:
+        xor     a
+        ld      (rcs_state), a                  ; idle — rebuild complete
+        ret
+
+;----------------------------------------------------------------
+; rc_stamp_row — stamp slot[rcs_row][rc_pipe] in rc_grid_base, then
+; advance rcs_row. Body rows on the GRID_A pass also append their
+; target-imm address to ACTIVE_PIPE_<pipe>.
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+rc_stamp_row:
+        ld      a, (rcs_row)
+        ld      c, a                            ; C = row
+        ld      a, (rc_cap_top_row)
+        cp      c
+        jr      z, .rsr_cap_top
+        jr      c, .rsr_chk_bot                 ; cap_top_row < row
+        jr      .rsr_body                       ; cap_top_row > row → body
+.rsr_chk_bot:
+        ld      a, (rc_cap_bot_row)
+        cp      c
+        jr      z, .rsr_cap_bot
+        jr      c, .rsr_body                    ; cap_bot_row < row → body
+        ; cap_top_row < row < cap_bot_row → skip slot
+        ld      a, c
+        call    rc_slot_addr_for_row            ; HL = slot, BC preserved
+        ld      (hl), $18                       ; JR e
+        inc     hl
+        ld      (hl), $04
+        inc     hl
+        xor     a
+        ld      (hl), a
+        inc     hl
+        ld      (hl), a
+        inc     hl
+        ld      (hl), a
+        inc     hl
+        ld      (hl), a
+        jr      .rsr_advance
+.rsr_cap_top:
+        ld      hl, cap_top_handler_addrs
+        call    rc_stamp_cap_slot               ; in: C=cap_row, HL=handler table
+        jr      .rsr_advance
+.rsr_cap_bot:
+        ld      hl, cap_bot_handler_addrs
+        call    rc_stamp_cap_slot
+        jr      .rsr_advance
+.rsr_body:
+        ld      a, c
+        call    rc_slot_addr_for_row            ; HL = slot[row][pipe], BC preserved
+        ld      (hl), $31                       ; ld sp,nn
+        inc     hl
+        ld      (rcs_slot1), hl                 ; slot+1 = target-imm lo addr
+        ; target = line_table[row] + byte_x + 5
+        ld      a, c
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; row*2
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = line_table[row]
+        ld      a, (rc_byte_x)
+        add     a, 5
+        ld      l, a
+        ld      h, 0
+        add     hl, de                          ; HL = target
+        ex      de, hl                          ; DE = target
+        ld      hl, (rcs_slot1)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      (hl), $E5                       ; push hl
+        inc     hl
+        ld      (hl), $D5                       ; push de
+        inc     hl
+        ld      (hl), $C5                       ; push bc
+        ; append active-list entry on the GRID_A pass only
+        ld      a, (rcs_state)
+        dec     a
+        jr      nz, .rsr_advance                ; state 2 (GRID_B) → skip
+        ld      hl, (rcs_act_ptr)
+        ld      de, (rcs_slot1)
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      (rcs_act_ptr), hl
+.rsr_advance:
+        ld      hl, rcs_row
+        inc     (hl)
+        ret
+
 ;----------------------------------------------------------------
 frame_update:
         ; PIPE_PROGRAM runs FIRST (after the bird ops in main_loop's RED
