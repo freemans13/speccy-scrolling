@@ -206,6 +206,9 @@ prep_pipe_swap_pending: db 0
 prep_phase:      db 0
 prep_row:        db 0
 prep_gap_y:      db 8
+; Pipe whose column prep_step is currently building post-swap.
+; 255 = no build in progress (prep_step is idle).
+activate_pipe_idx: db 255
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
