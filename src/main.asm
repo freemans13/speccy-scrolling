@@ -237,6 +237,12 @@ body_b_de:      dw 0
 ; ─── Pipe grid dispatch ──────────────────────────────────────────
 shadow_grid:    dw GRID_B               ; the grid being rebuilt (not the one rendering); ipp_grid_base is init-only
 
+; ─── patch_shadow_step state ─────────────────────────────────────
+; pss_pipe_idx: which pipe sublist is processed next (0..3, wraps).
+; One call handles one pipe's 112 entries; 4 calls = full pass.
+pss_pipe_idx:   db 0
+pss_saved_sp:   dw 0                    ; SP save slot (SP-hijack)
+
 ; Scratch bytes for update_cap_imm_v2's phase-shifted cap values
 cap_L_temp:     db 0
 cap_M1_temp:    db 0
@@ -4752,6 +4758,138 @@ restore_attr_rows_1col:
 .nc:
         djnz    .row_lp
         pop     de
+        ret
+
+;----------------------------------------------------------------
+; patch_shadow_step: incremental target-imm patcher for the shadow grid.
+;
+; One call processes one pipe sublist (112 entries), so 4 consecutive calls
+; cover the entire active list (4 × 112 = 448 entries).  The cursor
+; pss_pipe_idx (0..3) selects which sublist this call works on and is
+; advanced (mod 4) before returning.
+;
+; For each active-list entry (a 16-bit GRID_A address of a target-imm byte)
+; the corresponding shadow byte is at:
+;
+;   shadow_addr = entry_addr + (shadow_grid - GRID_A)
+;
+; That delta is recomputed at call time so it stays valid across grid swaps.
+;
+; The decrement applied is identical to patch_pipe_targets:
+;   sub 1 on the low byte; if borrow (carry set after sub), dec the high byte.
+; This mirrors the 16-bit little-endian "decrement by 1" used throughout.
+;
+; Pipes flagged in prep_pipe_idx or activate_pipe_idx are skipped (cursor
+; still advances — the slice is empty for that call).
+;
+; NOT called from anywhere yet — Stage 6 wires it into main_loop.
+; Does NOT modify GRID_A or the active-list entries.
+;
+; Clobbers: AF, BC, DE, HL.  Saves/restores SP via pss_saved_sp.
+;----------------------------------------------------------------
+patch_shadow_step:
+        ; ── Compute shadow offset into DE ────────────────────────
+        ; shadow_offset = shadow_grid - GRID_A  (signed 16-bit; e.g. $D100 when
+        ; GRID_B=$AC00 and GRID_A=$DB00).  We add this to every GRID_A entry
+        ; address to produce the shadow grid target.
+        ld      hl, (shadow_grid)               ; HL = shadow grid base (e.g. $AC00)
+        ld      de, GRID_A                      ; DE = $DB00
+        xor     a                               ; clear carry
+        sbc     hl, de                          ; HL = shadow_grid - GRID_A (signed offset)
+        ex      de, hl                          ; DE = offset  (HL now trashed, DE = offset)
+
+        ; ── Load and advance cursor ───────────────────────────────
+        ld      a, (pss_pipe_idx)
+        ld      c, a                            ; C = current pipe index
+        inc     a
+        and     3                               ; (pipe_idx + 1) mod 4
+        ld      (pss_pipe_idx), a               ; advance cursor unconditionally
+
+        ; ── Skip prep and activating pipes ───────────────────────
+        ld      a, (prep_pipe_idx)
+        cp      c
+        jr      z, .pss_done                    ; this pipe is the prep pipe — skip
+        ld      a, (activate_pipe_idx)
+        cp      c
+        jr      z, .pss_done                    ; this pipe is being activated — skip
+
+        ; ── Compute ACTIVE_PIPE_N base via dispatch ───────────────
+        ; ACTIVE_PIPE_0 = $F940, stride 224 ($E0).
+        ; base = ACTIVE_PIPE_0 + C*224.  Cheapest: lookup (only 4 values).
+        ld      a, c
+        or      a
+        jr      z, .pss_pipe0
+        cp      1
+        jr      z, .pss_pipe1
+        cp      2
+        jr      z, .pss_pipe2
+        ; pipe 3
+        ld      hl, ACTIVE_PIPE_3
+        jr      .pss_walk
+.pss_pipe0:
+        ld      hl, ACTIVE_PIPE_0
+        jr      .pss_walk
+.pss_pipe1:
+        ld      hl, ACTIVE_PIPE_1
+        jr      .pss_walk
+.pss_pipe2:
+        ld      hl, ACTIVE_PIPE_2
+        ; fall through
+
+        ; ── SP-hijack walk: 28 × 4 = 112 entries ─────────────────
+        ; SP → active sublist; pop hl reads each 16-bit GRID_A address.
+        ; DE = shadow offset (kept across loop).
+        ; B  = outer djnz counter (28 iterations of 4 entries).
+.pss_walk:
+        ld      (pss_saved_sp), sp
+        ld      sp, hl                          ; SP = base of sublist
+        ld      b, 28                           ; 112 / 4 entries
+
+.pss_lp:
+        ; --- entry 1 ---
+        pop     hl                              ; HL = GRID_A target address
+        add     hl, de                          ; HL = shadow target address
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pss_nc1
+        inc     hl
+        dec     (hl)
+.pss_nc1:
+        ; --- entry 2 ---
+        pop     hl
+        add     hl, de
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pss_nc2
+        inc     hl
+        dec     (hl)
+.pss_nc2:
+        ; --- entry 3 ---
+        pop     hl
+        add     hl, de
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pss_nc3
+        inc     hl
+        dec     (hl)
+.pss_nc3:
+        ; --- entry 4 ---
+        pop     hl
+        add     hl, de
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pss_nc4
+        inc     hl
+        dec     (hl)
+.pss_nc4:
+        djnz    .pss_lp
+
+        ld      sp, (pss_saved_sp)
+.pss_done:
         ret
 
 ;----------------------------------------------------------------
