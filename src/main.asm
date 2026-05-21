@@ -1155,16 +1155,15 @@ configure_pipe_slots:
         ld      (bc), a
 
         ; ─── Step 6: build active sublist via SP-hijack push (FAST) ─
-        ; Active list layout = 112 entries × 2 bytes per pipe:
-        ;   [0..N-1]   band1 body entries  (rows 0..cap_top_row-1)
-        ;   [N]        cap_top entry
-        ;   [N+1]      cap_bot entry
-        ;   [N+2..111] band2 body entries  (rows cap_bot_row+1..159)
+        ; Stage 7: body-only list = 110 entries × 2 bytes per pipe:
+        ;   [0..N-1]    band1 body entries  (rows 0..cap_top_row-1)
+        ;   [N..109]    band2 body entries  (rows cap_bot_row+1..159)
+        ; Caps are NOT in the list (update_cap_geometry handles them).
         ;
-        ; SP starts at ACTIVE_BASE+224 (end of list) and decreases through
-        ; all four regions in REVERSE order (band2 → cap_bot → cap_top → band1).
-        ; Total entries pushed = M + 1 + 1 + N = 112 always, so SP lands
-        ; exactly at ACTIVE_BASE after the final band1 push.
+        ; SP starts at ACTIVE_BASE+220 (end of list) and decreases through
+        ; band2 then band1 (REVERSE order). Total pushed = M + N = 110 always
+        ; (skip band is a fixed 48 rows), so SP lands exactly at ACTIVE_BASE
+        ; after the final band1 push.
         ;
         ; Per body row: 35T (add hl,de; push hl; djnz) vs old 92T.
         ; Total ~4.2k T worst case (was ~10.5k T) — saves ~6.3k T per pipe.
@@ -1185,8 +1184,8 @@ configure_pipe_slots:
         ld      h, (hl)
         ld      l, a                            ; HL = ACTIVE_BASE
 
-        ; SP = ACTIVE_BASE + 224 (end of active list)
-        ld      bc, 224
+        ; SP = ACTIVE_BASE + 220 (end of the 110-entry body-only list)
+        ld      bc, 220
         add     hl, bc
         ld      sp, hl                          ; SP ready for band2 pushes
 
@@ -1223,37 +1222,9 @@ configure_pipe_slots:
         djnz    .cps_act_b2_lp
 .cps_act_b2_done:
 
-        ; --- cap_bot entry: push cap_bot_target_imm_addrs[pipe] ---
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, cap_bot_target_imm_addrs
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_act_cb_nc
-        inc     h
-.cps_act_cb_nc:
-        ld      a, (hl)
-        ld      c, a
-        inc     hl
-        ld      a, (hl)
-        ld      b, a                            ; BC = cap_bot_addr
-        push    bc                              ; write entry, SP -= 2
-
-        ; --- cap_top entry: push cap_top_target_imm_addrs[pipe] ---
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, cap_top_target_imm_addrs
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_act_ct_nc
-        inc     h
-.cps_act_ct_nc:
-        ld      a, (hl)
-        ld      c, a
-        inc     hl
-        ld      a, (hl)
-        ld      b, a                            ; BC = cap_top_addr
-        push    bc                              ; write entry, SP -= 2
+        ; Stage 7: the cap_top / cap_bot entries are no longer in the active
+        ; list — caps scroll via update_cap_geometry, not patch_shadow_step.
+        ; The list is body-only: band2 (M entries) + band1 (N entries) = 110.
 
         ; --- Band 1: rows [0, cap_top_row-1], pushed in reverse ---
         ld      a, (cps_cap_top_row)
@@ -1395,7 +1366,7 @@ shift_pipe_targets:
         ld      d, (hl)
         push    de
         pop     ix                              ; IX = sublist cursor
-        ld      b, 112                          ; 112 entries per pipe
+        ld      b, 110                          ; Stage 7: 110 body-only entries per pipe
 .spt_lp:
         ld      l, (ix+0)
         ld      h, (ix+1)                       ; HL = target imm addr
@@ -3644,7 +3615,172 @@ update_cap_imm_v2:
         inc     iy
         pop     bc
         djnz    .bot_lp
+        ; fall through into update_cap_geometry
+
+;----------------------------------------------------------------
+; update_cap_geometry — repoint each cap handler's _target and _next
+; imms at the LIVE grid (grid_call+1) for next frame's PIPE_PROGRAM.
+; Caps no longer scroll via the active list (Stage 7): only the live
+; grid is executed, so the shared per-pipe handlers just need to be
+; correct for whichever grid is live. Runs every frame after the
+; cap-bitmap refresh above.
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+update_cap_geometry:
+        ld      b, 0                            ; B = pipe 0..3
+.ucg_lp:
+        ld      a, b
+        ld      (ucg_pipe), a
+        ; gap_y = pipe_state[pipe*2 + 1]
+        add     a, a
+        inc     a
+        ld      hl, pipe_state
+        add     a, l
+        ld      l, a
+        jr      nc, .ucg_gy_nc
+        inc     h
+.ucg_gy_nc:
+        ld      c, (hl)                         ; C = gap_y
+        ; cap_top: cap_row = gap_y - 1
+        ld      a, c
+        dec     a
+        ld      (ucg_cap_row), a
+        ld      hl, cap_top_target_imm_addrs
+        ld      (ucg_tgt_tbl), hl
+        ld      hl, cap_top_next_imm_addrs
+        ld      (ucg_nxt_tbl), hl
+        push    bc
+        call    ucg_write
+        pop     bc
+        ; cap_bot: cap_row = gap_y + PIPE_GAP
+        ld      a, c
+        add     a, PIPE_GAP
+        ld      (ucg_cap_row), a
+        ld      hl, cap_bot_target_imm_addrs
+        ld      (ucg_tgt_tbl), hl
+        ld      hl, cap_bot_next_imm_addrs
+        ld      (ucg_nxt_tbl), hl
+        push    bc
+        call    ucg_write
+        pop     bc
+        inc     b
+        ld      a, b
+        cp      NUM_PIPES
+        jr      nz, .ucg_lp
         ret
+
+;----------------------------------------------------------------
+; ucg_write — write one cap handler's _target and _next imms.
+;   _target = line_table[ucg_cap_row] + byte_x + 5   (matches body slots)
+;   _next   = live_grid + (pipe<3 ? cap_row*32 + 1 + (pipe+1)*6
+;                                 : (cap_row+1)*32)
+; In:  ucg_pipe, ucg_cap_row, ucg_tgt_tbl, ucg_nxt_tbl.
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+ucg_write:
+        ; --- target = line_table[cap_row] + byte_x + 5 ---
+        ld      a, (ucg_cap_row)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; cap_row*2
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = line_table[cap_row]
+        ld      a, (ucg_pipe)
+        add     a, a
+        ld      hl, pipe_state
+        add     a, l
+        ld      l, a
+        jr      nc, .ucg_w_bx_nc
+        inc     h
+.ucg_w_bx_nc:
+        ld      a, (hl)                         ; A = byte_x
+        add     a, 5
+        ld      l, a
+        ld      h, 0
+        add     hl, de                          ; HL = target
+        ld      a, (ucg_pipe)
+        add     a, a
+        ld      de, (ucg_tgt_tbl)
+        add     a, e
+        ld      e, a
+        jr      nc, .ucg_w_tt_nc
+        inc     d
+.ucg_w_tt_nc:
+        ld      a, (de)
+        ld      c, a
+        inc     de
+        ld      a, (de)
+        ld      b, a                            ; BC = &_target imm
+        ld      a, l
+        ld      (bc), a
+        inc     bc
+        ld      a, h
+        ld      (bc), a
+        ; --- next ---
+        ld      a, (ucg_pipe)
+        cp      NUM_PIPES - 1
+        jr      z, .ucg_w_p3
+        ; pipe 0-2: cap_row*32 + 1 + (pipe+1)*6
+        ld      a, (ucg_cap_row)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; cap_row*32
+        ld      a, (ucg_pipe)
+        inc     a                               ; pipe+1
+        ld      e, a
+        add     a, a
+        add     a, e                            ; (pipe+1)*3
+        add     a, a                            ; (pipe+1)*6
+        inc     a                               ; + 1 (EXX byte)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        jr      .ucg_w_nbase
+.ucg_w_p3:
+        ; pipe 3: (cap_row+1)*32  (EXX byte of next row)
+        ld      a, (ucg_cap_row)
+        inc     a
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; (cap_row+1)*32
+.ucg_w_nbase:
+        ld      de, (grid_call + 1)             ; live grid base
+        add     hl, de                          ; HL = next slot address
+        ld      a, (ucg_pipe)
+        add     a, a
+        ld      de, (ucg_nxt_tbl)
+        add     a, e
+        ld      e, a
+        jr      nc, .ucg_w_nt_nc
+        inc     d
+.ucg_w_nt_nc:
+        ld      a, (de)
+        ld      c, a
+        inc     de
+        ld      a, (de)
+        ld      b, a                            ; BC = &_next imm
+        ld      a, l
+        ld      (bc), a
+        inc     bc
+        ld      a, h
+        ld      (bc), a
+        ret
+
+ucg_pipe:       db 0
+ucg_cap_row:    db 0
+ucg_tgt_tbl:    dw 0
+ucg_nxt_tbl:    dw 0
 
 ;----------------------------------------------------------------
 ; Bird routines
@@ -4826,10 +4962,10 @@ restore_attr_rows_1col:
 ;----------------------------------------------------------------
 ; patch_shadow_step: incremental target-imm patcher for the shadow grid.
 ;
-; One call processes one pipe sublist (112 entries), so 4 consecutive calls
-; cover the entire active list (4 × 112 = 448 entries).  The cursor
-; pss_pipe_idx (0..3) selects which sublist this call works on and is
-; advanced (mod 4) before returning.
+; One call processes one pipe sublist (110 body-only entries — Stage 7
+; removed the 2 cap entries), so 4 consecutive calls cover the whole
+; active list.  The cursor pss_pipe_idx (0..3) selects which sublist this
+; call works on and is advanced (mod 4) before returning.
 ;
 ; For each active-list entry (a 16-bit GRID_A address of a target-imm byte)
 ; the corresponding shadow byte is at:
@@ -4899,14 +5035,15 @@ patch_shadow_step:
         ld      hl, ACTIVE_PIPE_2
         ; fall through
 
-        ; ── SP-hijack walk: 28 × 4 = 112 entries ─────────────────
+        ; ── SP-hijack walk: 27 × 4 + 2 = 110 entries ─────────────
+        ; Stage 7: the list is 110 body-only entries (caps removed).
         ; SP → active sublist; pop hl reads each 16-bit GRID_A address.
         ; DE = shadow offset (kept across loop).
-        ; B  = outer djnz counter (28 iterations of 4 entries).
+        ; B  = outer djnz counter (27 iterations of 4 entries), then 2 more.
 .pss_walk:
         ld      (pss_saved_sp), sp
         ld      sp, hl                          ; SP = base of sublist
-        ld      b, 28                           ; 112 / 4 entries
+        ld      b, 27                           ; 108 entries; 2 more below
 
 .pss_lp:
         ; --- entry 1 ---
@@ -4951,6 +5088,25 @@ patch_shadow_step:
 .pss_nc4:
         djnz    .pss_lp
 
+        ; --- 2 trailing entries (110 = 27*4 + 2) ---
+        pop     hl
+        add     hl, de
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pss_ncA
+        inc     hl
+        dec     (hl)
+.pss_ncA:
+        pop     hl
+        add     hl, de
+        ld      a, (hl)
+        sub     1
+        ld      (hl), a
+        jr      nc, .pss_ncB
+        inc     hl
+        dec     (hl)
+.pss_ncB:
         ld      sp, (pss_saved_sp)
 .pss_done:
         ret
