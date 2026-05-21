@@ -169,38 +169,11 @@ main_loop:
         call    update_cap_imm_v2
         ld      a, 6                    ; PROFILE: YELLOW = column build
         out     ($fe), a
-        ; Amortized column build. do_swap sets activate_pipe_idx to the
-        ; just-activated pipe and do_swap_fired=1. The swap frame itself skips
-        ; the build (do_swap_fired); subsequent frames run up to 6 prep_step
-        ; chunks each, spreading the ~20k build over ~3 frames — small enough
-        ; per frame to stay under budget, short enough total (~3 frames <
-        ; one 4-frame wrap) that pipe spacing is not disturbed. ps_phase6
-        ; sets activate_pipe_idx=255 when the build completes.
-        ld      a, (do_swap_fired)
-        or      a
-        jr      nz, .swap_frame_skip
-        ld      b, 6                            ; max prep_step chunks this frame
-.build_loop:
-        ld      a, (activate_pipe_idx)
-        cp      255
-        jr      z, .post_prep_step              ; idle, or build just finished
-        ld      a, 1
-        ld      (sound_heavy_frame), a
-        push    bc
-        call    prep_step
-        pop     bc
-        djnz    .build_loop
-        jr      .post_prep_step
-.swap_frame_skip:
-        xor     a
-        ld      (do_swap_fired), a
-        ld      a, 1
-        ld      (sound_heavy_frame), a
-.post_prep_step:
-        ; Stage 4: rolling column rebuild (no-op self-verifier). One pipe
-        ; per frame rebuilt into GRID_A at current geometry — byte-identical
-        ; to what is already there. Skipped on build/configure frames.
-        call    rolling_rebuild_step
+        ; Stage 8: amortised recycle rebuild. rc_step stamps ROWS_PER_STEP
+        ; rows of the parked pipe's column per frame, into GRID_A (+active
+        ; list regen) then GRID_B. Armed by do_swap (and by init for the
+        ; first parked pipe); a no-op when idle.
+        call    rc_step
         call    sfx_slice               ; sound — single slice in the idle tail
         ld      a, 0                    ; PROFILE: BLACK = idle before halt
         out     ($fe), a
@@ -1608,7 +1581,7 @@ write_jrskip_column:
         add     a, l                            ; A = pipe*6
         ld      l, a
         ld      h, 0
-        ld      de, SLOT_GRID_BASE + 1
+        ld      de, (wjc_base)                  ; grid base + 1 (Stage 8: per-grid)
         add     hl, de                          ; HL → slot[0][pipe]
         ld      d, $18                          ; JR e opcode
         ld      e, $04                          ; displacement → next slot
@@ -1627,6 +1600,8 @@ write_jrskip_column:
 .wjc_nc:
         djnz    .wjc_lp
         ret
+
+wjc_base:       dw SLOT_GRID_BASE + 1           ; slot[0][0] base; do_swap sets per grid
 
 ;----------------------------------------------------------------
 init_pipes:
@@ -1694,6 +1669,11 @@ init_pipes:
         ; JR-skip for pipe 3). Clone it into GRID_B so the double-buffer
         ; starts with two identical, correctly-shaped grids.
         call    clone_grid_a_to_b
+
+        ; Stage 8: pipe 3 is the initial parked pipe — arm rc_step to build
+        ; its real column (both grids) over the frames before it activates.
+        ld      a, 3
+        call    rc_arm
 
         ; Defensive: zero-fill ACTIVE_PIPE_3 (224 bytes) so that if do_swap's
         ; fallback path ever triggers patch_pipe_targets before phase 6 runs,
@@ -3346,114 +3326,66 @@ wrap_byte_x:
 ; In:  A = departing pipe index (0..3; NOT prep_pipe_idx).
 ; Clobbers: AF, BC, DE, HL, HL' (saved and restored).
 ;----------------------------------------------------------------
-do_swap:
-        ld      (ds_dep), a                     ; save departing pipe index
+do_swap:                                        ; A = departing pipe (D)
+        ld      (ds_dep), a
+        ; ── Stage 8 thin swap ──────────────────────────────────────────
+        ; The incoming pipe = current prep_pipe_idx (the parked pipe). Its
+        ; column was already rebuilt at byte_x=29 by rc_step during its long
+        ; parked window — it simply stops being the prep pipe. D becomes the
+        ; new parked pipe: blanked in both grids now, then rebuilt
+        ; incrementally by rc_step over its parked lead time (~112 frames).
 
-        ; ── Full swap ────────────────────────────────────────────────────
-        ; do_swap is only ever called from wrap_byte_x's .swap_with_prep,
-        ; which guards the call with prep_phase==7. The historical fallback
-        ; path (prep not ready) is therefore unreachable and was removed.
-.ds_full_swap:
-        ; Capture dep's OLD gap_y for later band-boundary computations.
-        ; Must happen BEFORE step 3 overwrites pipe_state[inc].
-        ld      a, (ds_dep)
-        add     a, a                            ; dep*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
-        add     hl, de                          ; HL = &pipe_state[dep].gap_y
-        ld      a, (hl)                         ; A = OLD gap_y
-        ld      (ds_old_gap_y), a
-
+        ; Incoming P.byte_x = 29 (already 29; defensive).
         ld      a, (prep_pipe_idx)
-        ld      (ds_inc), a                     ; incoming = old prep_pipe_idx
-
-        ; 1. Set incoming pipe's byte_x=29 in pipe_state.
-        ;    gap_y is NOT touched here — the incoming pipe's gap_y already holds
-        ;    the correct value (chosen when it departed). prep_gap_y at do_swap
-        ;    entry is a stale leftover; writing it would clobber the truth.
-        ld      a, (ds_inc)
-        add     a, a                            ; inc*2
+        add     a, a
         ld      l, a
         ld      h, 0
         ld      de, pipe_state
-        add     hl, de                          ; HL = &pipe_state[inc*2]
-        ld      (hl), 29                        ; byte_x = 29
+        add     hl, de
+        ld      (hl), 29
 
-        ; 2. (REMOVED) Incoming cap-slot arming relocated to ps_phase6 tail.
-        ;    Arming at swap time was overwritten by prep_step's column rebuild
-        ;    (ps_phase1 NOP-fills the cap range). ps_phase6 now arms the caps at
-        ;    build completion, so the $C3 JP opcodes survive into gameplay.
+        ; D is the new parked pipe.
+        ld      a, (ds_dep)
+        ld      (prep_pipe_idx), a
+        ; D.byte_x = 29
+        add     a, a
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state
+        add     hl, de
+        ld      (hl), 29
 
-        ; 3. (REMOVED) Cap target/_next imm writes relocated to ps_phase6 tail.
+        ; D.gap_y = fresh random (rc_arm reads it below).
+        call    random_gap_y                    ; A = gap_y; clobbers AF, HL
+        ld      c, a
+        ld      a, (ds_dep)
+        add     a, a
+        inc     a                               ; D*2 + 1
+        ld      hl, pipe_state
+        add     a, l
+        ld      l, a
+        jr      nc, .ds_gy_nc
+        inc     h
+.ds_gy_nc:
+        ld      (hl), c                         ; pipe_state[D].gap_y
 
-        ; 4. (REMOVED) Body-target-write for incoming pipe eliminated.
-        ;    prep_step phases 0 and 2 now stamp body slots with target=line_addr+34
-        ;    (= byte_x=29 buffer col) instead of $0000. After swap the incoming
-        ;    pipe's body slots already point at byte_x=29. No per-swap rewrite needed.
-
-        ; 5. Departing column becomes JR-skip.
-        ;    write_jrskip_column writes $18 $04 (JR e=$04) into bytes 0-1 of
-        ;    ALL 160 slots of dep's column — body rows, cap rows and cap-skip
-        ;    rows alike. PIPE_PROGRAM then JR-skips dep's column (12 T/row)
-        ;    instead of executing wasteful body pushes into invisible memory.
-        ;    Byte 0 (the opcode) IS overwritten, so the slot is unambiguously
-        ;    a JR — no JP-to-ROM hazard (do_swap_partial_rewrite_bug). Bytes
-        ;    2-5 are left stale but are UNREACHABLE (the JR jumps over them),
-        ;    so they are never executed; prep_step overwrites all 6 bytes
-        ;    when the column is rebuilt.
-        ;    write_jrskip_column clobbers AF,BC,DE,HL — do_swap holds no
-        ;    live state in those registers at this point (ds_* scratch is in
-        ;    memory; HL' is untouched). Nothing to preserve.
+        ; Blank D's column in BOTH grids now — its old byte_x≈1 column would
+        ; otherwise show fragments (cols 4-6 visible) until rc_step overwrites
+        ; it. rc_step then rebuilds it row-by-row over the parked window.
+        ld      hl, GRID_A + 1
+        ld      (wjc_base), hl
         ld      a, (ds_dep)
         call    write_jrskip_column
-
-        ; 7. Update prep_pipe_idx, reset prep state, trigger post-swap build.
+        ld      hl, GRID_B + 1
+        ld      (wjc_base), hl
         ld      a, (ds_dep)
-        ld      (prep_pipe_idx), a              ; departing pipe is now the prep pipe
+        call    write_jrskip_column
+        ld      hl, GRID_A + 1                  ; restore default for other callers
+        ld      (wjc_base), hl
 
-        ; The incoming (just-activated) pipe's column is currently JR-skip
-        ; (it was the prep pipe). prep_step must FULLY rebuild it post-swap.
-        ; Trigger that build:
-        ;   activate_pipe_idx = ds_inc  → makes prep_step start building
-        ;   prep_phase = 0, prep_row = 0 → restart the build state machine
-        ;   prep_gap_y = incoming gap_y → prep_step builds the column to this
-        ;                                 gap_y. Step 1 stored prep_gap_y (as
-        ;                                 it was on entry) into
-        ;                                 pipe_state[ds_inc].gap_y, so re-read
-        ;                                 it from there to be unambiguous.
-        ld      a, (ds_inc)
-        ld      (activate_pipe_idx), a          ; the pipe prep_step now builds
-
-        ld      a, (ds_inc)
-        add     a, a                            ; inc*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
-        add     hl, de                          ; HL = &pipe_state[ds_inc].gap_y
-        ld      a, (hl)
-        ld      (prep_gap_y), a                 ; gap_y of the column to build
-
-        ; Pick the DEPARTING pipe's next gap_y now (it has just become the prep
-        ; pipe). Stored into pipe_state[ds_dep].gap_y; consumed ~one cycle later
-        ; when ds_dep next activates. random_gap_y clobbers AF and HL only —
-        ; store its A-result before anything else uses A.
-        call    random_gap_y                    ; A = fresh random gap_y for departing pipe
-        ld      c, a                            ; preserve gap_y across address calc
+        ; Arm the incremental two-grid rebuild of D (byte_x=29, new gap_y).
         ld      a, (ds_dep)
-        add     a, a                            ; dep*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
-        add     hl, de                          ; HL = &pipe_state[ds_dep].gap_y
-        ld      (hl), c                          ; store fresh random gap_y
-
-        ; ps_cap_top_row/ps_cap_bot_row will be reset by prep_step phase 3.
-        xor     a
-        ld      (prep_phase), a                 ; reset to phase 0 (start fresh)
-        ld      (prep_row), a
-        ld      a, 1
-        ld      (do_swap_fired), a              ; tell main_loop to skip prep_step this frame
+        call    rc_arm
         ret
 
 ; ── Scratch variables for do_swap ────────────────────────────────
