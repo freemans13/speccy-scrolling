@@ -39,54 +39,49 @@ Stages must be executed in order; later stages depend on earlier ones.
 
 **Files:** Modify `src/main.asm` — `redraw_pipes_v2` (the `call PIPE_PROGRAM` at the line reading `call    PIPE_PROGRAM`, currently ~3145).
 
-- [ ] **Step 1: Add a live-grid base variable**
+**CRITICAL constraint:** `redraw_pipes_v2` sets `HL = 0` in *both* register banks
+immediately before entering the grid — body slots `push hl` to write a
+trailing-zero pair to the screen. The grid entry must therefore clobber **no
+registers**. A register-indirect `jp (hl)` would corrupt the render. Use SMC:
+the grid base lives in the operand of a `call`, which uses no registers.
 
-Insert near the pipe state declarations (after `pipe_state` block, alongside other `dw` scratch like `body_a_bc`):
+- [ ] **Step 1: Label the grid call so its operand is SMC-addressable**
 
-```
-live_grid:   dw PIPE_PROGRAM          ; base of the grid redraw_pipes_v2 renders
-```
-
-- [ ] **Step 2: Render through the pointer**
-
-In `redraw_pipes_v2`, replace:
-
-```
-        call    PIPE_PROGRAM
-```
-
-with an indirect call (Z80 has no `call (hl)`; push a return address and `jp (hl)`):
+In `redraw_pipes_v2`, the tail is `ld (saved_sp), sp` / `call PIPE_PROGRAM` /
+`ret`. Add a label on the `call` so later stages can patch its 2-byte operand:
 
 ```
-        ld      hl, .pp_return
-        push    hl                      ; return address for the grid epilogue's RET
-        ld      hl, (live_grid)
-        jp      (hl)
-.pp_return:
+        ld      (saved_sp), sp
+grid_call:
+        call    PIPE_PROGRAM            ; operand (grid_call+1) is SMC-patched to swap grids
+        ret
 ```
 
-The grid epilogue is `ld sp,(saved_sp) ; ret` — the `ret` consumes the pushed `.pp_return`. Behaviour is identical to the old `call`.
+This is the *only* change — behaviour is byte-identical to before (the
+operand still says `PIPE_PROGRAM`). The "live grid pointer" is simply the
+2 bytes at `grid_call+1`; no separate variable is needed.
 
-- [ ] **Step 3: Build check**
+- [ ] **Step 2: Build check**
 
 Run: `make` — expect `Errors: 0, warnings: 0`.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add src/main.asm
-git commit -m "refactor: render pipe grid through a live_grid pointer"
+git commit -m "refactor: label the pipe grid call site for later SMC grid-swap"
 ```
 
-- [ ] **Step 5: CHECKPOINT**
+- [ ] **Step 4: CHECKPOINT**
 
-Human runs `make run`: the game must look and run **exactly as before** — pipes scroll, no glitch, border profile unchanged. This verifies the indirect call path.
+Human runs `make run`: the game must look and run **exactly as before** —
+pipes scroll, no glitch or pixel corruption, border profile unchanged.
 
 ---
 
 ## Stage 2: Allocate the second grid (memory reshuffle)
 
-**Goal:** Reserve a second 5120-byte grid (`GRID_B`) and a renamed `GRID_A` for the existing one, with no behaviour change. `live_grid` / a new `shadow_grid` both initially point at `GRID_A`.
+**Goal:** Reserve a second 5120-byte grid (`GRID_B`) and a renamed `GRID_A` for the existing one, with no behaviour change. The live grid stays `GRID_A` (the `grid_call+1` operand); a new `shadow_grid` variable tracks `GRID_B`.
 
 **Study first:** the EQU/memory-map block at the top of `src/main.asm` (lines ~12–80) — `SLOT_GRID_BASE`, `SLOT_GRID_END`, `SLOT_ADDR_TABLE`, `ACTIVE_PIPE_0..3`, `ACTIVE_LIST_END`; and confirm the top of free RAM vs the stack at `$8000`.
 
@@ -99,10 +94,11 @@ Add EQUs: `GRID_A EQU SLOT_GRID_BASE` (existing grid, unchanged address). Place 
 - [ ] **Step 2: Add the shadow_grid variable**
 
 ```
-shadow_grid: dw GRID_B                 ; grid currently being rebuilt
+shadow_grid: dw GRID_B                 ; grid currently being rebuilt (not the one rendering)
 ```
 
-and change `live_grid` initial value to `GRID_A`.
+The *live* grid is the operand at `grid_call+1` (already `GRID_A`/`PIPE_PROGRAM`
+from Stage 1); `shadow_grid` tracks the other one. No `live_grid` variable.
 
 - [ ] **Step 3: Build check** — `make` → `Errors: 0, warnings: 0`.
 
@@ -129,7 +125,7 @@ git commit -m "feat: reserve second pipe grid GRID_B and memory map for it"
 - [ ] **Step 2:** At init, call the emitter twice — once for `GRID_A`, once for `GRID_B` — producing two byte-identical grids for the current pipe geometry.
 - [ ] **Step 3: Build check** — `make` → `Errors: 0, warnings: 0`.
 - [ ] **Step 4: Commit** — `git commit -m "feat: parameterise grid emitter on base; build both grids at init"`.
-- [ ] **Step 5: CHECKPOINT** — Human `make run`: behaviour unchanged. (Optional diagnostic: temporarily point `live_grid` at `GRID_B` and confirm the game still renders correctly, then revert — proves GRID_B is a valid grid.)
+- [ ] **Step 5: CHECKPOINT** — Human `make run`: behaviour unchanged. (Optional diagnostic: temporarily SMC-patch `grid_call+1` to `GRID_B` and confirm the game still renders correctly, then revert — proves GRID_B is a valid grid.)
 
 ---
 
@@ -158,7 +154,7 @@ git commit -m "feat: reserve second pipe grid GRID_B and memory map for it"
 **Files:** Modify `src/main.asm` — `main_loop` rebuild cursor; `advance_phase` / `wrap_byte_x`; remove the `patch_pipe_targets` call.
 
 - [ ] **Step 1:** Rebuild cursor targets `shadow_grid`, building each pipe's column for `byte_x − 1` (the next window). One pipe per frame; all four done across the 4-frame window.
-- [ ] **Step 2:** On the byte-boundary crossing, swap the live/shadow pointers (and SMC render target) and update the shadow pipes' `byte_x`.
+- [ ] **Step 2:** On the byte-boundary crossing, swap live and shadow: read the current `grid_call+1` operand, write `shadow_grid` into it (SMC), store the old operand value into `shadow_grid`. Then update the shadow pipes' `byte_x`.
 - [ ] **Step 3:** Remove the `patch_pipe_targets` call from the wrap path (leave the routine defined for now; deleted in Stage 8).
 - [ ] **Step 4: Build check** — `make` → `Errors: 0, warnings: 0`.
 - [ ] **Step 5: Commit** — `git commit -m "feat: double-buffer the pipe grid; swap on byte boundary"`.
