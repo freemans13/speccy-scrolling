@@ -34,6 +34,13 @@ ATTR_BUFFER     EQU $2D                 ; paper cyan + ink cyan — invisible bu
 GROUND_TOP      EQU 160                 ; first scan line of ground band — pipes stop here
 SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= ground+8)
 
+; ─── Beeper sound effects ────────────────────────────────────────
+SPK_BIT           EQU $10                ; bit 4 of port $FE = speaker
+SOUND_BORDER      EQU $01                ; blue profile band for the sound region
+EDGE_FIXED_ITERS  EQU 6                  ; per-edge non-delay overhead in delay-iter units (CALIBRATE — Task 6)
+SND_BUDGET_NORMAL EQU 300                ; sound delay-iters allowed on normal/wrap frames (CALIBRATE — Task 6)
+SND_BUDGET_CONFIG EQU 40                 ; sound delay-iters allowed on swap/build frames (CALIBRATE — Task 6)
+
 ; ─── Slot grid layout (fixed-slot dispatch) ──────────────────────
 ; Phase 1: 6-byte normal slot template:
 ;   ld sp,target ; push hl ; push de ; push bc  (HL=0 → trailing-zero pair)
@@ -204,6 +211,34 @@ cap_R_temp:     db 0
 score:        dw 0
 score_last:   dw $FFFF                  ; force first render
 pipe_scored:  db 0, 0, 0, 0            ; one byte per pipe (NUM_PIPES=4)
+
+; ─── Sound engine state (read/write, persists across frames) ─────
+sound_active:     db 0                   ; 0 = idle, 1 = an effect is playing
+sound_id:         db 0                   ; 0 = flap, 1 = chime
+sound_descptr:    dw 0                   ; -> current segment in descriptor table
+sound_edges_left: dw 0                   ; edges remaining in the current segment
+sound_half:       dw 0                   ; current edge half-period (delay-loop iters)
+sound_speaker:    db 0                   ; current speaker bit ($00 or $10)
+sound_sweep:      db 0                   ; signed half-period delta applied per edge
+sound_mode:       db 0                   ; current segment mode: 0 = tone, 1 = noise
+sound_lfsr:       dw $7ACE               ; 16-bit LFSR state for noise (must stay nonzero)
+sound_budget:     dw 0                   ; delay-iters of sound permitted this frame
+snd_heavy_frame:  db 0                   ; 1 = configure/swap/build frame this frame
+
+; ─── SFX descriptors ─────────────────────────────────────────────
+; Flap "fwip": noise burst, clock rate sweeps downward (darkens as it fades).
+sfx_flap:
+        db 1 : dw  90 : dw 70 : db  3
+        db 1 : dw 160 : dw 55 : db  6
+        db 1 : dw 280 : dw 40 : db 10
+        db $FF
+; Score chime: three ascending pure tones, last note held longest.
+sfx_chime:
+        db 0 : dw 150 : dw 48 : db 0
+        db 0 : dw 120 : dw 52 : db 0
+        db 0 : dw  95 : dw 80 : db 0
+        db $FF
+
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
 wrap_pending:  db 0                      ; set when a wrap happened this frame
 ; Phase 5: pending_regen, recycled_pipe_idx and patch_pending removed.
