@@ -1608,15 +1608,15 @@ init_pipes:
 ; wrap_byte_x. No more 30 k T configure spike on recycle frames.
 
 ;----------------------------------------------------------------
-; ps_slot_addr_for_row — compute slot[row][prep_pipe_idx] address.
+; ps_slot_addr_for_row — compute slot[row][activate_pipe_idx] address.
 ; In:  A = row (0..159)
-; Out: HL = slot[row][prep_pipe_idx] = SLOT_GRID_BASE + 1 + row*32 + prep_pipe_idx*6
+; Out: HL = slot[row][activate_pipe_idx] = SLOT_GRID_BASE + 1 + row*32 + activate_pipe_idx*6
 ; Clobbers: DE, HL. BC preserved.
 ;----------------------------------------------------------------
 ps_slot_addr_for_row:
-        ; Compute prep_pipe_idx * 6 into E; use only DE to avoid clobbering BC.
+        ; Compute activate_pipe_idx * 6 into E; use only DE to avoid clobbering BC.
         push    af                              ; save row
-        ld      a, (prep_pipe_idx)
+        ld      a, (activate_pipe_idx)
         ld      e, a
         add     a, a                            ; *2
         add     a, e                            ; *3
@@ -1671,6 +1671,10 @@ ps_slot_addr_for_row:
 ; ps_saved_sp saves real SP across SP-hijack in phase 6.
 ;----------------------------------------------------------------
 prep_step:
+        ; Guard: 255 sentinel means no column build in progress — return cheaply.
+        ld      a, (activate_pipe_idx)
+        inc     a                               ; 255 -> 0 sets Z
+        ret     z
         ld      a, (prep_phase)
         or      a
         jp      z, ps_phase0
@@ -1968,8 +1972,8 @@ ps_phase4:
 ; ps_cap_top_next / ps_cap_bot_next hold the computed values; Phase 5
 ; (implementation) swap will write them to handlers when activating pipe 3.
 ps_phase5:
-        ; compute_next_slot reads cps_pipe — set to prep_pipe_idx (Phase 5: dynamic)
-        ld      a, (prep_pipe_idx)
+        ; compute_next_slot reads cps_pipe — set to activate_pipe_idx (Phase 5: dynamic)
+        ld      a, (activate_pipe_idx)
         ld      (cps_pipe), a
 
         ld      a, (ps_cap_top_row)
@@ -1995,18 +1999,18 @@ ps_phase5:
 ps_phase6:
         ld      (ps_saved_sp), sp
 
-        ; Compute prep_pipe_idx * 6 into (ps_p6_pipe6) for slot address arithmetic.
-        ld      a, (prep_pipe_idx)
+        ; Compute activate_pipe_idx * 6 into (ps_p6_pipe6) for slot address arithmetic.
+        ld      a, (activate_pipe_idx)
         ld      e, a
         add     a, a                            ; *2
         add     a, e                            ; *3
         add     a, e                            ; *4
         add     a, e                            ; *5
         add     a, e                            ; *6
-        ld      (ps_p6_pipe6), a                ; save prep_pipe_idx*6
+        ld      (ps_p6_pipe6), a                ; save activate_pipe_idx*6
 
-        ; Compute SP = ACTIVE_PIPE_<prep_pipe_idx> + 224 (end of sublist).
-        ld      a, (prep_pipe_idx)
+        ; Compute SP = ACTIVE_PIPE_<activate_pipe_idx> + 224 (end of sublist).
+        ld      a, (activate_pipe_idx)
         add     a, a                            ; * 2 (each table entry is 2 bytes)
         ld      l, a
         ld      h, 0
@@ -2044,7 +2048,7 @@ ps_phase6:
 .act_b2_done:
 
         ; ── Cap_bot entry: address of cap_bot_handler_pipe_<prep>_target
-        ld      a, (prep_pipe_idx)
+        ld      a, (activate_pipe_idx)
         add     a, a                            ; *2
         ld      l, a
         ld      h, 0
@@ -2056,7 +2060,7 @@ ps_phase6:
         push    de
 
         ; ── Cap_top entry: address of cap_top_handler_pipe_<prep>_target
-        ld      a, (prep_pipe_idx)
+        ld      a, (activate_pipe_idx)
         add     a, a
         ld      l, a
         ld      h, 0
