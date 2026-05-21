@@ -1466,36 +1466,46 @@ build_slot_templates:
 
 ;----------------------------------------------------------------
 ; write_jrskip_column — fill one pipe's entire PIPE_PROGRAM column
-; with the JR-skip pattern, making that column a no-op (cap-skip
-; style: JR e=$04 advances PC 6 bytes = exactly one slot).
+; with the JR-skip pattern, making that column a no-op.
+;
+; Only bytes 0-1 of each slot are written: $18 $04 = JR e=$04, which
+; advances PC 6 bytes = exactly one slot. Bytes 2-5 are UNREACHABLE
+; (the JR jumps over them) so they are deliberately left untouched —
+; whatever stale content they hold is never executed. prep_step
+; overwrites all 6 bytes when the column is later rebuilt. Writing
+; only 2 bytes/slot keeps this fast enough for the swap-frame budget.
 ;
 ; In:  A = pipe index (0..3).
-; Out: 160 slots of that column set to $18 $04 $00 $00 $00 $00.
-;      Only this pipe's 6 bytes per row are touched — EXX byte,
+; Out: 160 slots of that column: bytes 0-1 set to $18 $04.
+;      Only this pipe's 2 bytes per row are touched — EXX byte,
 ;      other columns, row trailer and pad bytes are left intact.
-; Clobbers: AF, BC, DE, HL, IY.
+; Clobbers: AF, BC, DE, HL.
 ;----------------------------------------------------------------
 write_jrskip_column:
-        ; IY = slot[0][pipe] = SLOT_GRID_BASE + 1 + pipe*6
+        ; HL = slot[0][pipe] = SLOT_GRID_BASE + 1 + pipe*6
         add     a, a                            ; A = pipe*2
         ld      l, a
         add     a, a                            ; A = pipe*4
         add     a, l                            ; A = pipe*6
-        ld      e, a
-        ld      d, 0                            ; DE = pipe*6
-        ld      iy, SLOT_GRID_BASE + 1
-        add     iy, de                          ; IY → slot[0][pipe]
+        ld      l, a
+        ld      h, 0
+        ld      de, SLOT_GRID_BASE + 1
+        add     hl, de                          ; HL → slot[0][pipe]
+        ld      d, $18                          ; JR e opcode
+        ld      e, $04                          ; displacement → next slot
+        ld      c, SLOT_ROW_STRIDE - 1          ; advance from slot+1 to next slot+0
         ld      b, GROUND_TOP                   ; B = 160 rows
 .wjc_lp:
-        ld      (iy+0), $18                     ; JR e
-        ld      (iy+1), $04                     ; displacement → next slot
-        ld      (iy+2), 0
-        ld      (iy+3), 0
-        ld      (iy+4), 0
-        ld      (iy+5), 0
-        ; advance IY to same column in next row: +SLOT_ROW_STRIDE
-        ld      de, SLOT_ROW_STRIDE
-        add     iy, de
+        ld      (hl), d                         ; byte 0 = $18
+        inc     hl
+        ld      (hl), e                         ; byte 1 = $04
+        ; advance HL from slot+1 to next row's slot+0: +31
+        ld      a, l
+        add     a, c
+        ld      l, a
+        jr      nc, .wjc_nc
+        inc     h
+.wjc_nc:
         djnz    .wjc_lp
         ret
 
@@ -2697,16 +2707,16 @@ do_swap:
         ;    pipe's body slots already point at byte_x=29. No per-swap rewrite needed.
 
         ; 5. Departing column becomes JR-skip.
-        ;    write_jrskip_column writes the 6-byte JR-skip pattern
-        ;    ($18 $04 $00 $00 $00 $00) into ALL 160 slots of dep's column —
-        ;    body rows, cap rows and cap-skip rows alike. PIPE_PROGRAM then
-        ;    JR-skips dep's column (12 T/row) instead of executing wasteful
-        ;    body pushes into invisible memory.
-        ;    Because every slot's 6 bytes are fully overwritten, no stale
-        ;    target bytes survive (avoids do_swap_partial_rewrite_bug) and the
-        ;    old cap-slot $C3 JP opcodes are disarmed (no separate deactivate
-        ;    sub-step needed).
-        ;    write_jrskip_column clobbers AF,BC,DE,HL,IY — do_swap holds no
+        ;    write_jrskip_column writes $18 $04 (JR e=$04) into bytes 0-1 of
+        ;    ALL 160 slots of dep's column — body rows, cap rows and cap-skip
+        ;    rows alike. PIPE_PROGRAM then JR-skips dep's column (12 T/row)
+        ;    instead of executing wasteful body pushes into invisible memory.
+        ;    Byte 0 (the opcode) IS overwritten, so the slot is unambiguously
+        ;    a JR — no JP-to-ROM hazard (do_swap_partial_rewrite_bug). Bytes
+        ;    2-5 are left stale but are UNREACHABLE (the JR jumps over them),
+        ;    so they are never executed; prep_step overwrites all 6 bytes
+        ;    when the column is rebuilt.
+        ;    write_jrskip_column clobbers AF,BC,DE,HL — do_swap holds no
         ;    live state in those registers at this point (ds_* scratch is in
         ;    memory; HL' is untouched). Nothing to preserve.
         ld      a, (ds_dep)
