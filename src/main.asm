@@ -223,9 +223,10 @@ sound_sweep:      db 0                   ; signed half-period delta applied per 
 sound_mode:       db 0                   ; current segment mode: 0 = tone, 1 = noise
 sound_lfsr:       dw $7ACE               ; 16-bit LFSR state for noise (must stay nonzero)
 sound_budget:     dw 0                   ; delay-iters of sound permitted this frame
-snd_heavy_frame:  db 0                   ; 1 = configure/swap/build frame this frame
+sound_heavy_frame: db 0                  ; 1 = configure/swap/build frame this frame
 
 ; ─── SFX descriptors ─────────────────────────────────────────────
+; segment = db mode(0=tone,1=noise,$FF=end) : dw half_period : dw edge_count : db sweep
 ; Flap "fwip": noise burst, clock rate sweeps downward (darkens as it fades).
 sfx_flap:
         db 1 : dw  90 : dw 70 : db  3
