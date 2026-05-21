@@ -2677,6 +2677,7 @@ rc_cursor:       db 0                           ; next pipe index to rebuild
 ; Clobbers: AF, BC, DE, HL.
 ;----------------------------------------------------------------
 rolling_rebuild_step:
+        ret                                     ; TEMP: rebuild disabled for headroom measurement
         ; Skip on build/configure frames — old prep_step machinery is
         ; mid-rebuild this frame; adding ~18-20k T would overrun 70k.
         ld      a, (activate_pipe_idx)
