@@ -122,17 +122,33 @@ main_loop:
         ld      a, 5                    ; PROFILE: CYAN = update_cap_imm_v2
         out     ($fe), a
         call    update_cap_imm_v2
-        ld      a, 6                    ; PROFILE: YELLOW = prep_step
+        ld      a, 6                    ; PROFILE: YELLOW = column build
         out     ($fe), a
-        ; Skip prep_step on swap frame to free ~2k T budget; do_swap already
-        ; reset prep state, so missing one frame just delays prep by 1 frame
-        ; (still well under the 28-frame swap interval at 10 rows/frame).
+        ; One-shot column build. do_swap sets activate_pipe_idx to the
+        ; just-activated pipe and do_swap_fired=1. The swap frame itself skips
+        ; the build (do_swap_fired); the very next frame runs a single
+        ; configure_pipe_slots for that pipe, then releases the freeze
+        ; (activate_pipe_idx=255). The pipe is held at byte_x=29 for only ~2
+        ; frames — under one 4-frame wrap — so pipe spacing is undisturbed.
         ld      a, (do_swap_fired)
         or      a
-        jr      nz, .skip_prep_step
-        call    prep_step
+        jr      nz, .swap_frame_skip
+        ld      a, (activate_pipe_idx)
+        cp      255
+        jr      z, .post_prep_step              ; no build pending
+        ld      c, a                            ; C = pipe index to build
+        add     a, a                            ; pipe*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state + 1
+        add     hl, de                          ; HL = &pipe_state[pipe].gap_y
+        ld      e, (hl)                         ; E = gap_y
+        ld      a, c                            ; A = pipe index
+        call    configure_pipe_slots
+        ld      a, 255
+        ld      (activate_pipe_idx), a          ; release freeze — pipe now scrolls
         jr      .post_prep_step
-.skip_prep_step:
+.swap_frame_skip:
         xor     a
         ld      (do_swap_fired), a
 .post_prep_step:
@@ -165,13 +181,14 @@ saved_sp_inner: dw 0                    ; second save slot — inner CALL inside
 ground_iy_save: dw 0
 
 pipe_state:
-        ; Phase 3: 4 pipes. 3 active + 1 preparing.
-        ; Initial spacing: 29, 22, 15, 8 (every 7 byte_x). Last entry starts as
-        ; the "preparing" slot — see prep_pipe_idx.
-        db 29, 64                       ; pipe 0: just entering from right buffer
-        db 22, 40                       ; pipe 1
-        db 15, 88                       ; pipe 2
-        db  8, 24                       ; pipe 3 (Phase 3 starts inert)
+        ; 4 pipes. 3 active + 1 preparing.
+        ; The 3 active pipes are spaced evenly across the [1,29] track
+        ; (~9-10 byte_x apart). The recycle scheme (leave at 1, enter at 29)
+        ; preserves this spacing — so even init = even forever.
+        db 29, 64                       ; pipe 0
+        db 19, 40                       ; pipe 1
+        db 10, 88                       ; pipe 2
+        db  8, 24                       ; pipe 3 (prep; byte_x set to 29 at init)
 
 ; Scratch words for cap_bot's BC/DE restore. Populated by redraw_pipes_v2 at frame entry.
 body_a_bc:      dw 0
