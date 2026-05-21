@@ -109,6 +109,8 @@ main_loop:
         di
         ld      a, 2                    ; PROFILE: RED = top blanking
         out     ($fe), a
+        xor     a
+        ld      (sound_heavy_frame), a
         ; Phase 2: bird ops run BEFORE PIPE_PROGRAM in top blanking.
         ; All bird writes complete before raster reaches row 0, so the
         ; bird is visible same-frame at every Y with no flicker.
@@ -146,6 +148,8 @@ main_loop:
         ld      a, (activate_pipe_idx)
         cp      255
         jr      z, .post_prep_step              ; idle, or build just finished
+        ld      a, 1
+        ld      (sound_heavy_frame), a
         push    bc
         call    prep_step
         pop     bc
@@ -154,7 +158,17 @@ main_loop:
 .swap_frame_skip:
         xor     a
         ld      (do_swap_fired), a
+        ld      a, 1
+        ld      (sound_heavy_frame), a
 .post_prep_step:
+        ld      hl, SND_BUDGET_NORMAL
+        ld      a, (sound_heavy_frame)
+        or      a
+        jr      z, .snd_budget_set
+        ld      hl, SND_BUDGET_CONFIG
+.snd_budget_set:
+        ld      (sound_budget), hl
+        call    sfx_tick
         ld      a, 0                    ; PROFILE: BLACK = idle before halt
         out     ($fe), a
         ei
