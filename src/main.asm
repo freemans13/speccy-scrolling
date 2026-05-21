@@ -184,7 +184,7 @@ main_loop:
         ld      a, 0                    ; PROFILE: BLACK = idle before halt
         out     ($fe), a
         ei
-        jr      main_loop
+        jp      main_loop
 
 ;----------------------------------------------------------------
 ; do_white_work: state-prep work that used to be in frame_update's WHITE
