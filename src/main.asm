@@ -54,6 +54,10 @@ SLOT_GRID_BASE         EQU $DB00
 SLOT_GRID_END          EQU SLOT_GRID_BASE + 160 * SLOT_ROW_STRIDE   ; Phase 3: $DB00 + 160*32 = $EF00
 PIPE_PROGRAM           EQU SLOT_GRID_BASE              ; entry point alias
 
+; ─── Double-buffered grid (Stage 2: GRID_B reserved, not yet used) ───
+GRID_A                 EQU SLOT_GRID_BASE              ; existing grid ($DB00)
+GRID_B                 EQU $AC00                       ; second grid; $AC00+$1400 = $C000 (flush to TEMPLATE_BASE)
+
 ; Phase 3: 1 EXX + 4*6-byte slots = 25 bytes/row; pad to 32 for fast row << 5 indexing.
 ; Slot format: $31 lo hi $E5 $D5 $C5  =  ld sp,target ; push hl ; push de ; push bc
 ; HL is set to $0000 once at PIPE_PROGRAM entry; the extra push HL writes the
@@ -224,6 +228,9 @@ body_a_bc:      dw 0
 body_a_de:      dw 0
 body_b_bc:      dw 0
 body_b_de:      dw 0
+
+; ─── Pipe grid dispatch ──────────────────────────────────────────
+shadow_grid:    dw GRID_B               ; the grid being rebuilt (not the one rendering)
 
 ; Scratch bytes for update_cap_imm_v2's phase-shifted cap values
 cap_L_temp:     db 0
@@ -4416,5 +4423,7 @@ Y = 0
         dw $4000 + ((Y & 7) << 8) + ((Y & $38) << 2) + ((Y & $C0) << 5)
 Y = Y + 1
         EDUP
+
+        ASSERT $ <= GRID_B              ; code/data must not grow into GRID_B
 
         SAVESNA "build/main.sna", start
