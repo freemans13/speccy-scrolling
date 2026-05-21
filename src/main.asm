@@ -2009,6 +2009,30 @@ ps_phase5:
 ; ─── Phase 6: one-shot — build ACTIVE sublist for prep_pipe_idx (~4.2k T) ────
 ; Phase 5: generalised from pipe-3-only to use prep_pipe_idx. Covers any pipe.
 ps_phase6:
+        ; ── Self-repair cap_*_target_imm_addrs tables FIRST ─────────────────
+        ; Mirrors configure_pipe_slots' defensive re-stamp. An unidentified
+        ; runtime corruption flips a bit in cap_top_target_imm_addrs, leaving
+        ; one pipe's cap_top stuck on a bogus target (missing cap). This MUST
+        ; run before the active-list build below reads cap_*_target_imm_addrs
+        ; — otherwise a corrupt address gets baked into the ACTIVE_PIPE list
+        ; and patch_pipe_targets decrements the wrong byte forever.
+        ld      hl, cap_top_handler_pipe_0_target
+        ld      (cap_top_target_imm_addrs), hl
+        ld      hl, cap_top_handler_pipe_1_target
+        ld      (cap_top_target_imm_addrs + 2), hl
+        ld      hl, cap_top_handler_pipe_2_target
+        ld      (cap_top_target_imm_addrs + 4), hl
+        ld      hl, cap_top_handler_pipe_3_target
+        ld      (cap_top_target_imm_addrs + 6), hl
+        ld      hl, cap_bot_handler_pipe_0_target
+        ld      (cap_bot_target_imm_addrs), hl
+        ld      hl, cap_bot_handler_pipe_1_target
+        ld      (cap_bot_target_imm_addrs + 2), hl
+        ld      hl, cap_bot_handler_pipe_2_target
+        ld      (cap_bot_target_imm_addrs + 4), hl
+        ld      hl, cap_bot_handler_pipe_3_target
+        ld      (cap_bot_target_imm_addrs + 6), hl
+
         ld      (ps_saved_sp), sp
 
         ; Compute activate_pipe_idx * 6 into (ps_p6_pipe6) for slot address arithmetic.
@@ -2111,30 +2135,6 @@ ps_phase6:
 .act_b1_done:
 
         ld      sp, (ps_saved_sp)
-
-        ; ── Self-repair cap_*_target_imm_addrs tables ───────────────────────
-        ; Mirrors configure_pipe_slots' defensive re-stamp. An unidentified
-        ; runtime corruption flips a bit in cap_top_target_imm_addrs, leaving
-        ; one pipe's cap_top stuck on a bogus screen target (missing cap).
-        ; configure_pipe_slots only runs at init, so recycles never repaired
-        ; it. ps_phase6 is the per-recycle configure point — re-stamp here,
-        ; BEFORE the cap-arming code below reads these tables.
-        ld      hl, cap_top_handler_pipe_0_target
-        ld      (cap_top_target_imm_addrs), hl
-        ld      hl, cap_top_handler_pipe_1_target
-        ld      (cap_top_target_imm_addrs + 2), hl
-        ld      hl, cap_top_handler_pipe_2_target
-        ld      (cap_top_target_imm_addrs + 4), hl
-        ld      hl, cap_top_handler_pipe_3_target
-        ld      (cap_top_target_imm_addrs + 6), hl
-        ld      hl, cap_bot_handler_pipe_0_target
-        ld      (cap_bot_target_imm_addrs), hl
-        ld      hl, cap_bot_handler_pipe_1_target
-        ld      (cap_bot_target_imm_addrs + 2), hl
-        ld      hl, cap_bot_handler_pipe_2_target
-        ld      (cap_bot_target_imm_addrs + 4), hl
-        ld      hl, cap_bot_handler_pipe_3_target
-        ld      (cap_bot_target_imm_addrs + 6), hl
 
         ; ── Arm incoming cap slots in PIPE_PROGRAM (relocated from do_swap) ──
         ; Runs once at build completion: after the column has been (re)built and
