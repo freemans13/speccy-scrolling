@@ -3409,6 +3409,70 @@ render_score:
         add     hl, bc                  ; undo the overshoot
         ret
 
+;----------------------------------------------------------------
+; Sound engine — trigger routines + descriptor walking.
+;----------------------------------------------------------------
+
+; sfx_trigger_flap: start the flap effect, unless a chime is playing
+; (chime beats flap). A flap fired mid-flap restarts cleanly.
+; Clobbers A, HL.
+sfx_trigger_flap:
+        ld      a, (sound_active)
+        or      a
+        jr      z, .start
+        ld      a, (sound_id)
+        cp      1                       ; 1 = chime currently playing?
+        ret     z                       ; yes → ignore the flap
+.start:
+        ld      hl, sfx_flap
+        ld      a, 0                    ; id = flap
+        jr      sfx_begin
+
+; sfx_trigger_chime: start the chime, interrupting any flap.
+; Clobbers A, HL.
+sfx_trigger_chime:
+        ld      hl, sfx_chime
+        ld      a, 1                    ; id = chime
+        ; fall through into sfx_begin
+
+; sfx_begin: HL = descriptor address, A = sound id. Arms the effect.
+; sound_edges_left is zeroed so sfx_tick loads segment 0 on its next call.
+; Clobbers A.
+sfx_begin:
+        ld      (sound_id), a
+        ld      (sound_descptr), hl
+        ld      a, 1
+        ld      (sound_active), a
+        xor     a
+        ld      (sound_edges_left), a
+        ld      (sound_edges_left+1), a
+        ret
+
+; sfx_next_segment: read the next 6-byte segment at sound_descptr into the
+; live state vars and advance sound_descptr. If the mode byte is $FF the
+; effect is over → clear sound_active. Clobbers A, DE, HL.
+sfx_next_segment:
+        ld      hl, (sound_descptr)
+        ld      a, (hl)                 ; mode byte
+        cp      $FF
+        jr      z, .end
+        ld      (sound_mode), a
+        inc     hl
+        ld      e, (hl) : inc hl
+        ld      d, (hl) : inc hl
+        ld      (sound_half), de        ; half_period
+        ld      e, (hl) : inc hl
+        ld      d, (hl) : inc hl
+        ld      (sound_edges_left), de  ; edge_count
+        ld      a, (hl) : inc hl
+        ld      (sound_sweep), a        ; sweep
+        ld      (sound_descptr), hl
+        ret
+.end:
+        xor     a
+        ld      (sound_active), a
+        ret
+
 ; bird_attr_addr: HL = ATTRS + (A >> 3) * 32 + 8, A = y_high.
 ;   (A & $F8) << 2 == char_row * 32 (since char_row*32 = (y>>3)*32 = y*4 once
 ;   the low 3 bits are masked off).
