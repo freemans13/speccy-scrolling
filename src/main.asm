@@ -124,22 +124,26 @@ main_loop:
         call    update_cap_imm_v2
         ld      a, 6                    ; PROFILE: YELLOW = column build
         out     ($fe), a
-        ; One-shot column build. do_swap sets activate_pipe_idx to the
+        ; Amortized column build. do_swap sets activate_pipe_idx to the
         ; just-activated pipe and do_swap_fired=1. The swap frame itself skips
-        ; the build (do_swap_fired); the very next frame loops prep_step
-        ; through all 7 phases in one go. ps_phase6 sets activate_pipe_idx=255
-        ; when the build completes, exiting the loop. The pipe is held at
-        ; byte_x=29 for only ~2 frames — under one 4-frame wrap — so pipe
-        ; spacing is undisturbed.
+        ; the build (do_swap_fired); subsequent frames run up to 6 prep_step
+        ; chunks each, spreading the ~20k build over ~3 frames — small enough
+        ; per frame to stay under budget, short enough total (~3 frames <
+        ; one 4-frame wrap) that pipe spacing is not disturbed. ps_phase6
+        ; sets activate_pipe_idx=255 when the build completes.
         ld      a, (do_swap_fired)
         or      a
         jr      nz, .swap_frame_skip
+        ld      b, 6                            ; max prep_step chunks this frame
 .build_loop:
         ld      a, (activate_pipe_idx)
         cp      255
         jr      z, .post_prep_step              ; idle, or build just finished
+        push    bc
         call    prep_step
-        jr      .build_loop
+        pop     bc
+        djnz    .build_loop
+        jr      .post_prep_step
 .swap_frame_skip:
         xor     a
         ld      (do_swap_fired), a
