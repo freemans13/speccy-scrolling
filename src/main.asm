@@ -3334,6 +3334,7 @@ update_score:
         ld      hl, (score)
         inc     hl
         ld      (score), hl
+        call    sfx_trigger_chime
         pop     bc
         pop     hl
         jr      .next
@@ -3603,6 +3604,7 @@ read_input:
         ret     nz
         ld      hl, FLAP_VY
         ld      (bird_vy), hl
+        call    sfx_trigger_flap
         ret
 
 update_bird:
