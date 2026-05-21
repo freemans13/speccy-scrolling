@@ -1547,25 +1547,15 @@ init_pipes:
         cp      3                            ; Phase 3: configure only pipes 0..2 (not pipe 3)
         jr      nz, .init_cps_lp
 
-        ; Phase 3: pipe 3 is the "preparing" slot column. Init it to all-NOPs.
-        ; Slot column 3 at row R is at SLOT_GRID_BASE + 1 + row*32 + 3*6
-        ;   = SLOT_GRID_BASE + 1 + 18 = SLOT_GRID_BASE + 19 for row 0.
-        ; 6 bytes × 160 rows = 960 NOP bytes to write.
-        ld      hl, SLOT_GRID_BASE + 1 + 3*SLOT_STRIDE  ; first byte of pipe-3 slot at row 0
-        ld      b, 160
-.init_pipe3_lp:
-        push    bc
-        xor     a                            ; A = $00 (NOP opcode)
-        ld      b, SLOT_STRIDE               ; 6 bytes per slot
-.init_pipe3_byte_lp:
-        ld      (hl), a
-        inc     hl
-        djnz    .init_pipe3_byte_lp
-        ; Advance HL to pipe-3 slot of next row: HL += (SLOT_ROW_STRIDE - SLOT_STRIDE) = 32 - 6 = 26
-        ld      bc, SLOT_ROW_STRIDE - SLOT_STRIDE
-        add     hl, bc
-        pop     bc
-        djnz    .init_pipe3_lp
+        ; Refactor: pipe 3 is the "prep" pipe. Its column is held as a
+        ; JR-skip column (cheap no-op) until the first do_swap activates it.
+        ; pipe_state[3].byte_x = 29 — parked off-screen right, invisible.
+        ; pipe_state[3].gap_y is left at its data default (a valid 8..96
+        ; value); do_swap reads it when pipe 3 first activates.
+        ld      a, 29
+        ld      (pipe_state + 3*2), a        ; pipe 3 byte_x = 29
+        ld      a, 3
+        call    write_jrskip_column          ; pipe 3 column = JR-skip
 
         ; Defensive: zero-fill ACTIVE_PIPE_3 (224 bytes) so that if do_swap's
         ; fallback path ever triggers patch_pipe_targets before phase 6 runs,
@@ -1583,11 +1573,13 @@ init_pipes:
         ld      hl, 336
         ld      (ACTIVE_COUNT_NEW), hl
 
-        ; Phase 4: initialise prep state machine. prep_step will prepare pipe 3's
-        ; slot column incrementally over the next ~112 frames, starting from phase 0.
-        ; prep_gap_y is taken from pipe_state[3*2+1] (gap_y of pipe 3 at init).
-        xor     a
+        ; Refactor: prep state machine is IDLE at startup. No build is in
+        ; progress (activate_pipe_idx == 255, its db default) — prep_step
+        ; returns immediately. prep_phase = 7 means "done / idle"; the first
+        ; do_swap will arm the build and reset prep_phase/prep_row itself.
+        ld      a, 7
         ld      (prep_phase), a
+        xor     a
         ld      (prep_row), a
         ld      a, (pipe_state + 3*2 + 1)
         ld      (prep_gap_y), a
