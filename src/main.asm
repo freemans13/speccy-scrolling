@@ -43,7 +43,7 @@ EDGE_FIXED_ITERS  EQU 14                 ; per-edge non-delay overhead in delay-
 ; heavier, so they get less sound budget to stay under the 70k T ceiling.
 SND_SLICE_NORMAL  EQU 1100               ; budget on normal frames (CALIBRATE)
 SND_SLICE_WRAP    EQU 700                ; budget on wrap/swap frames (CALIBRATE)
-SND_SLICE_CONFIG  EQU 90                 ; budget on build frames (CALIBRATE)
+SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no room for sound
 
 ; ─── Slot grid layout (fixed-slot dispatch) ──────────────────────
 ; Phase 1: 6-byte normal slot template:
