@@ -28,7 +28,7 @@ that the re-sync work becomes **uniform per frame** instead of spiky.
 ## Goal
 
 Every frame costs roughly the same — no spikes — so headroom is consistent.
-Target: a flat ~32–35k T-states/frame, peak well under the 70k ceiling.
+Target: a flat ~44–46k T-states/frame, peak well under the 70k ceiling.
 
 ## Architecture — double-buffered grid with a rolling rebuild
 
@@ -61,9 +61,10 @@ pipe's `gap_y`, it stamps:
 4. the cap-bot slot at `cap_bot_row`
 5. body slots for rows `[cap_bot_row + 1 .. 159]`
 
-Each band is a tight stamp-from-template loop writing the 6-byte slot plus the
-target address derived from the pipe's shadow `byte_x`. Target estimate:
-~6–8k T-states/frame.
+Each band is a stamp-from-template loop writing the 6-byte slot plus the
+target address derived from the pipe's shadow `byte_x`. A full 160-row column
+rebuild costs ~18–20k T-states (the same work the old `prep_step` spread over
+many frames); done once per frame this is affordable — see Cost budget below.
 
 Because a full column is rebuilt every time, the rebuild does not care whether
 a pipe just scrolled one byte or just recycled to `byte_x = 29` with a new
@@ -109,13 +110,16 @@ memory-map reshuffle. Exact addresses are assigned in the implementation plan.
 | Component | T-states/frame |
 |---|---|
 | Render `live_grid` | ~16k |
-| Rolling rebuild (1 pipe column) | ≤8k (hard target) |
+| Rolling rebuild (1 pipe column) | ~18–20k |
 | Bird / ground / score | ~10k |
-| **Total, every frame** | **~32–35k, flat** |
+| **Total, every frame** | **~44–46k, flat** |
 
-Peak frame cost drops from ~67k to ~35k. Every routine is still T-state
-counted per the project discipline; the rebuild has a hard ≤8k T/frame target
-and must be verified with the border profiler.
+Peak frame cost drops from ~67k to ~45k. A full from-geometry column rebuild
+genuinely costs ~18–20k T (this is why the old `prep_step` amortised the build
+over many frames); doing one whole column per frame is affordable because the
+flat ~45k frame still leaves ~25k T of headroom under the 70k ceiling — enough
+for a uniform beeper-sound budget. Every routine is still T-state counted per
+the project discipline and verified with the border profiler.
 
 ## Open detail — cap handlers
 
@@ -127,7 +131,7 @@ not affect the architecture above.
 
 ## Payoff for sound
 
-With every frame flat at ~35k there is ~35k T-states of headroom on **every**
+With every frame flat at ~45k there is ~25k T-states of headroom on **every**
 frame. The beeper sound budget becomes uniform — no wrap/build flutter — and
 the muted flap effect can be re-enabled. The sound work, currently parked, is
 fully unblocked by this redesign.

@@ -137,11 +137,11 @@ git commit -m "feat: reserve second pipe grid GRID_B and memory map for it"
 
 **Files:** Modify `src/main.asm` — add `rebuild_column`; add a per-frame rebuild cursor in `main_loop`.
 
-- [ ] **Step 1:** Implement `rebuild_column` (pipe index + target grid base → stamps that pipe's column band-by-band). Reuse `BODY_TEMPLATE` / `CAP_BLOCK` stamping logic from `prep_step`. Hard target ≤8k T-states; count it with the border profiler.
-- [ ] **Step 2:** In `main_loop`, add a cursor that calls `rebuild_column` for one pipe per frame against the **live** grid at its current geometry (a self-overwrite with identical bytes).
+- [ ] **Step 1:** Implement `rebuild_column` (pipe index + target grid base → stamps that pipe's column band-by-band). Reuse `BODY_TEMPLATE` / `CAP_BLOCK` stamping logic from `prep_step`. A full column rebuild costs ~18–20k T-states (this is the same work `prep_step` amortised); soft target ≤22k T — use `prep_step`'s proven row-stamping, do not chase stack-blast micro-optimisation.
+- [ ] **Step 2:** In `main_loop`, add a cursor that calls `rebuild_column` for one pipe per frame against the **live** grid at its current geometry (a self-overwrite with identical bytes). The cursor must **skip `prep_pipe_idx` and the activating pipe**, and — because the old machinery still runs this stage — **skip build/configure frames entirely** (`activate_pipe_idx != 255`), so no frame pays both the old ~67k config work and the ~18k rebuild.
 - [ ] **Step 3: Build check** — `make` → `Errors: 0, warnings: 0`.
 - [ ] **Step 4: Commit** — `git commit -m "feat: band-structured rolling column rebuild (no-op verify)"`.
-- [ ] **Step 5: CHECKPOINT** — Human `make run`: pipes render **identically** (the rebuild reproduces the existing grid). Border profiler: the rebuild band is ≤8k T and the frame stays well under 70k.
+- [ ] **Step 5: CHECKPOINT** — Human `make run`: pipes render **identically** (the rebuild reproduces the existing grid). Border profiler: the rebuild adds ~18–20k T on the frames it runs, and the frame stays under 70k.
 
 ---
 
