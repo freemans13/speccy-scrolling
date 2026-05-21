@@ -724,6 +724,38 @@ init_grid_epilogue:
         ld      (hl), $C9
         ret
 
+;----------------------------------------------------------------
+; clone_grid_a_to_b: make GRID_B a byte-for-byte copy of the fully
+; CONFIGURED GRID_A.  init_pipe_program emits only raw body slots;
+; the cap/skip/target-shift configuration is applied to GRID_A alone
+; (configure_pipe_slots / shift_pipe_targets / write_jrskip_column all
+; hard-code SLOT_GRID_BASE).  Without this clone GRID_B is an unshaped
+; all-body grid and renders garbage the moment it goes live.
+;
+; Copies bytes 0..24 of every row (EXX + 4×6-byte slots).  Bytes 25..31
+; (the JP-next-row trailer + pad) are LEFT INTACT — init_pipe_program
+; already gave GRID_B base-relative trailers (jp GRID_B+(row+1)*32);
+; the slot bytes are all grid-independent (screen targets, cap-handler
+; jp addresses, jr-skips), so copying them is safe.
+; Call at init AFTER GRID_A is fully configured.
+;----------------------------------------------------------------
+clone_grid_a_to_b:
+        ld      hl, GRID_A
+        ld      de, GRID_B
+        ld      b, 160                  ; rows
+.cgab_row:
+        push    bc
+        ld      bc, 25                  ; EXX + 4 slots; trailer/pad left intact
+        ldir                            ; HL += 25, DE += 25
+        ld      bc, 7                   ; advance past trailer(3) + pad(4)
+        ex      de, hl
+        add     hl, bc
+        ex      de, hl                  ; DE = next row
+        add     hl, bc                  ; HL = next row
+        pop     bc
+        djnz    .cgab_row
+        ret
+
 ipp_byte_x:     ds 4, 0                 ; scratch: byte_x per pipe (Phase 3: 4 bytes)
 ipp_grid_base:  dw GRID_A              ; scratch: target grid base for init_pipe_program (init-only)
 init_pipe_bx_tmp: db 0                 ; scratch: byte_x for the pipe being configured at init
@@ -1686,6 +1718,11 @@ init_pipes:
         ld      (pipe_state + 3*2), a        ; pipe 3 byte_x = 29
         ld      a, 3
         call    write_jrskip_column          ; pipe 3 column = JR-skip
+
+        ; GRID_A is now fully configured (caps/skips/shift for pipes 0-2,
+        ; JR-skip for pipe 3). Clone it into GRID_B so the double-buffer
+        ; starts with two identical, correctly-shaped grids.
+        call    clone_grid_a_to_b
 
         ; Defensive: zero-fill ACTIVE_PIPE_3 (224 bytes) so that if do_swap's
         ; fallback path ever triggers patch_pipe_targets before phase 6 runs,
