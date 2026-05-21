@@ -147,36 +147,80 @@ operand still says `PIPE_PROGRAM`). The "live grid pointer" is simply the
 
 ---
 
-## Stage 7: Recycle into the shadow grid (amortised rebuild)
+## Stages 7–8: Combined — per-grid caps, then amortised recycle
 
-**Goal:** When a pipe recycles (`byte_x → 29`, new `gap_y`), its column changes shape and needs a full `rebuild_column` — in **both** grids. Amortise these rebuilds over the recycling pipe's invisible lead time so no frame spikes. Retire the old `do_swap` / `prep_step` configure path.
-
-**Study first:** `do_swap`, `prep_step`, `ps_phase6`, `wrap_byte_x`'s recycle branch, `random_gap_y`, `prep_pipe_idx`; the buffer-column lead time a recycled pipe has before becoming visible.
-
-**Files:** Modify `src/main.asm` — `wrap_byte_x` recycle branch; an amortised recycle-rebuild driver in `main_loop`; remove `do_swap` / `prep_step` / `configure_pipe_slots` calls.
-
-- [ ] **Step 1:** On recycle, set the pipe's `byte_x = 29` and a new `gap_y`, and mark its column "needs full rebuild in both grids".
-- [ ] **Step 2:** Add an amortised driver: each frame, advance a bounded slice of the recycled column's `rebuild_column` into whichever grid still needs it. Ensure both grids' copies of that column are complete before the pipe scrolls into view (verify against the buffer-column lead time; the recycled column gets rebuild priority that window).
-- [ ] **Step 3:** Remove the `do_swap` / `prep_step` / `configure_pipe_slots` calls (routines left defined; deleted in Stage 9).
-- [ ] **Step 4: Build check** — `make` → `Errors: 0, warnings: 0`.
-- [ ] **Step 5: Commit** — `git commit -m "feat: recycle pipes via amortised rebuild_column into both grids"`.
-- [ ] **Step 6: CHECKPOINT** — Human `make run`: pipes recycle correctly (re-enter from the right with a new gap, no corruption, no multi-second reset crash). Border profiler: **no recycle spike** — recycle frames cost the same as normal frames.
+> **Why combined / resequenced.** Investigation during Stage 6 found that caps,
+> the shadow patch, the recycle rebuild and the active list are one entangled
+> problem, so the plan's original "Stage 7 recycle → Stage 8 caps" order is
+> wrong:
+>
+> - The `ACTIVE_PIPE_N` active list has 112 entries/pipe. **110 are body-slot
+>   target-imm addresses inside GRID_A; 2 (cap_top, cap_bot) are cap-handler
+>   imm addresses** outside the grid. `patch_shadow_step` blindly adds the
+>   `shadow_grid − GRID_A` offset to *every* entry — correct for the 110 body
+>   entries, **garbage for the 2 cap entries** (it decrements memory outside
+>   both grids). Currently semi-masked by `update_cap_imm_v2` rewriting the
+>   real cap imms each frame, but it is wrong and fragile.
+> - The cap screen position lives in a **single shared handler imm**. With two
+>   grids at two byte positions, `patch_shadow_step` scrolling the shadow's caps
+>   would move the *live* grid's caps too. Caps must become **per-grid**.
+> - `rebuild_column`'s recycle path (Stage 8) must regenerate the active list,
+>   including those cap entries — so the cap representation must be settled
+>   first.
+>
+> Therefore: **Stage 7 = per-grid caps (do this first); Stage 8 = recycle.**
+> The 3+1-parked recycle model is retained (user decision: keep 3 visible pipes
+> + 1 parked pipe; do **not** switch to 4 continuously-scrolling pipes).
 
 ---
 
-## Stage 8: Cap handlers under double-buffering
+## Stage 7: Per-grid caps — fold the cap target into the grid slot
 
-**Goal:** Cap rows `JP` to shared cap handlers carrying byte-position imms; with two grids at two byte positions, cap state must be per-grid. Resolve this.
+**Goal:** A cap row's slot carries its **own per-grid screen target**, decremented by `patch_shadow_step` exactly like a body slot. The cap handler becomes geometry-free for horizontal position (reads its target from the slot, not a shared imm). This (a) makes all 112 active-list entries grid-slot addresses, so `patch_shadow_step`'s blanket offset-add is correct, and (b) gives each grid an independent cap position — a prerequisite for the double buffer being correct. The cap *bitmap* stays grid-independent phase state, still refreshed by `update_cap_imm_v2`.
 
-**Study first:** the cap handler routines, `update_cap_imm_v2`, `CAP_TARGET_TABLE`, `ps_cap_top_target` / `ps_cap_bot_target`; how a cap row's `JP cap_handler` resolves and where the cap screen position lives; how `patch_shadow_step` and `rebuild_column` touch cap rows.
+**Study first (read before writing any code):**
+- The cap handler routine(s): how a cap row's `jp cap_handler` resolves, where the cap screen position is read from, and — critically — **how the handler continues to the next slot (`slot+6`) after drawing** (the `_next` mechanism). The grid runs with `SP` hijacked to screen RAM, so the handler must `jp` onward, not `call`/`ret`.
+- `update_cap_imm_v2` — which imms are the cap *screen target* (must move per-grid) vs the cap *phase bitmap* (stays shared).
+- `CAP_TARGET_TABLE`, `CAP_BLOCK`, `cap_top_handler_addrs` / `cap_bot_handler_addrs`, `cap_*_handler_pipe_N_target`.
+- Cap slot emission in three places that must all change: init cap config (`configure_pipe_slots` via `CAP_BLOCK`), `rebuild_column`'s `rc_stamp_cap_slot`, and the active-list build (`configure_pipe_slots` Step 6, lines ~1226–1256).
+- `patch_shadow_step` (`pss_*`) — confirms it needs no cap special-casing once entries are all grid addresses.
 
-**Files:** Modify `src/main.asm` — cap handler(s), `update_cap_imm_v2`, `patch_shadow_step` / `rebuild_column` cap handling.
+**Design (confirm against the study):** Redefine the 6-byte cap slot to carry a per-grid target as the operand of a `ld sp, cap_target` (`$31 lo hi`) followed by a 3-byte `jp cap_handler` (`$C3 hh hl`). `patch_shadow_step` decrements the `lo,hi` like a body target; the active-list cap entry becomes `slot+1` (a grid address). The handler reads `SP` for the cap position and `jp`-continues to `slot+6`. **Open question to resolve in study:** how the handler reaches `slot+6` without a grid-specific `_next` imm — `slot+6` is grid+row+pipe specific. If a grid-independent continuation cannot be encoded in 6 bytes, fall back to **two cap-handler instances** (one per grid, each with its own `_next` imms maintained for that grid). Pick the encoding the study supports and record the decision in the commit message.
 
-- [ ] **Step 1:** Implement per-grid cap state — either (a) two cap-handler instances, one per grid, each with imms maintained for that grid; or (b) fold the cap screen position into the grid slot so the handler is geometry-free. Choose (a) unless (b) is clearly simpler after study.
-- [ ] **Step 2:** Ensure the spread patch and the recycle rebuild maintain the correct grid's cap state; update/retire `update_cap_imm_v2`.
-- [ ] **Step 3: Build check** — `make` → `Errors: 0, warnings: 0`.
-- [ ] **Step 4: Commit** — `git commit -m "feat: per-grid cap handling for the double-buffered renderer"`.
-- [ ] **Step 5: CHECKPOINT** — Human `make run`: pipe caps render correctly across scrolling and recycle — no cap tearing, no stale cap position after a swap.
+**Files:** Modify `src/main.asm` — cap slot format; cap handler(s); `configure_pipe_slots` (cap stamping + Step 6 active-list cap entries); `rc_stamp_cap_slot`; `update_cap_imm_v2`; remove any cap-entry special handling in `patch_shadow_step`.
+
+- [ ] **Step 1:** From the study, decide and write down (as a comment block near the cap handler) the new 6-byte cap slot format and the handler-continuation mechanism.
+- [ ] **Step 2:** Update the cap handler(s) to take the cap screen target from the slot; keep the phase-bitmap imms refreshed by `update_cap_imm_v2`.
+- [ ] **Step 3:** Update every cap-slot emitter — init/`configure_pipe_slots` cap stamping, `rc_stamp_cap_slot` — to emit the new format into the target grid.
+- [ ] **Step 4:** Update the active-list build (`configure_pipe_slots` Step 6) so the cap_top/cap_bot entries are the cap slot's target-imm addresses (grid addresses), not handler-imm addresses.
+- [ ] **Step 5:** Confirm `patch_shadow_step` is now correct with all entries as grid addresses; remove any cap-entry workaround.
+- [ ] **Step 6: Build check** — `make` → `Errors: 0, warnings: 0`, ASSERT passes.
+- [ ] **Step 7: Commit** — `git commit -m "feat: per-grid caps — cap screen target folded into the grid slot"`.
+- [ ] **Step 8: CHECKPOINT** — Human `make run`: caps render correctly with the live grid swapping between GRID_A/GRID_B every byte boundary — no cap tear, no stale cap position after a swap. (Recycle is still the old path; run up to just before the first recycle, ~30 frames.)
+
+---
+
+## Stage 8: Recycle via amortised rebuild into both grids
+
+**Goal:** The freeze fix. When a pipe recycles, rebuild its full column at `byte_x=29` + new `gap_y` into **both** grids, amortised over the parked pipe's lead time, with `ACTIVE_PIPE_N` regenerated. Keep the 3+1-parked model and a thin swap; retire `prep_step`/`ps_phase0..6`/`configure_pipe_slots`.
+
+**Study first:** `do_swap`, `prep_step` + `ps_phase0..6`, `wrap_byte_x`'s `.swap_with_prep` branch, `rebuild_column` + `rc_*` helpers, the active-list build in `configure_pipe_slots` Step 6, `random_gap_y`, `prep_pipe_idx` / `activate_pipe_idx`, `write_jrskip_column`, `do_swap_fired`; the parked-pipe lead time (the parked pipe holds a JR-skip column from when it departed at `byte_x=1` until the next swap re-activates it at `byte_x=29` — ~100 frames).
+
+**Design:**
+- `rebuild_column` becomes **row-sliced incremental**: a driver processes a bounded row count per call (cursor word holds `{pipe, grid, row}`), reusing `rc_stamp_body_band` / `rc_stamp_cap_slot` for sub-ranges; ~30k T spread over enough frames to stay inside the flat budget (≥8 frames per grid → ≤~4k T/frame).
+- The driver (or `rebuild_column`) also **regenerates `ACTIVE_PIPE_N`** for the rebuilt pipe. Cap entries are now grid addresses (Stage 7), so the regen is uniform.
+- Keep `do_swap` as a **thin swap only**: on `byte_x==1`, exchange active/parked roles — set incoming `byte_x=29`, pick the departing pipe's new `gap_y` (`random_gap_y`), set the departing column to JR-skip in **both** grids (`write_jrskip_column` targeting both), set `activate_pipe_idx=incoming`, mark "rebuild incoming column in both grids".
+- **Amortised driver in `main_loop`** replaces the `prep_step` build loop: while a rebuild is pending, advance a slice into GRID_A (+ active list) first, then GRID_B. `activate_pipe_idx` keeps `patch_shadow_step` off the rebuilding column until both grids are done (it already skips `activate_pipe_idx`). Both grids must complete before the pipe scrolls visible — verify against the lead time.
+- Retire the `prep_step` / `configure_pipe_slots` calls (routines left defined; deleted in Stage 9).
+
+**Files:** Modify `src/main.asm` — `rebuild_column` (incremental driver + cursor + active-list regen); `do_swap` (thin swap); `write_jrskip_column` (both grids); `main_loop` (amortised driver replacing the `prep_step` loop); `wrap_byte_x`.
+
+- [ ] **Step 1:** Make `rebuild_column` row-sliceable — add an incremental driver + `{pipe,grid,row}` cursor; include active-list regen. Build clean; not yet wired into `main_loop` (Stage-5 pattern). Commit `feat: row-sliced incremental rebuild_column with active-list regen`.
+- [ ] **Step 2:** Thin `do_swap`: JR-skip the departing column in both grids; arm the both-grid rebuild of the incoming column.
+- [ ] **Step 3:** Add the amortised rebuild driver to `main_loop`, replacing the `prep_step` build loop; remove the `prep_step` / `configure_pipe_slots` calls.
+- [ ] **Step 4: Build check** — `make` → `Errors: 0, warnings: 0`.
+- [ ] **Step 5: Commit** — `git commit -m "feat: recycle pipes via amortised rebuild_column into both grids"`.
+- [ ] **Step 6: CHECKPOINT** — Human `make run`: pipes recycle correctly (re-enter from the right with a new gap, no corruption, **no freeze**, no multi-second reset). A full session survives indefinitely. Border profiler: **no recycle spike** — recycle frames cost the same as normal frames.
 
 ---
 
@@ -186,7 +230,7 @@ operand still says `PIPE_PROGRAM`). The "live grid pointer" is simply the
 
 **Files:** Modify `src/main.asm` — delete dead routines/data; the disabled `rolling_rebuild_step`; sound budget constants and `main_loop` classification; `read_input`.
 
-- [ ] **Step 1:** Delete the disabled `rolling_rebuild_step` and its `rc_cursor`; delete `do_swap`, `prep_step`, `configure_pipe_slots`, the single-shot `patch_pipe_targets`, the JR-skip prep-column code, and any now-orphaned scratch/EQUs. Recompute the memory map. Build must stay clean.
+- [ ] **Step 1:** Delete the disabled `rolling_rebuild_step` and its `rc_cursor`; delete `prep_step` + `ps_phase0..6` and their scratch, `configure_pipe_slots`, `shift_pipe_targets`, the single-shot `patch_pipe_targets`, and any now-orphaned scratch/EQUs. **Keep** `do_swap` (now the thin swap), `write_jrskip_column`, and `rebuild_column`. Recompute the memory map. Build must stay clean.
 - [ ] **Step 2:** Replace the per-frame-type sound budget classification in `main_loop` with a single uniform `SND_SLICE` budget — frames are now all ~equal cost. Set it from the profiler-measured headroom (~22k T → ~800–900 delay-iters; calibrate). Remove the wrap/build classification and the now-dead `sound_heavy_frame`.
 - [ ] **Step 3:** Re-enable the flap: uncomment the `call sfx_trigger_flap` in `read_input`.
 - [ ] **Step 4: Build check** — `make` → `Errors: 0, warnings: 0`.
@@ -197,7 +241,8 @@ operand still says `PIPE_PROGRAM`). The "live grid pointer" is simply the
 
 ## Self-review notes
 
-- **Spec coverage:** two grids (Stages 1–3 ✓), `rebuild_column` (Stage 4 ✓), grid-targeted incremental imm-patch (Stage 5), double-buffer swap + spread patch retiring the wrap spike (Stage 6), recycle via amortised rebuild retiring `do_swap`/`prep_step` (Stage 7), per-grid cap handlers (Stage 8), cleanup + uniform sound + flap (Stage 9) — all Approach-2 spec sections mapped.
+- **Spec coverage:** two grids (Stages 1–3 ✓), `rebuild_column` (Stage 4 ✓), grid-targeted incremental imm-patch (Stage 5 ✓), double-buffer swap + spread patch retiring the wrap spike (Stage 6 ✓ — scroll verified; freezes on recycle pending Stage 8), per-grid caps (Stage 7), amortised recycle into both grids (Stage 8), cleanup + uniform sound + flap (Stage 9) — all Approach-2 spec sections mapped.
 - **Approach-2 pivot:** Stages 1–4 are complete from the Approach-1 attempt and carry over unchanged. Stages 5–9 are the Approach-2 strategy (spread the cheap re-sync; amortise the recycle) — the per-frame full rebuild is abandoned.
-- **Staging discipline:** every stage ends building clean and runnable with a profiler checkpoint.
-- **Risk:** Stage 6 (live double-buffer swap) and Stage 7 (recycle) are the dangerous ones — each independently committed and checkpoint-gated. Measure with the profiler; do not trust estimates.
+- **Stages 7–8 resequenced:** the original Stage 7 (recycle) / Stage 8 (caps) order was inverted — caps must be made per-grid *before* the recycle rebuild, because the recycle regenerates the active list whose cap entries depend on the cap representation, and because `patch_shadow_step` is already incorrect on cap entries without the per-grid fix. See the combined-stages note above.
+- **Staging discipline:** every stage ends building clean. Stages 7–8 are checkpoint-gated; the Stage 7 checkpoint can only verify up to the first recycle (the freeze fix lands in Stage 8).
+- **Risk:** Stage 6 (done), Stage 7 (cap-format change touching the SP-hijacked grid) and Stage 8 (recycle) are the dangerous ones — each independently committed and checkpoint-gated. Measure with the profiler; do not trust estimates.
