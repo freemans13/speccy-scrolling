@@ -2247,6 +2247,8 @@ ps_phase6:
 
         ld      a, 7
         ld      (prep_phase), a
+        ld      a, 255                          ; build done — unfreeze the activated pipe
+        ld      (activate_pipe_idx), a
         ret
 
 ps_p6_pipe6: db 0                              ; prep_pipe_idx * 6 scratch for phase 6
@@ -2398,6 +2400,9 @@ patch_pipe_targets:
         ; Pipe 0
         or      a                               ; prep_pipe_idx == 0?
         jr      z, .pt_done_p0
+        ld      a, (activate_pipe_idx)          ; freeze activating pipe (255 when idle)
+        or      a                               ; activate_pipe_idx == 0?
+        jr      z, .pt_done_p0
         ld      sp, ACTIVE_PIPE_0
         ld      b, 28                           ; 112 / 4
 .pt_lp_p0:
@@ -2439,6 +2444,9 @@ patch_pipe_targets:
         ; Pipe 1
         ld      a, (prep_pipe_idx)
         cp      1                               ; prep_pipe_idx == 1?
+        jr      z, .pt_done_p1
+        ld      a, (activate_pipe_idx)          ; freeze activating pipe (255 when idle)
+        cp      1                               ; activate_pipe_idx == 1?
         jr      z, .pt_done_p1
         ld      sp, ACTIVE_PIPE_1
         ld      b, 28
@@ -2482,6 +2490,9 @@ patch_pipe_targets:
         ld      a, (prep_pipe_idx)
         cp      2                               ; prep_pipe_idx == 2?
         jr      z, .pt_done_p2
+        ld      a, (activate_pipe_idx)          ; freeze activating pipe (255 when idle)
+        cp      2                               ; activate_pipe_idx == 2?
+        jr      z, .pt_done_p2
         ld      sp, ACTIVE_PIPE_2
         ld      b, 28
 .pt_lp_p2:
@@ -2523,6 +2534,9 @@ patch_pipe_targets:
         ; Pipe 3 (Phase 5: newly active after swap; skipped when prep_pipe_idx == 3)
         ld      a, (prep_pipe_idx)
         cp      3                               ; prep_pipe_idx == 3?
+        jr      z, .pt_done_p3
+        ld      a, (activate_pipe_idx)          ; freeze activating pipe (255 when idle)
+        cp      3                               ; activate_pipe_idx == 3?
         jr      z, .pt_done_p3
         ld      sp, ACTIVE_PIPE_3
         ld      b, 28
@@ -2586,6 +2600,9 @@ wrap_byte_x:
         ld      a, (prep_pipe_idx)
         cp      c
         jr      z, .wbx_skip                   ; skip the preparing pipe
+        ld      a, (activate_pipe_idx)          ; freeze activating pipe (255 when idle)
+        cp      c
+        jr      z, .wbx_skip                   ; skip the activating pipe — build in progress
         ; active pipe: check byte_x
         ld      a, (iy+0)
         cp      1
