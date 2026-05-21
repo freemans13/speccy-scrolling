@@ -37,9 +37,9 @@ SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= 
 ; ─── Beeper sound effects ────────────────────────────────────────
 SPK_BIT           EQU $10                ; bit 4 of port $FE = speaker
 SOUND_BORDER      EQU $01                ; blue profile band for the sound region
-EDGE_FIXED_ITERS  EQU 6                  ; per-edge non-delay overhead in delay-iter units (CALIBRATE — Task 6)
-SND_BUDGET_NORMAL EQU 300                ; sound delay-iters allowed on normal/wrap frames (CALIBRATE — Task 6)
-SND_BUDGET_CONFIG EQU 40                 ; sound delay-iters allowed on swap/build frames (CALIBRATE — Task 6)
+EDGE_FIXED_ITERS  EQU 14                 ; per-edge non-delay overhead in delay-iter units (CALIBRATE — Task 6)
+SND_BUDGET_NORMAL EQU 1200               ; sound delay-iters allowed on normal/wrap frames (CALIBRATE — Task 6)
+SND_BUDGET_CONFIG EQU 90                 ; sound delay-iters allowed on swap/build frames (CALIBRATE — Task 6)
 
 ; ─── Slot grid layout (fixed-slot dispatch) ──────────────────────
 ; Phase 1: 6-byte normal slot template:
@@ -248,10 +248,11 @@ sfx_flap:
         db 1 : dw 280 : dw 40 : db 10
         db $FF
 ; Score chime: three ascending pure tones, last note held longest.
+; Higher pitches fit more wave cycles per frame-slice → cleaner tone.
 sfx_chime:
-        db 0 : dw 150 : dw 48 : db 0
-        db 0 : dw 120 : dw 52 : db 0
-        db 0 : dw  95 : dw 80 : db 0
+        db 0 : dw 75 : dw  64 : db 0
+        db 0 : dw 60 : dw  72 : db 0
+        db 0 : dw 47 : dw 120 : db 0
         db $FF
 
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
@@ -3618,7 +3619,7 @@ read_input:
         ret     nz
         ld      hl, FLAP_VY
         ld      (bird_vy), hl
-        call    sfx_trigger_flap
+        ; call    sfx_trigger_flap        ; TEMP (Task 6): flap muted to tune the chime in isolation
         ret
 
 update_bird:
