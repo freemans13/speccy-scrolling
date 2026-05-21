@@ -195,9 +195,6 @@ scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
 wrap_pending:  db 0                      ; set when a wrap happened this frame
 ; Phase 5: pending_regen, recycled_pipe_idx and patch_pending removed.
 prep_pipe_idx:   db 3                  ; Phase 3: pipe 3 starts as the preparing column
-; Bug 2 fix: do_swap fallback defers prep_pipe_idx update until after wrap_byte_x loop.
-; 0 = no pending swap; N+1 = update prep_pipe_idx to N after loop exits.
-prep_pipe_swap_pending: db 0
 ; Phase 4: incremental-prepare state machine variables.
 ; prep_phase 0..6 = which configure sub-step we are on; 7 = done.
 ; prep_row  0..N  = current row within the current phase (phases 0, 2 use rows;
@@ -2575,7 +2572,7 @@ patch_pipe_targets:
 ; wrap_byte_x: scroll all active (non-prep) pipes left by one byte (8 px).
 ;   Phase 5: iterate all 4 pipes, skip prep_pipe_idx.
 ;   When byte_x == 1: call do_swap to exchange with the prepared pipe.
-;     If prep not ready (prep_phase != 7): fast fallback (byte_x=29, new gap_y, no configure).
+;     If prep not ready (prep_phase != 7): defer — leave byte_x=1, retry next wrap.
 ; Tail-call patch_pipe_targets to decrement every active body slot's screen
 ; target by ROW_OFFSET (= 1) so they walk to the next column.
 ;
@@ -2625,17 +2622,6 @@ wrap_byte_x:
         inc     iy
         inc     iy
         djnz    .outer
-.wbx_apply_pending:
-        ; Bug 2 fix: apply deferred prep_pipe_idx update from fallback path.
-        ; prep_pipe_swap_pending == dep+1 if the fallback ran; 0 otherwise.
-        ld      a, (prep_pipe_swap_pending)
-        or      a
-        jr      z, .wbx_no_pending
-        dec     a                               ; recover dep
-        ld      (prep_pipe_idx), a
-        xor     a
-        ld      (prep_pipe_swap_pending), a     ; clear pending flag
-.wbx_no_pending:
         ; Run patch_pipe_targets so NEXT frame's PIPE_PROGRAM renders at NEW byte_x.
         call    patch_pipe_targets
         ret
@@ -2643,7 +2629,8 @@ wrap_byte_x:
 ;----------------------------------------------------------------
 ; do_swap: called when pipe A (departing) has reached byte_x=1.
 ;
-; If prep_phase == 7 (prep ready): full swap (~14 k T total).
+; Only called from wrap_byte_x's .swap_with_prep, which is guarded by
+; prep_phase==7, so do_swap always performs a full swap (~14 k T total).
 ;   - Set pipe_state[incoming].byte_x = 29 (gap_y left untouched — already correct).
 ;   - Cap arming (incoming $C3 + handler addrs + target/_next imms) is NOT done
 ;     here: it is relocated to ps_phase6's tail so it survives prep_step's
@@ -2660,124 +2647,16 @@ wrap_byte_x:
 ;   patch_pipe_targets walks the new active pipe each wrap → targets decrement and
 ;   pipe scrolls leftward naturally.
 ;
-; If prep_phase != 7 (fallback):
-;   - Re-randomise departing pipe's gap_y and set byte_x=29 in place.
-;     (byte_x=29 is intentional: pipe stays at 29 while its slot column is
-;     all-NOP, so pipe_state[dep].byte_x stays at 29 throughout dep's prep
-;     cycle — pipe_state drives attr routines, not the NOP column itself.)
-;   - Clear all 6 bytes of each of the departing pipe's 160 slot rows to $00
-;     (full NOP slide). Without clearing bytes 1-5, stray pushes would occur
-;     when the slot executes with a wrong SP.
-;   - Set prep_pipe_swap_pending = dep+1 (deferred; applied after wrap_byte_x
-;     loop exits to prevent the loop from walking the old prep pipe).
-;
 ; In:  A = departing pipe index (0..3; NOT prep_pipe_idx).
 ; Clobbers: AF, BC, DE, HL, HL' (saved and restored).
 ;----------------------------------------------------------------
 do_swap:
         ld      (ds_dep), a                     ; save departing pipe index
 
-        ; Guard: only do full swap when prep is complete (phase 7).
-        ld      a, (prep_phase)
-        cp      7
-        jp      z, .ds_full_swap
-
-        ; ── Fallback: prep not ready. Fast in-place recycle. ────────────
-        ; First, zero-fill ACTIVE_PIPE_<dep> (224 bytes) so stale entries
-        ; can't corrupt slot bytes via patch_pipe_targets when dep eventually
-        ; becomes active again. The full-swap path skips this — phase 6 has
-        ; rebuilt the sublist there. Fallback path lacks that guarantee.
-        ld      a, (ds_dep)
-        add     a, a                            ; dep*2
-        ld      e, a
-        ld      d, 0
-        ld      hl, active_pipe_addrs
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = ACTIVE_PIPE_<dep>
-        ld      hl, 224
-        add     hl, de                          ; HL = ACTIVE_PIPE_<dep> + 224 (end)
-        ld      (saved_sp_inner), sp            ; save real SP
-        ld      sp, hl                          ; SP = end of buffer
-        ld      hl, 0
-        ; 112 pushes × 11 T = 1232 T
-        REPT 112
-            push hl
-        ENDR
-        ld      sp, (saved_sp_inner)            ; restore real SP
-
-        ; Just pick new random gap_y and reset byte_x=29 for the departing pipe.
-        ; The departing pipe's slot column stays configured (body targets at old byte_x=1
-        ; position, which is the LEFT buffer → invisible writes for 1 frame until
-        ; patch_pipe_targets scrolls targets further). After ~2 frames the old targets
-        ; wrap off left buffer into visible area, so we MUST clear the $31 opcode.
-        ; Clear: write $00 to byte 0 of all 160 departing-pipe slots → NOP slide.
-        ; Then body slots write nothing, and prep_step will reconfigure them.
-        call    random_gap_y                    ; A = new random gap_y
-        ld      (ds_tmp), a                     ; save gap_y
-
-        ; Clear all 6 bytes of all 160 slots in departing pipe's column → full NOP slide.
-        ; Without this, bytes 1-5 left as ($00 $00 $E5 $D5 $C5) after clearing byte 0
-        ; would cause stray pushes with wrong SP on execution.
-        ld      a, (ds_dep)
-        ld      e, a
-        add     a, a    ; dep*2
-        add     a, e    ; dep*3
-        add     a, e    ; dep*4
-        add     a, e    ; dep*5
-        add     a, e    ; dep*6
-        ld      l, a
-        ld      h, 0
-        ld      de, SLOT_GRID_BASE + 1
-        add     hl, de                          ; HL = slot[0][dep]
-        ld      de, SLOT_ROW_STRIDE - SLOT_STRIDE + 1 ; 27: HL at slot+5 after 5 incs;
-                                                      ; +27 reaches next row's slot+0.
-        ld      b, GROUND_TOP                   ; 160
-        xor     a
-.ds_fb_clr:
-        ld      (hl), a                         ; byte 0
-        inc     hl
-        ld      (hl), a                         ; byte 1
-        inc     hl
-        ld      (hl), a                         ; byte 2
-        inc     hl
-        ld      (hl), a                         ; byte 3
-        inc     hl
-        ld      (hl), a                         ; byte 4
-        inc     hl
-        ld      (hl), a                         ; byte 5
-        add     hl, de                          ; advance to next row's dep slot
-        djnz    .ds_fb_clr
-
-        ; Set pipe_state[dep] byte_x=29, gap_y=new
-        ld      a, (ds_dep)
-        add     a, a                            ; dep*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state
-        add     hl, de                          ; HL = &pipe_state[dep*2]
-        ld      (hl), 29                        ; byte_x = 29
-        inc     hl
-        ld      a, (ds_tmp)
-        ld      (hl), a                         ; gap_y = new random
-
-        ; Update prep state so prep_step rebuilds this pipe (new gap_y may differ).
-        ; NOTE: we do NOT update prep_pipe_idx here — the wrap_byte_x loop is still
-        ; running and relies on the OLD prep_pipe_idx to skip the old prep pipe.
-        ; Instead, set prep_pipe_swap_pending = dep+1; wrap_byte_x applies it after
-        ; its loop exits (see .wbx_apply_pending below).
-        ld      a, (ds_dep)
-        inc     a                               ; dep+1 (0 means "no pending")
-        ld      (prep_pipe_swap_pending), a
-        ld      a, (ds_tmp)
-        ld      (prep_gap_y), a
-        xor     a
-        ld      (prep_phase), a
-        ld      (prep_row), a
-        ret
-
         ; ── Full swap ────────────────────────────────────────────────────
+        ; do_swap is only ever called from wrap_byte_x's .swap_with_prep,
+        ; which guards the call with prep_phase==7. The historical fallback
+        ; path (prep not ready) is therefore unreachable and was removed.
 .ds_full_swap:
         ; Capture dep's OLD gap_y for later band-boundary computations.
         ; Must happen BEFORE step 3 overwrites pipe_state[inc].
@@ -2885,12 +2764,7 @@ do_swap:
 do_swap_fired: db 0                            ; main_loop reads and clears each frame
 ds_dep:     db 0                               ; departing pipe index
 ds_inc:     db 0                               ; incoming pipe index
-ds_tmp:     db 0                               ; temp (fallback gap_y)
-ds_pipe6:   db 0                               ; incoming pipe index × 6
-ds_cap_top: db 0                               ; temp scratch (reused for dep*6 in cap deactivate)
-ds_cap_bot: db 0                               ; (unused in full_swap path; kept for alignment)
 ds_old_gap_y: db 0                             ; dep's OLD gap_y, captured at .ds_full_swap entry
-ds_band2_count: db 0                           ; band 2 row count, set before setup exx & loaded after
 
 active_pipe_addrs:
         dw      ACTIVE_PIPE_0
