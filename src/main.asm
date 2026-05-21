@@ -126,28 +126,20 @@ main_loop:
         out     ($fe), a
         ; One-shot column build. do_swap sets activate_pipe_idx to the
         ; just-activated pipe and do_swap_fired=1. The swap frame itself skips
-        ; the build (do_swap_fired); the very next frame runs a single
-        ; configure_pipe_slots for that pipe, then releases the freeze
-        ; (activate_pipe_idx=255). The pipe is held at byte_x=29 for only ~2
-        ; frames — under one 4-frame wrap — so pipe spacing is undisturbed.
+        ; the build (do_swap_fired); the very next frame loops prep_step
+        ; through all 7 phases in one go. ps_phase6 sets activate_pipe_idx=255
+        ; when the build completes, exiting the loop. The pipe is held at
+        ; byte_x=29 for only ~2 frames — under one 4-frame wrap — so pipe
+        ; spacing is undisturbed.
         ld      a, (do_swap_fired)
         or      a
         jr      nz, .swap_frame_skip
+.build_loop:
         ld      a, (activate_pipe_idx)
         cp      255
-        jr      z, .post_prep_step              ; no build pending
-        ld      c, a                            ; C = pipe index to build
-        add     a, a                            ; pipe*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state + 1
-        add     hl, de                          ; HL = &pipe_state[pipe].gap_y
-        ld      e, (hl)                         ; E = gap_y
-        ld      a, c                            ; A = pipe index
-        call    configure_pipe_slots
-        ld      a, 255
-        ld      (activate_pipe_idx), a          ; release freeze — pipe now scrolls
-        jr      .post_prep_step
+        jr      z, .post_prep_step              ; idle, or build just finished
+        call    prep_step
+        jr      .build_loop
 .swap_frame_skip:
         xor     a
         ld      (do_swap_fired), a
