@@ -231,7 +231,7 @@ body_b_bc:      dw 0
 body_b_de:      dw 0
 
 ; ─── Pipe grid dispatch ──────────────────────────────────────────
-shadow_grid:    dw GRID_B               ; the grid being rebuilt (not the one rendering)
+shadow_grid:    dw GRID_B               ; the grid being rebuilt (not the one rendering); ipp_grid_base is init-only
 
 ; Scratch bytes for update_cap_imm_v2's phase-shifted cap values
 cap_L_temp:     db 0
@@ -655,6 +655,7 @@ init_pipe_program:
         inc     a                               ; row+1
         ld      l, a
         ld      h, 0
+        ; row*32 — same shift as the write cursor above, for row+1
         add     hl, hl                          ; *2
         add     hl, hl                          ; *4
         add     hl, hl                          ; *8
@@ -699,7 +700,7 @@ init_grid_epilogue:
         ret
 
 ipp_byte_x:     ds 4, 0                 ; scratch: byte_x per pipe (Phase 3: 4 bytes)
-ipp_grid_base:  dw GRID_A              ; scratch: target grid base for init_pipe_program
+ipp_grid_base:  dw GRID_A              ; scratch: target grid base for init_pipe_program (init-only)
 init_pipe_bx_tmp: db 0                 ; scratch: byte_x for the pipe being configured at init
 
 ;----------------------------------------------------------------
