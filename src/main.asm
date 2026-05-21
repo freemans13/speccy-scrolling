@@ -263,9 +263,11 @@ sfx_chime:
         db 0 : dw 60 : dw  72 : db 0
         db 0 : dw 47 : dw 120 : db 0
         db $FF
-; Stage-1 prototype: steady ~1.1 kHz test tone (one long tone segment).
+; Stage-1 prototype: steady ~1.1 kHz test tone, ~0.47 s.
+; Pipes are passed every ~38 frames (~0.76 s); 280 edges ≈ 24 frames at the
+; current slice budget, leaving a clear gap before the next score retriggers.
 sfx_tone_test:
-        db 0 : dw 60 : dw 2000 : db 0
+        db 0 : dw 60 : dw 280 : db 0
         db $FF
 
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
