@@ -54,9 +54,10 @@ SLOT_GRID_BASE         EQU $DB00
 SLOT_GRID_END          EQU SLOT_GRID_BASE + 160 * SLOT_ROW_STRIDE   ; Phase 3: $DB00 + 160*32 = $EF00
 PIPE_PROGRAM           EQU SLOT_GRID_BASE              ; entry point alias
 
-; ─── Double-buffered grid (Stage 2: GRID_B reserved, not yet used) ───
+; ─── Double-buffered grid ─────────────────────────────────────────
 GRID_A                 EQU SLOT_GRID_BASE              ; existing grid ($DB00)
 GRID_B                 EQU $AC00                       ; second grid; $AC00+$1400 = $C000 (flush to TEMPLATE_BASE)
+GRID_B_END             EQU GRID_B + 160 * SLOT_ROW_STRIDE  ; $AC00 + $1400 = $C000
 
 ; Phase 3: 1 EXX + 4*6-byte slots = 25 bytes/row; pad to 32 for fast row << 5 indexing.
 ; Slot format: $31 lo hi $E5 $D5 $C5  =  ld sp,target ; push hl ; push de ; push bc
@@ -537,27 +538,29 @@ init_slot_addr_table:
         ret
 
 ;----------------------------------------------------------------
-; init_pipe_program: emit the initial slot grid into PIPE_PROGRAM
-; memory ($DB00+).  Caller must call init_slot_addr_table first
-; (this routine assumes the table is already populated).
+; init_pipe_program: emit a complete slot grid into the target base
+; given by ipp_grid_base.  Caller sets ipp_grid_base before calling.
+; Call init_slot_addr_table first (SLOT_ADDR_TABLE must be populated —
+; the table is still used by run-time routines for GRID_A addressing;
+; this emitter computes write cursors directly from ipp_grid_base so
+; it works for any target base, including GRID_B).
 ;
 ; Walks rows 0..159.  For each row:
-;   - Reads slot[row][0] address from SLOT_ADDR_TABLE (entry index
-;     row*4, 2-byte little-endian address).   Phase 3: 4 pipes
-;   - Writes $D9 (EXX) at (slot[row][0] - 1).
-;   - Writes 4 × 6-byte body templates for pipes 0-3.  Phase 3: 4 pipes
+;   - Computes write cursor = ipp_grid_base + row*32  (EXX byte)
+;   - Writes $D9 (EXX) at cursor, then 4×6-byte body slots.
+;   - Writes JP-next-row trailer; row 159 → JP SLOT_GRID_END.
 ;
-; After the loop writes the 5-byte epilogue at SLOT_GRID_END:
-;   ED 7B lo hi C9  =  ld sp,(saved_sp) ; ret
+; SLOT_GRID_END ($EF00) is grid-agnostic: both grids' row-159 trailers
+; jump to the same shared epilogue.  Write the epilogue once by calling
+; init_grid_epilogue separately after all grids are built.
 ;
-; Scratch: ipp_byte_x (4 bytes) caches byte_x for each pipe so we
-; don't touch pipe_state during the inner loop.  Phase 3: 4 bytes
+; Scratch: ipp_byte_x (4 bytes), ipp_grid_base (2 bytes).
 ;
 ; Register usage (outer loop):
 ;   B  = row (0..159)
-;   IY = write cursor (slot[row][0] for each row, advances per pipe)
+;   IY = write cursor (advances per slot)
 ;   HL = address scratch
-;   DE = address scratch / cache_addr
+;   DE = address scratch
 ;   C  = pipe index (0..3) in inner loops  Phase 3
 ;----------------------------------------------------------------
 init_pipe_program:
@@ -576,28 +579,24 @@ init_pipe_program:
 .ipp_row_lp:
         push    bc                      ; save B=row
 
-        ; ── Look up slot[row][0] address from SLOT_ADDR_TABLE ─────
-        ; Table entry index = row*4 + pipe (pipe=0 here).
-        ; Each entry is 2 bytes → byte offset = (row*4)*2 = row*8.
+        ; ── Compute write cursor = ipp_grid_base + row*32 ────────
+        ; (row*32 = row << 5)
         ld      l, b
         ld      h, 0
         add     hl, hl                  ; row*2
         add     hl, hl                  ; row*4
         add     hl, hl                  ; row*8
-        ld      de, SLOT_ADDR_TABLE
-        add     hl, de                  ; HL → table[row*4]
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = slot[row][0] address
+        add     hl, hl                  ; row*16
+        add     hl, hl                  ; row*32
+        ld      de, (ipp_grid_base)
+        add     hl, de                  ; HL = grid_base + row*32
 
-        ; ── Write EXX ($D9) at (slot_addr - 1) ───────────────────
-        dec     de
-        ld      a, $D9
-        ld      (de), a
-        inc     de                      ; DE back to slot[row][0]
+        ; ── Write EXX ($D9) at HL (= row start), then advance ────
+        ld      (hl), $D9
+        inc     hl                      ; HL = grid_base + row*32 + 1 = slot[row][0]
 
         ; Transfer slot cursor to IY
-        push    de
+        push    hl
         pop     iy                      ; IY = write cursor at slot[row][0]
 
         ; All 160 rows: 4 × 6-byte body template (Phase 3: 4 pipes)
@@ -642,16 +641,16 @@ init_pipe_program:
         cp      NUM_PIPES
         jr      nz, .ipp_pipe_lp
 
-        ; ── Write row-trailer JP at byte +25 of this row ────────
+        ; ── Write row-trailer JP at byte +25 of this row ─────────
         ; IY = slot[row][0] + 24 (= slot[row][3]+6 = first pad byte).
-        ; Normal rows: JP base + (row+1)*32 = next row's EXX byte.
-        ; Row 159   : JP SLOT_GRID_END (epilogue: ld sp,(saved_sp); ret).
+        ; Normal rows: JP ipp_grid_base + (row+1)*32 (next row's EXX).
+        ; Row 159   : JP SLOT_GRID_END (shared epilogue, grid-agnostic).
         ld      (iy+0), $C3                     ; opcode: jp nn
         ld      a, b
         cp      GROUND_TOP - 1                  ; row 159?
         jr      z, .ipp_trailer_last
 
-        ; HL = SLOT_GRID_BASE + (row+1) * 32
+        ; HL = ipp_grid_base + (row+1)*32
         ld      a, b
         inc     a                               ; row+1
         ld      l, a
@@ -661,12 +660,12 @@ init_pipe_program:
         add     hl, hl                          ; *8
         add     hl, hl                          ; *16
         add     hl, hl                          ; *32
-        ld      de, SLOT_GRID_BASE
-        add     hl, de                          ; HL = base + (row+1)*32
+        ld      de, (ipp_grid_base)
+        add     hl, de                          ; HL = grid_base + (row+1)*32
         jr      .ipp_trailer_write
 
 .ipp_trailer_last:
-        ld      hl, SLOT_GRID_END
+        ld      hl, SLOT_GRID_END               ; shared epilogue, same for both grids
 
 .ipp_trailer_write:
         ld      (iy+1), l
@@ -678,9 +677,15 @@ init_pipe_program:
         ld      a, b
         cp      GROUND_TOP              ; 160
         jp      nz, .ipp_row_lp
+        ret
 
-        ; ── Epilogue at SLOT_GRID_END: ld sp,(saved_sp) ; ret ────
-        ; Encoding: ED 7B lo hi C9
+;----------------------------------------------------------------
+; init_grid_epilogue: write the shared epilogue at SLOT_GRID_END.
+; Both grids' row-159 trailers jump here.  Call once after all
+; grids are built.
+; Encoding: ED 7B lo hi C9  =  ld sp,(saved_sp) ; ret
+;----------------------------------------------------------------
+init_grid_epilogue:
         ld      hl, SLOT_GRID_END
         ld      (hl), $ED
         inc     hl
@@ -694,6 +699,7 @@ init_pipe_program:
         ret
 
 ipp_byte_x:     ds 4, 0                 ; scratch: byte_x per pipe (Phase 3: 4 bytes)
+ipp_grid_base:  dw GRID_A              ; scratch: target grid base for init_pipe_program
 init_pipe_bx_tmp: db 0                 ; scratch: byte_x for the pipe being configured at init
 
 ;----------------------------------------------------------------
@@ -1599,7 +1605,14 @@ init_pipes:
         ld      (phase), a
         call    init_slot_addr_table        ; precompute slot_addr_table[160][4]  Phase 3
         call    init_screen_target_table    ; precompute screen_target_table_29[160]
-        call    init_pipe_program           ; emit fixed slot grid (reads slot_addr_table)
+        ; Build GRID_A then GRID_B identically; epilogue written once after both.
+        ld      hl, GRID_A
+        ld      (ipp_grid_base), hl
+        call    init_pipe_program           ; emit slot grid into GRID_A ($DB00)
+        ld      hl, GRID_B
+        ld      (ipp_grid_base), hl
+        call    init_pipe_program           ; emit slot grid into GRID_B ($AC00)
+        call    init_grid_epilogue          ; shared epilogue at SLOT_GRID_END ($EF00)
         ; For each of the 3 ACTIVE pipes, apply initial cap/skip configuration (full pass).
         ; Phase 3: pipe 3 is the "preparing" pipe — its column gets NOP-fill below.
         xor     a                            ; pipe index 0
