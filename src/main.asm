@@ -39,8 +39,10 @@ SPK_BIT           EQU $10                ; bit 4 of port $FE = speaker
 SOUND_BORDER      EQU $01                ; blue profile band for the sound region
 EDGE_FIXED_ITERS  EQU 14                 ; per-edge non-delay overhead in delay-iter units (CALIBRATE — Task 6)
 ; Per-frame sound budget (delay-iters). One slice per frame, in the idle tail.
-; Build frames (activate_pipe_idx != 255) are tight (~3k T slack) → small budget.
-SND_SLICE_NORMAL  EQU 1200               ; budget on normal/wrap frames (CALIBRATE)
+; Classified per frame type: build frames (~67k) and wrap/swap frames are
+; heavier, so they get less sound budget to stay under the 70k T ceiling.
+SND_SLICE_NORMAL  EQU 1100               ; budget on normal frames (CALIBRATE)
+SND_SLICE_WRAP    EQU 700                ; budget on wrap/swap frames (CALIBRATE)
 SND_SLICE_CONFIG  EQU 90                 ; budget on build frames (CALIBRATE)
 
 ; ─── Slot grid layout (fixed-slot dispatch) ──────────────────────
@@ -113,13 +115,19 @@ main_loop:
         out     ($fe), a
         xor     a
         ld      (sound_heavy_frame), a
-        ; Stage-1 sound: classify frame, set per-slice budget. Build frames
-        ; (activate_pipe_idx != 255) are tight (~3k T slack) → tiny slice.
-        ld      hl, SND_SLICE_NORMAL
+        ; Classify this frame → per-frame sound budget. Build frames
+        ; (activate_pipe_idx != 255, ~67k) get the tiny budget; wrap/swap
+        ; frames (phase == 6 at frame top → this frame wraps) get the reduced
+        ; budget; everything else gets the full normal budget.
+        ld      hl, SND_SLICE_CONFIG
         ld      a, (activate_pipe_idx)
         inc     a                       ; 255 -> 0
-        jr      z, .snd_slice_set
-        ld      hl, SND_SLICE_CONFIG
+        jr      nz, .snd_slice_set      ; build frame in progress → CONFIG
+        ld      hl, SND_SLICE_WRAP
+        ld      a, (phase)
+        cp      6                       ; phase 6 → second advance_phase wraps
+        jr      z, .snd_slice_set       ; wrap/swap frame → WRAP
+        ld      hl, SND_SLICE_NORMAL
 .snd_slice_set:
         ld      (sound_slice_budget), hl
         ; Phase 2: bird ops run BEFORE PIPE_PROGRAM in top blanking.
