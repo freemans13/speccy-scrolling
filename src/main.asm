@@ -3473,6 +3473,87 @@ sfx_next_segment:
         ld      (sound_active), a
         ret
 
+; sfx_tick: generate one frame's slice of the active effect. Runs under di in
+; main_loop's idle region. Plays edges until sound_budget (delay-iters) is
+; exhausted. Bounded → never overruns into the next interrupt.
+; Clobbers A, BC, DE, HL.
+sfx_tick:
+        ld      a, (sound_active)
+        or      a
+        ret     z
+        ld      bc, (sound_budget)      ; BC = budget remaining (delay-iters)
+.edge_loop:
+        ; ── ensure a live segment ───────────────────────────────
+        ld      hl, (sound_edges_left)
+        ld      a, h
+        or      l
+        jr      nz, .have_segment
+        push    bc
+        call    sfx_next_segment
+        pop     bc
+        ld      a, (sound_active)
+        or      a
+        ret     z                       ; effect finished
+.have_segment:
+        ; ── budget check: cost = sound_half + EDGE_FIXED_ITERS ───
+        ld      hl, (sound_half)
+        ld      de, EDGE_FIXED_ITERS
+        add     hl, de                  ; HL = edge cost
+        ld      a, c
+        sub     l
+        ld      a, b
+        sbc     a, h
+        ret     c                       ; cost > budget → stop, keep state
+        ; BC -= HL  (budget -= cost)
+        ld      a, c : sub l : ld c, a
+        ld      a, b : sbc a, h : ld b, a
+        ; ── produce the speaker bit ─────────────────────────────
+        ld      a, (sound_mode)
+        or      a
+        jr      nz, .noise
+        ld      a, (sound_speaker)      ; tone: toggle the bit
+        xor     SPK_BIT
+        jr      .emit
+.noise:
+        ld      hl, (sound_lfsr)        ; 16-bit Galois LFSR step
+        srl     h
+        rr      l
+        jr      nc, .no_tap
+        ld      a, h
+        xor     $B4
+        ld      h, a
+.no_tap:
+        ld      (sound_lfsr), hl
+        ld      a, l
+        and     1                       ; output bit → A = 0 or 1
+        rlca : rlca : rlca : rlca       ; shift bit 0 → bit 4 (= SPK_BIT)
+.emit:
+        ld      (sound_speaker), a
+        or      SOUND_BORDER
+        out     ($fe), a
+        ; ── delay sound_half iterations ─────────────────────────
+        ld      de, (sound_half)
+.delay:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .delay
+        ; ── advance: edges_left-- ; half += sweep ───────────────
+        ld      hl, (sound_edges_left)
+        dec     hl
+        ld      (sound_edges_left), hl
+        ld      a, (sound_sweep)
+        or      a
+        jr      z, .edge_loop
+        ld      e, a                    ; sign-extend sweep into DE
+        rla
+        sbc     a, a
+        ld      d, a                    ; D = $00 or $FF
+        ld      hl, (sound_half)
+        add     hl, de
+        ld      (sound_half), hl
+        jr      .edge_loop
+
 ; bird_attr_addr: HL = ATTRS + (A >> 3) * 32 + 8, A = y_high.
 ;   (A & $F8) << 2 == char_row * 32 (since char_row*32 = (y>>3)*32 = y*4 once
 ;   the low 3 bits are masked off).
