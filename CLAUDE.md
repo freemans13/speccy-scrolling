@@ -135,7 +135,8 @@ frame_update:
 
 ## Key data structures
 
-- **`PIPE_PROGRAM`** at `$DB00..$E4FF` — machine-emitted SMC slot grid. 160 rows × 16 bytes (1 EXX + 3 × 5-byte slot). Each pipe slot is `ld sp,target ; push de ; push bc` (body) or `jp cap_handler` (cap_top/cap_bot). Skip slots are 5 NOPs. Epilogue at `SLOT_GRID_END = $E500` falls through into `ld sp,(saved_sp); ret`.
+- **`PIPE_PROGRAM`** at `$DB00..$E4FF` — machine-emitted SMC slot grid. 160 rows × 32 bytes (1 EXX + 4 × 6-byte slot + JP-next-row trailer + pad). Each pipe slot is `ld sp,target ; push hl ; push de ; push bc` (body) or `jp cap_handler` (cap_top/cap_bot). Skip slots are `JR +4`. Epilogue at `SLOT_GRID_END` falls through into `ld sp,(saved_sp); ret`.
+- **Prep-column JR-skip** — the invisible prep pipe's whole slot column is held as `JR +4` slots (12 T/row instead of a 43 T body push into the off-screen buffer column). `do_swap` JR-skips the departing column; `prep_step` rebuilds the just-activated column post-swap while the pipe is frozen at `byte_x=29`; `ps_phase6` arms its caps at build completion. See `docs/superpowers/specs/2026-05-21-skip-prep-column-design.md`.
 - **`pipe_state`** — `db byte_x, gap_y` for each of 3 pipes. byte_x ∈ [1,29], gap_y ∈ {8,16,...,96}.
 - **`BODY_TEMPLATE`** at `$C000` — 800 bytes, pre-baked body slot bytes for byte_x=29.
 - **`CAP_BLOCK`** at `$C320` — 250 bytes, shared cap_top + 48 skip + cap_bot block.
