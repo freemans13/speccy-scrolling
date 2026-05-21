@@ -185,6 +185,10 @@ main_loop:
         ld      a, 1
         ld      (sound_heavy_frame), a
 .post_prep_step:
+        ; Stage 4: rolling column rebuild (no-op self-verifier). One pipe
+        ; per frame rebuilt into GRID_A at current geometry — byte-identical
+        ; to what is already there. Skipped on build/configure frames.
+        call    rolling_rebuild_step
         call    sfx_slice               ; sound — single slice in the idle tail
         ld      a, 0                    ; PROFILE: BLACK = idle before halt
         out     ($fe), a
@@ -2386,6 +2390,316 @@ ps_cap_top_target: dw 0
 ps_cap_bot_target: dw 0
 ps_cap_top_next:   dw 0
 ps_cap_bot_next:   dw 0
+
+;----------------------------------------------------------------
+; rebuild_column — rebuild ONE pipe's entire 160-row slot column into
+; a target grid, from that pipe's CURRENT byte_x / gap_y geometry.
+;
+; This is prep_step's per-column work (body bands + cap slots + skip
+; band) consolidated into one band-structured routine, parameterised
+; on a pipe index and a target grid base.  No per-row cp dispatch:
+; each band is a single djnz loop.
+;
+; Bands (cap_top_row = gap_y-1, cap_bot_row = gap_y+PIPE_GAP):
+;   band1 body : rows [0 .. cap_top_row-1]
+;   cap-top    : slot at cap_top_row
+;   skip band  : rows [cap_top_row+1 .. cap_bot_row-1]
+;   cap-bot    : slot at cap_bot_row
+;   band2 body : rows [cap_bot_row+1 .. 159]
+;
+; Slot byte formats (identical to init_pipe_program / build_slot_templates):
+;   body : $31 lo hi $E5 $D5 $C5  (ld sp,target ; push hl ; push de ; push bc)
+;          where (lo,hi) = line_table[row] + byte_x + 5
+;   cap  : $C3 handler.lo handler.hi 0 0 0  (jp cap_handler ; 3 pad)
+;   skip : $18 $04 0 0 0 0  (JR e=$04 → next slot)
+;
+; When the target grid is the LIVE grid (GRID_A) and the geometry passed
+; is the pipe's current geometry, the output is byte-identical to what
+; is already there — a no-op.  This is the Stage-4 correctness proof.
+;
+; Parameters (scratch words, set by caller — same pattern as cps_*/ipp_*):
+;   rc_pipe       : db   pipe index 0..3
+;   rc_grid_base  : dw   target grid base address
+;
+; Worst-case cost ~22k T (~110 body rows × ~183 T + 48 skip rows × ~150 T
+; + 2 cap slots + setup).  Acceptable: in the final design this replaces
+; prep_step/do_swap/configure_pipe_slots, so a steady-state frame is
+; render ~16k + rebuild ~20k + bird/ground ~10k ≈ 45k T, flat.
+;
+; Clobbers: AF, BC, DE, HL, IY.
+;----------------------------------------------------------------
+rebuild_column:
+        ; ── Cache geometry: byte_x, gap_y, cap_top_row, cap_bot_row ──
+        ; pipe_state layout: db byte_x, gap_y per pipe → entry at pipe*2.
+        ld      a, (rc_pipe)
+        add     a, a                            ; pipe*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state
+        add     hl, de                          ; HL = &pipe_state[pipe].byte_x
+        ld      a, (hl)
+        ld      (rc_byte_x), a                  ; byte_x
+        inc     hl
+        ld      a, (hl)                         ; A = gap_y
+        ld      e, a                            ; E = gap_y
+        dec     a
+        ld      (rc_cap_top_row), a             ; cap_top_row = gap_y - 1
+        ld      a, e
+        add     a, PIPE_GAP
+        ld      (rc_cap_bot_row), a             ; cap_bot_row = gap_y + PIPE_GAP
+
+        ; Cache pipe*6 (slot column offset).
+        ld      a, (rc_pipe)
+        ld      e, a
+        add     a, a                            ; *2
+        add     a, e                            ; *3
+        add     a, e                            ; *4
+        add     a, e                            ; *5
+        add     a, e                            ; *6
+        ld      (rc_pipe6), a
+
+        ; ── Band 1: body rows [0 .. cap_top_row-1] ──────────────────
+        ld      a, (rc_cap_top_row)
+        or      a
+        jr      z, .rc_b1_done                  ; cap_top_row == 0 → no band1
+        ld      b, a                            ; B = row count
+        xor     a                               ; A = first row = 0
+        call    rc_slot_addr_for_row            ; HL = slot[0][pipe]
+        ex      de, hl                          ; DE = slot cursor
+        ld      hl, line_table                  ; HL = &line_table[0]
+        call    rc_stamp_body_band              ; stamp B rows from row 0
+.rc_b1_done:
+
+        ; ── Cap-top slot at row cap_top_row ─────────────────────────
+        ld      a, (rc_cap_top_row)
+        ld      c, a                            ; C = cap_top_row (for slot addr)
+        ld      hl, cap_top_handler_addrs
+        call    rc_stamp_cap_slot               ; stamp $C3 + cap_top handler
+
+        ; ── Skip band: rows [cap_top_row+1 .. cap_bot_row-1] ────────
+        ; Count = (cap_bot_row-1) - (cap_top_row+1) + 1 = cap_bot_row - cap_top_row - 1
+        ;       = PIPE_GAP - 1 = 47 rows (constant).
+        ld      a, (rc_cap_top_row)
+        inc     a                               ; A = cap_top_row + 1 = first skip row
+        call    rc_slot_addr_for_row            ; HL = slot[cap_top_row+1][pipe]
+        ex      de, hl                          ; DE = slot cursor
+        ld      b, PIPE_GAP - 1                 ; B = 47 skip rows
+.rc_skip_lp:
+        ld      a, $18                          ; JR e
+        ld      (de), a
+        inc     de
+        ld      a, $04                          ; displacement → next slot
+        ld      (de), a
+        inc     de
+        xor     a
+        ld      (de), a
+        inc     de
+        ld      (de), a
+        inc     de
+        ld      (de), a
+        inc     de
+        ld      (de), a
+        inc     de
+        ; advance DE to next row's slot: +(SLOT_ROW_STRIDE - SLOT_STRIDE) = +26
+        ld      a, e
+        add     a, SLOT_ROW_STRIDE - SLOT_STRIDE
+        ld      e, a
+        jr      nc, .rc_skip_nc
+        inc     d
+.rc_skip_nc:
+        djnz    .rc_skip_lp
+
+        ; ── Cap-bot slot at row cap_bot_row ─────────────────────────
+        ld      a, (rc_cap_bot_row)
+        ld      c, a                            ; C = cap_bot_row (for slot addr)
+        ld      hl, cap_bot_handler_addrs
+        call    rc_stamp_cap_slot               ; stamp $C3 + cap_bot handler
+
+        ; ── Band 2: body rows [cap_bot_row+1 .. 159] ────────────────
+        ld      a, (rc_cap_bot_row)
+        cpl                                     ; A = 255 - cap_bot_row
+        sub     255 - 159                       ; A = 159 - cap_bot_row = row count
+        jr      z, .rc_b2_done
+        jr      c, .rc_b2_done                  ; safety: cap_bot_row > 159
+        ld      b, a                            ; B = row count
+        ld      a, (rc_cap_bot_row)
+        inc     a                               ; A = cap_bot_row + 1 = first row
+        push    af                              ; save first row
+        call    rc_slot_addr_for_row            ; HL = slot[cap_bot_row+1][pipe]
+        ex      de, hl                          ; DE = slot cursor
+        pop     af                              ; A = first row
+        ; HL = &line_table[first_row] = line_table + first_row*2
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; first_row*2
+        ld      bc, line_table
+        add     hl, bc                          ; HL = &line_table[first_row]
+        call    rc_stamp_body_band              ; stamp B rows
+.rc_b2_done:
+        ret
+
+;----------------------------------------------------------------
+; rc_stamp_body_band — stamp B body slots starting at slot cursor DE,
+; reading line_table entries from HL.  Per row writes:
+;   $31 lo hi $E5 $D5 $C5   where (lo,hi) = line_table[row] + byte_x + 5
+; Body target offset = byte_x + 5 (matches init_pipe_program).
+; In:  B = row count (>0), DE = slot cursor, HL = &line_table[first_row]
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+rc_stamp_body_band:
+.rc_bb_lp:
+        ld      a, $31                          ; ld sp,nn opcode
+        ld      (de), a
+        inc     de
+        ; target.lo = line_table[row].lo + byte_x + 5
+        ld      a, (hl)
+        inc     hl
+        ld      c, a                            ; C = line_table.lo
+        ld      a, (rc_byte_x)
+        add     a, 5                            ; A = byte_x + 5
+        add     a, c                            ; A = line_table.lo + byte_x + 5
+        ld      (de), a                         ; target.lo
+        inc     de
+        ld      a, (hl)                         ; line_table[row].hi
+        inc     hl
+        adc     a, 0                            ; carry from .lo add
+        ld      (de), a                         ; target.hi
+        inc     de
+        ld      a, $E5                          ; push hl
+        ld      (de), a
+        inc     de
+        ld      a, $D5                          ; push de
+        ld      (de), a
+        inc     de
+        ld      a, $C5                          ; push bc
+        ld      (de), a
+        inc     de
+        ; advance DE to next row's slot: +(SLOT_ROW_STRIDE - SLOT_STRIDE) = +26
+        ld      a, e
+        add     a, SLOT_ROW_STRIDE - SLOT_STRIDE
+        ld      e, a
+        jr      nc, .rc_bb_nc
+        inc     d
+.rc_bb_nc:
+        djnz    .rc_bb_lp
+        ret
+
+;----------------------------------------------------------------
+; rc_stamp_cap_slot — stamp one cap slot: $C3 + handler addr + 3 pad.
+; In:  C  = cap row (0..159)
+;      HL = cap handler address table (cap_top_handler_addrs / _bot_)
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+rc_stamp_cap_slot:
+        push    hl                              ; save handler table ptr
+        ld      a, c                            ; A = cap row
+        call    rc_slot_addr_for_row            ; HL = slot[cap_row][pipe]
+        pop     de                              ; DE = handler table ptr
+        ld      (hl), $C3                       ; jp nn opcode
+        inc     hl                              ; HL = slot+1 (handler addr imm)
+        ; DE → cap_*_handler_addrs[pipe] = table + pipe*2
+        ld      a, (rc_pipe)
+        add     a, a                            ; pipe*2
+        add     a, e
+        ld      e, a
+        jr      nc, .rc_cs_nc
+        inc     d
+.rc_cs_nc:
+        ld      a, (de)                         ; handler.lo
+        ld      (hl), a
+        inc     hl
+        inc     de
+        ld      a, (de)                         ; handler.hi
+        ld      (hl), a
+        inc     hl
+        ; 3 pad bytes
+        xor     a
+        ld      (hl), a
+        inc     hl
+        ld      (hl), a
+        inc     hl
+        ld      (hl), a
+        ret
+
+;----------------------------------------------------------------
+; rc_slot_addr_for_row — slot address for a row in rebuild_column's
+; target grid: slot[row][pipe] = rc_grid_base + 1 + row*32 + pipe*6.
+; In:  A = row (0..159)
+; Out: HL = slot address
+; Clobbers: AF, DE, HL.  BC preserved.
+;----------------------------------------------------------------
+rc_slot_addr_for_row:
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; row*2
+        add     hl, hl                          ; row*4
+        add     hl, hl                          ; row*8
+        add     hl, hl                          ; row*16
+        add     hl, hl                          ; row*32
+        ld      a, (rc_pipe6)
+        ld      e, a
+        ld      d, 0
+        add     hl, de                          ; HL = row*32 + pipe*6
+        ld      de, (rc_grid_base)
+        add     hl, de                          ; += grid base
+        inc     hl                              ; += 1 (skip EXX byte) → slot[row][pipe]
+        ret
+
+; ── Scratch / parameters for rebuild_column ──────────────────────
+rc_pipe:         db 0                           ; param: pipe index 0..3
+rc_grid_base:    dw GRID_A                      ; param: target grid base
+rc_byte_x:       db 0                           ; cached pipe byte_x
+rc_cap_top_row:  db 0                           ; cached gap_y - 1
+rc_cap_bot_row:  db 0                           ; cached gap_y + PIPE_GAP
+rc_pipe6:        db 0                           ; cached pipe * 6
+
+; ── Rolling rebuild cursor (Stage 4 no-op verifier) ──────────────
+; One pipe per frame, rotating 0,1,2,3,0,...  Skips the prep pipe
+; (its column is a JR-skip column, not a body/cap column) and the
+; activating pipe while a build is in progress — exactly mirroring
+; wrap_byte_x's own guards — so the rebuild is only ever applied to
+; truly-active columns and stays a guaranteed no-op against GRID_A.
+rc_cursor:       db 0                           ; next pipe index to rebuild
+
+;----------------------------------------------------------------
+; rolling_rebuild_step — main_loop hook.  Rebuilds one pipe's column
+; into GRID_A at its current geometry (a no-op), then advances the
+; rotating cursor.  Skipped entirely on build/configure frames
+; (activate_pipe_idx != 255) so Stage 4's transitional overlap with
+; the old machinery cannot overrun the 70k frame budget.
+; Clobbers: AF, BC, DE, HL, IY.
+;----------------------------------------------------------------
+rolling_rebuild_step:
+        ; Skip on build/configure frames — old prep_step machinery is
+        ; mid-rebuild this frame; adding ~18-20k T would overrun 70k.
+        ld      a, (activate_pipe_idx)
+        inc     a                               ; 255 → 0 sets Z
+        ret     z
+        ; Current cursor pipe.
+        ld      a, (rc_cursor)
+        ld      c, a                            ; C = candidate pipe
+        ; Advance the cursor (0,1,2,3,0,...) regardless of skip below.
+        inc     a
+        cp      NUM_PIPES
+        jr      c, .rrs_cur_set
+        xor     a
+.rrs_cur_set:
+        ld      (rc_cursor), a
+        ; Skip the prep pipe — its column is a JR-skip column.
+        ld      a, (prep_pipe_idx)
+        cp      c
+        ret     z
+        ; Skip the activating pipe (build in progress). activate_pipe_idx
+        ; is 255 here (guarded above) so this only matters defensively.
+        ld      a, (activate_pipe_idx)
+        cp      c
+        ret     z
+        ; Rebuild candidate pipe C into GRID_A at its current geometry.
+        ld      a, c
+        ld      (rc_pipe), a
+        ld      hl, GRID_A
+        ld      (rc_grid_base), hl
+        jp      rebuild_column
 
 ;----------------------------------------------------------------
 frame_update:
