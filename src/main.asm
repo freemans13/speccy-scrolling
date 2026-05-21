@@ -2099,6 +2099,152 @@ ps_phase6:
 .act_b1_done:
 
         ld      sp, (ps_saved_sp)
+
+        ; ── Arm incoming cap slots in PIPE_PROGRAM (relocated from do_swap) ──
+        ; Runs once at build completion: after the column has been (re)built and
+        ; ps_phase1's NOP-fill of the cap range is done. Arming here ensures the
+        ; $C3 JP opcodes survive into gameplay. Indexed by activate_pipe_idx.
+        ; activate_pipe_idx*6 is already in (ps_p6_pipe6) — reuse it.
+        ;    slot[row][pipe] = SLOT_GRID_BASE + 1 + row*32 + pipe*6
+
+        ; --- cap_top slot ---
+        ld      a, (ps_cap_top_row)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl  ; row*2
+        add     hl, hl  ; row*4
+        add     hl, hl  ; row*8
+        add     hl, hl  ; row*16
+        add     hl, hl  ; row*32
+        ld      a, (ps_p6_pipe6)
+        ld      e, a
+        ld      d, 0
+        add     hl, de                          ; HL += pipe*6
+        ld      de, SLOT_GRID_BASE + 1
+        add     hl, de                          ; HL = slot[cap_top_row][inc]
+        ; Write $C3 + handler addr (lo, hi)
+        ld      (hl), $C3                       ; JP opcode
+        inc     hl
+        ; Look up cap_top_handler_pipe_<inc> from cap_top_handler_addrs[inc]
+        ld      a, (activate_pipe_idx)
+        add     a, a                            ; inc * 2
+        ld      e, a
+        ld      d, 0
+        push    hl                              ; save slot+1 addr
+        ld      hl, cap_top_handler_addrs
+        add     hl, de                          ; HL = &cap_top_handler_addrs[inc]
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = handler address
+        pop     hl                              ; restore slot+1 addr
+        ld      (hl), e                         ; write handler.lo
+        inc     hl
+        ld      (hl), d                         ; write handler.hi
+
+        ; --- cap_bot slot ---
+        ld      a, (ps_cap_bot_row)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl  ; row*2
+        add     hl, hl  ; row*4
+        add     hl, hl  ; row*8
+        add     hl, hl  ; row*16
+        add     hl, hl  ; row*32
+        ld      a, (ps_p6_pipe6)
+        ld      e, a
+        ld      d, 0
+        add     hl, de
+        ld      de, SLOT_GRID_BASE + 1
+        add     hl, de                          ; HL = slot[cap_bot_row][inc]
+        ld      (hl), $C3                       ; JP opcode
+        inc     hl
+        ld      a, (activate_pipe_idx)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        push    hl
+        ld      hl, cap_bot_handler_addrs
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = handler address
+        pop     hl
+        ld      (hl), e                         ; write handler.lo
+        inc     hl
+        ld      (hl), d                         ; write handler.hi
+
+        ; Write ps_cap_top_target into cap_top_handler_pipe_<inc>_target
+        ld      a, (activate_pipe_idx)
+        add     a, a                            ; inc * 2
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_top_target_imm_addrs
+        add     hl, de                          ; HL = &cap_top_target_imm_addrs[inc]
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)                         ; BC = address of cap_top_handler_<inc>_target imm
+        ld      hl, ps_cap_top_target
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
+        ; Write ps_cap_bot_target into cap_bot_handler_pipe_<inc>_target
+        ld      a, (activate_pipe_idx)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_bot_target_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)                         ; BC = address of cap_bot_handler_<inc>_target imm
+        ld      hl, ps_cap_bot_target
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
+        ; Write ps_cap_top_next into cap_top_handler_pipe_<inc>_next
+        ld      a, (activate_pipe_idx)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_top_next_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)                         ; BC = address of cap_top_handler_<inc>_next imm
+        ld      hl, ps_cap_top_next
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
+        ; Write ps_cap_bot_next into cap_bot_handler_pipe_<inc>_next
+        ld      a, (activate_pipe_idx)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_bot_next_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        ld      hl, ps_cap_bot_next
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
         ld      a, 7
         ld      (prep_phase), a
         ret
@@ -2489,16 +2635,16 @@ wrap_byte_x:
 ; do_swap: called when pipe A (departing) has reached byte_x=1.
 ;
 ; If prep_phase == 7 (prep ready): full swap (~14 k T total).
-;   - Arm incoming pipe's cap slots ($C3 + handler addr written into PIPE_PROGRAM).
-;   - Write ps_cap_*_target and ps_cap_*_next imms to incoming cap handlers.
-;   - Set pipe_state[incoming].gap_y = prep_gap_y, byte_x = 29.
-;   - Dep body-slot target rewrite (~13.8 k T): write line_addr+34 to the 2 target
-;     imm bytes of each of dep's 160 slot rows. Body slots become invisible writes
-;     (byte_x=29 buffer cols) immediately without clearing the full 6-byte slot.
-;   - Dep cap-slot deactivate (~50 T): write $00 to byte 0 of dep's old cap_top
-;     and cap_bot slots, neutralising the $C3 JP opcode until prep_step phase 1
-;     NOP-fills those rows.
-;   - Update prep_pipe_idx = dep. Pick new gap_y. Reset prep state to phase 0.
+;   - Set pipe_state[incoming].byte_x = 29 (gap_y left untouched — already correct).
+;   - Cap arming (incoming $C3 + handler addrs + target/_next imms) is NOT done
+;     here: it is relocated to ps_phase6's tail so it survives prep_step's
+;     post-swap column rebuild (ps_phase1 NOP-fills the cap range).
+;   - Dep column becomes JR-skip via write_jrskip_column (all 160 slots, full
+;     6-byte overwrite — disarms old cap $C3 opcodes, no partial-rewrite hazard).
+;   - Update prep_pipe_idx = dep. Set activate_pipe_idx = inc and reset prep
+;     state to phase 0 so prep_step rebuilds the incoming column.
+;   - Pick the departing pipe's next gap_y (random_gap_y) and store it into
+;     pipe_state[dep].gap_y; consumed when dep next activates.
 ;   NOTE: incoming pipe's body slot targets are NOT written here. prep_step phases 0
 ;   and 2 stamp body slots with target=line_addr+34 (byte_x=29 buffer col, invisible).
 ;   After swap the newly-active pipe's body slots already point at byte_x=29.
@@ -2638,7 +2784,10 @@ do_swap:
         ld      a, (prep_pipe_idx)
         ld      (ds_inc), a                     ; incoming = old prep_pipe_idx
 
-        ; 1. Set incoming pipe's byte_x=29, gap_y=prep_gap_y in pipe_state.
+        ; 1. Set incoming pipe's byte_x=29 in pipe_state.
+        ;    gap_y is NOT touched here — the incoming pipe's gap_y already holds
+        ;    the correct value (chosen when it departed). prep_gap_y at do_swap
+        ;    entry is a stale leftover; writing it would clobber the truth.
         ld      a, (ds_inc)
         add     a, a                            ; inc*2
         ld      l, a
@@ -2646,164 +2795,13 @@ do_swap:
         ld      de, pipe_state
         add     hl, de                          ; HL = &pipe_state[inc*2]
         ld      (hl), 29                        ; byte_x = 29
-        inc     hl
-        ld      a, (prep_gap_y)
-        ld      (hl), a                         ; gap_y = prep_gap_y
 
-        ; 2. Arm incoming cap slots in PIPE_PROGRAM.
-        ;    slot[cap_top_row][inc] byte 0: write $C3; bytes 1-2: write handler addr
-        ;    slot[cap_bot_row][inc] byte 0: write $C3; bytes 1-2: write handler addr
-        ;
-        ;    slot[row][pipe] = SLOT_GRID_BASE + 1 + row*32 + pipe*6
+        ; 2. (REMOVED) Incoming cap-slot arming relocated to ps_phase6 tail.
+        ;    Arming at swap time was overwritten by prep_step's column rebuild
+        ;    (ps_phase1 NOP-fills the cap range). ps_phase6 now arms the caps at
+        ;    build completion, so the $C3 JP opcodes survive into gameplay.
 
-        ; --- Compute pipe offset = inc*6 ---
-        ld      a, (ds_inc)
-        ld      e, a
-        add     a, a    ; inc*2
-        add     a, e    ; inc*3
-        add     a, e    ; inc*4
-        add     a, e    ; inc*5
-        add     a, e    ; inc*6
-        ld      (ds_pipe6), a                   ; save inc*6
-
-        ; --- cap_top slot ---
-        ld      a, (ps_cap_top_row)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl  ; row*2
-        add     hl, hl  ; row*4
-        add     hl, hl  ; row*8
-        add     hl, hl  ; row*16
-        add     hl, hl  ; row*32
-        ld      a, (ds_pipe6)
-        ld      e, a
-        ld      d, 0
-        add     hl, de                          ; HL += pipe*6
-        ld      de, SLOT_GRID_BASE + 1
-        add     hl, de                          ; HL = slot[cap_top_row][inc]
-        ; Write $C3 + handler addr (lo, hi)
-        ld      (hl), $C3                       ; JP opcode
-        inc     hl
-        ; Look up cap_top_handler_pipe_<inc> from cap_top_handler_addrs[inc]
-        ld      a, (ds_inc)
-        add     a, a                            ; inc * 2
-        ld      e, a
-        ld      d, 0
-        push    hl                              ; save slot+1 addr
-        ld      hl, cap_top_handler_addrs
-        add     hl, de                          ; HL = &cap_top_handler_addrs[inc]
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = handler address
-        pop     hl                              ; restore slot+1 addr
-        ld      (hl), e                         ; write handler.lo
-        inc     hl
-        ld      (hl), d                         ; write handler.hi
-
-        ; --- cap_bot slot ---
-        ld      a, (ps_cap_bot_row)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl  ; row*2
-        add     hl, hl  ; row*4
-        add     hl, hl  ; row*8
-        add     hl, hl  ; row*16
-        add     hl, hl  ; row*32
-        ld      a, (ds_pipe6)
-        ld      e, a
-        ld      d, 0
-        add     hl, de
-        ld      de, SLOT_GRID_BASE + 1
-        add     hl, de                          ; HL = slot[cap_bot_row][inc]
-        ld      (hl), $C3                       ; JP opcode
-        inc     hl
-        ld      a, (ds_inc)
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        push    hl
-        ld      hl, cap_bot_handler_addrs
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = handler address
-        pop     hl
-        ld      (hl), e                         ; write handler.lo
-        inc     hl
-        ld      (hl), d                         ; write handler.hi
-
-        ; 3. Write ps_cap_top_target into cap_top_handler_pipe_<inc>_target
-        ;    Address of the SMC imm slot = cap_top_target_imm_addrs[inc]
-        ld      a, (ds_inc)
-        add     a, a                            ; inc * 2
-        ld      e, a
-        ld      d, 0
-        ld      hl, cap_top_target_imm_addrs
-        add     hl, de                          ; HL = &cap_top_target_imm_addrs[inc]
-        ld      c, (hl)
-        inc     hl
-        ld      b, (hl)                         ; BC = address of cap_top_handler_<inc>_target imm
-        ld      hl, ps_cap_top_target
-        ld      a, (hl)
-        ld      (bc), a
-        inc     bc
-        inc     hl
-        ld      a, (hl)
-        ld      (bc), a
-
-        ; Write ps_cap_bot_target into cap_bot_handler_pipe_<inc>_target
-        ld      a, (ds_inc)
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        ld      hl, cap_bot_target_imm_addrs
-        add     hl, de
-        ld      c, (hl)
-        inc     hl
-        ld      b, (hl)                         ; BC = address of cap_bot_handler_<inc>_target imm
-        ld      hl, ps_cap_bot_target
-        ld      a, (hl)
-        ld      (bc), a
-        inc     bc
-        inc     hl
-        ld      a, (hl)
-        ld      (bc), a
-
-        ; Write ps_cap_top_next into cap_top_handler_pipe_<inc>_next
-        ld      a, (ds_inc)
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        ld      hl, cap_top_next_imm_addrs
-        add     hl, de
-        ld      c, (hl)
-        inc     hl
-        ld      b, (hl)                         ; BC = address of cap_top_handler_<inc>_next imm
-        ld      hl, ps_cap_top_next
-        ld      a, (hl)
-        ld      (bc), a
-        inc     bc
-        inc     hl
-        ld      a, (hl)
-        ld      (bc), a
-
-        ; Write ps_cap_bot_next into cap_bot_handler_pipe_<inc>_next
-        ld      a, (ds_inc)
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        ld      hl, cap_bot_next_imm_addrs
-        add     hl, de
-        ld      c, (hl)
-        inc     hl
-        ld      b, (hl)
-        ld      hl, ps_cap_bot_next
-        ld      a, (hl)
-        ld      (bc), a
-        inc     bc
-        inc     hl
-        ld      a, (hl)
-        ld      (bc), a
+        ; 3. (REMOVED) Cap target/_next imm writes relocated to ps_phase6 tail.
 
         ; 4. (REMOVED) Body-target-write for incoming pipe eliminated.
         ;    prep_step phases 0 and 2 now stamp body slots with target=line_addr+34
@@ -2851,6 +2849,20 @@ do_swap:
         add     hl, de                          ; HL = &pipe_state[ds_inc].gap_y
         ld      a, (hl)
         ld      (prep_gap_y), a                 ; gap_y of the column to build
+
+        ; Pick the DEPARTING pipe's next gap_y now (it has just become the prep
+        ; pipe). Stored into pipe_state[ds_dep].gap_y; consumed ~one cycle later
+        ; when ds_dep next activates. random_gap_y clobbers AF and HL only —
+        ; store its A-result before anything else uses A.
+        call    random_gap_y                    ; A = fresh random gap_y for departing pipe
+        ld      c, a                            ; preserve gap_y across address calc
+        ld      a, (ds_dep)
+        add     a, a                            ; dep*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
+        add     hl, de                          ; HL = &pipe_state[ds_dep].gap_y
+        ld      (hl), c                          ; store fresh random gap_y
 
         ; ps_cap_top_row/ps_cap_bot_row will be reset by prep_step phase 3.
         xor     a
