@@ -2477,13 +2477,14 @@ rebuild_column:
         call    rc_stamp_cap_slot               ; stamp $C3 + cap_top handler
 
         ; ── Skip band: rows [cap_top_row+1 .. cap_bot_row-1] ────────
+        ; cap_bot_row - cap_top_row = (gap_y+PIPE_GAP) - (gap_y-1) = PIPE_GAP+1 = 49.
         ; Count = (cap_bot_row-1) - (cap_top_row+1) + 1 = cap_bot_row - cap_top_row - 1
-        ;       = PIPE_GAP - 1 = 47 rows (constant).
+        ;       = PIPE_GAP = 48 rows (constant).
         ld      a, (rc_cap_top_row)
         inc     a                               ; A = cap_top_row + 1 = first skip row
         call    rc_slot_addr_for_row            ; HL = slot[cap_top_row+1][pipe]
         ex      de, hl                          ; DE = slot cursor
-        ld      b, PIPE_GAP - 1                 ; B = 47 skip rows
+        ld      b, PIPE_GAP                     ; B = 48 skip rows [cap_top_row+1..cap_bot_row-1]
 .rc_skip_lp:
         ld      a, $18                          ; JR e
         ld      (de), a
@@ -2528,13 +2529,19 @@ rebuild_column:
         call    rc_slot_addr_for_row            ; HL = slot[cap_bot_row+1][pipe]
         ex      de, hl                          ; DE = slot cursor
         pop     af                              ; A = first row
-        ; HL = &line_table[first_row] = line_table + first_row*2
+        ; HL = &line_table[first_row] = line_table + first_row*2.
+        ; B holds the Band-2 row count — must NOT be clobbered. Add the
+        ; line_table base byte-wise so no register pair is overwritten.
         ld      l, a
         ld      h, 0
-        add     hl, hl                          ; first_row*2
-        ld      bc, line_table
-        add     hl, bc                          ; HL = &line_table[first_row]
-        call    rc_stamp_body_band              ; stamp B rows
+        add     hl, hl                          ; HL = first_row*2
+        ld      a, l
+        add     a, low line_table
+        ld      l, a
+        ld      a, h
+        adc     a, high line_table
+        ld      h, a                            ; HL = &line_table[first_row]
+        call    rc_stamp_body_band              ; stamp B rows (B = row count, intact)
 .rc_b2_done:
         ret
 
@@ -2673,8 +2680,8 @@ rolling_rebuild_step:
         ; Skip on build/configure frames — old prep_step machinery is
         ; mid-rebuild this frame; adding ~18-20k T would overrun 70k.
         ld      a, (activate_pipe_idx)
-        inc     a                               ; 255 → 0 sets Z
-        ret     z
+        inc     a                               ; 255 (idle) → 0 sets Z
+        ret     nz                              ; nonzero ⇒ build in progress → skip
         ; Current cursor pipe.
         ld      a, (rc_cursor)
         ld      c, a                            ; C = candidate pipe
