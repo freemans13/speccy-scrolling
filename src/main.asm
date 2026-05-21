@@ -3425,7 +3425,7 @@ sfx_trigger_flap:
         ret     z                       ; yes → ignore the flap
 .start:
         ld      hl, sfx_flap
-        ld      a, 0                    ; id = flap
+        xor     a                       ; id = flap
         jr      sfx_begin
 
 ; sfx_trigger_chime: start the chime, interrupting any flap.
@@ -3437,7 +3437,7 @@ sfx_trigger_chime:
 
 ; sfx_begin: HL = descriptor address, A = sound id. Arms the effect.
 ; sound_edges_left is zeroed so sfx_tick loads segment 0 on its next call.
-; Clobbers A.
+; Clobbers A, HL.
 sfx_begin:
         ld      (sound_id), a
         ld      (sound_descptr), hl
