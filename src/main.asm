@@ -38,8 +38,11 @@ SCORE_TOP       EQU 168                 ; first scan line of scoreboard band (= 
 SPK_BIT           EQU $10                ; bit 4 of port $FE = speaker
 SOUND_BORDER      EQU $01                ; blue profile band for the sound region
 EDGE_FIXED_ITERS  EQU 14                 ; per-edge non-delay overhead in delay-iter units (CALIBRATE — Task 6)
-SND_BUDGET_NORMAL EQU 1200               ; sound delay-iters allowed on normal/wrap frames (CALIBRATE — Task 6)
-SND_BUDGET_CONFIG EQU 90                 ; sound delay-iters allowed on swap/build frames (CALIBRATE — Task 6)
+SND_BUDGET_NORMAL EQU 1200               ; (legacy single-slice budget — unused since Stage 1 multi-slice)
+SND_BUDGET_CONFIG EQU 90                 ; (legacy single-slice budget — unused since Stage 1 multi-slice)
+; Stage 1 renderer-distributed sound: budget PER SLICE (4 slices per frame).
+SND_SLICE_NORMAL  EQU 220                ; per-slice delay-iters on normal/wrap frames (CALIBRATE)
+SND_SLICE_CONFIG  EQU 18                 ; per-slice delay-iters on build frames (activate_pipe_idx != 255)
 
 ; ─── Slot grid layout (fixed-slot dispatch) ──────────────────────
 ; Phase 1: 6-byte normal slot template:
@@ -111,6 +114,15 @@ main_loop:
         out     ($fe), a
         xor     a
         ld      (sound_heavy_frame), a
+        ; Stage-1 sound: classify frame, set per-slice budget. Build frames
+        ; (activate_pipe_idx != 255) are tight (~3k T slack) → tiny slice.
+        ld      hl, SND_SLICE_NORMAL
+        ld      a, (activate_pipe_idx)
+        inc     a                       ; 255 -> 0
+        jr      z, .snd_slice_set
+        ld      hl, SND_SLICE_CONFIG
+.snd_slice_set:
+        ld      (sound_slice_budget), hl
         ; Phase 2: bird ops run BEFORE PIPE_PROGRAM in top blanking.
         ; All bird writes complete before raster reaches row 0, so the
         ; bird is visible same-frame at every Y with no flicker.
@@ -122,15 +134,18 @@ main_loop:
         call    advance_bird_anim
         call    draw_bird
         call    paint_bird_attrs
+        call    sfx_slice               ; sound slice 1/4 — before PIPE_PROGRAM
         ld      a, 3                    ; PROFILE: MAGENTA = PIPE_PROGRAM
         out     ($fe), a
         call    frame_update
+        call    sfx_slice               ; sound slice 2/4 — after frame_update
         ld      a, 7                    ; PROFILE: WHITE = state prep
         out     ($fe), a
         call    do_white_work
         ld      a, 5                    ; PROFILE: CYAN = update_cap_imm_v2
         out     ($fe), a
         call    update_cap_imm_v2
+        call    sfx_slice               ; sound slice 3/4 — after cap update
         ld      a, 6                    ; PROFILE: YELLOW = column build
         out     ($fe), a
         ; Amortized column build. do_swap sets activate_pipe_idx to the
@@ -161,14 +176,7 @@ main_loop:
         ld      a, 1
         ld      (sound_heavy_frame), a
 .post_prep_step:
-        ld      hl, SND_BUDGET_NORMAL
-        ld      a, (sound_heavy_frame)
-        or      a
-        jr      z, .snd_budget_set
-        ld      hl, SND_BUDGET_CONFIG
-.snd_budget_set:
-        ld      (sound_budget), hl
-        call    sfx_tick
+        call    sfx_slice               ; sound slice 4/4 — idle tail
         ld      a, 0                    ; PROFILE: BLACK = idle before halt
         out     ($fe), a
         ei
@@ -238,6 +246,7 @@ sound_mode:       db 0                   ; current segment mode: 0 = tone, 1 = n
 sound_lfsr:       dw $7ACE               ; 16-bit LFSR state for noise (must stay nonzero)
 sound_budget:     dw 0                   ; delay-iters of sound permitted this frame
 sound_heavy_frame: db 0                  ; 1 = configure/swap/build frame this frame
+sound_slice_budget: dw 0                 ; per-slice delay-iter budget, set once per frame
 
 ; ─── SFX descriptors ─────────────────────────────────────────────
 ; segment = db mode(0=tone,1=noise,$FF=end) : dw half_period : dw edge_count : db sweep
@@ -253,6 +262,10 @@ sfx_chime:
         db 0 : dw 75 : dw  64 : db 0
         db 0 : dw 60 : dw  72 : db 0
         db 0 : dw 47 : dw 120 : db 0
+        db $FF
+; Stage-1 prototype: steady ~1.1 kHz test tone (one long tone segment).
+sfx_tone_test:
+        db 0 : dw 60 : dw 2000 : db 0
         db $FF
 
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
@@ -2360,6 +2373,8 @@ frame_update:
         ; reached row 0 → uniform 0-frame lag at every bird Y, no flicker.
         ; PIPE_PROGRAM starts at T~5.6k with ~8k T head start over the raster.
         call    redraw_pipes_v2
+        ; NB: no sound slice here — draw_ground races the beam right behind the
+        ; pipe render; inserting a slice would delay it and tear the ground.
         ld      a, 1                    ; PROFILE: BLUE = ground/score region
         out     ($fe), a
         call    update_score
@@ -3447,7 +3462,7 @@ sfx_trigger_flap:
 ; sfx_trigger_chime: start the chime, interrupting any flap.
 ; Clobbers A, HL.
 sfx_trigger_chime:
-        ld      hl, sfx_chime
+        ld      hl, sfx_tone_test       ; TEMP (Stage 1): steady test tone, not sfx_chime
         ld      a, 1                    ; id = chime
         ; fall through into sfx_begin
 
@@ -3488,6 +3503,15 @@ sfx_next_segment:
         xor     a
         ld      (sound_active), a
         ret
+
+; sfx_slice: play one renderer-distributed sound slice. Loads the per-slice
+; budget (set once per frame) into sound_budget, then runs the engine. Called
+; at ~5 points spread across the frame so the speaker never stays silent long
+; enough to buzz. Clobbers A, BC, DE, HL.
+sfx_slice:
+        ld      hl, (sound_slice_budget)
+        ld      (sound_budget), hl
+        ; fall through into sfx_tick
 
 ; sfx_tick: generate one frame's slice of the active effect. Runs under di in
 ; main_loop's idle region. Plays edges until sound_budget (delay-iters) is
