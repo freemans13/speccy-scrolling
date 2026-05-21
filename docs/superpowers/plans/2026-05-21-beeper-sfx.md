@@ -398,7 +398,7 @@ wrap budget is not needed.
 Insert after the sound state block (after `sound_budget` from Task 1, Step 2):
 
 ```
-snd_heavy_frame:  db 0                   ; 1 = configure/swap/build frame this frame
+sound_heavy_frame:  db 0                   ; 1 = configure/swap/build frame this frame
 ```
 
 - [ ] **Step 2: Clear the flag at the top of each frame**
@@ -408,7 +408,7 @@ and before the `call restore_bird_bg` at line 109, insert:
 
 ```
         xor     a
-        ld      (snd_heavy_frame), a
+        ld      (sound_heavy_frame), a
 ```
 
 - [ ] **Step 3: Flag the swap frame**
@@ -428,7 +428,7 @@ change it to also set the heavy flag:
         xor     a
         ld      (do_swap_fired), a
         ld      a, 1
-        ld      (snd_heavy_frame), a
+        ld      (sound_heavy_frame), a
 ```
 
 - [ ] **Step 4: Flag build frames**
@@ -456,7 +456,7 @@ Change it to:
         cp      255
         jr      z, .post_prep_step              ; idle, or build just finished
         ld      a, 1
-        ld      (snd_heavy_frame), a
+        ld      (sound_heavy_frame), a
         push    bc
         call    prep_step
         pop     bc
@@ -481,7 +481,7 @@ Change it to select the budget, run the tick, then mark the leftover idle:
 ```
 .post_prep_step:
         ld      hl, SND_BUDGET_NORMAL
-        ld      a, (snd_heavy_frame)
+        ld      a, (sound_heavy_frame)
         or      a
         jr      z, .snd_budget_set
         ld      hl, SND_BUDGET_CONFIG
@@ -605,6 +605,6 @@ Ask the human to run `make run` and confirm:
   no-overrun guarantee and sound quality are unaffected.
 - **Symbol consistency:** `sound_*` state names, `sfx_trigger_flap`,
   `sfx_trigger_chime`, `sfx_begin`, `sfx_next_segment`, `sfx_tick`,
-  `snd_heavy_frame`, `SPK_BIT`, `SOUND_BORDER`, `EDGE_FIXED_ITERS`,
+  `sound_heavy_frame`, `SPK_BIT`, `SOUND_BORDER`, `EDGE_FIXED_ITERS`,
   `SND_BUDGET_NORMAL`, `SND_BUDGET_CONFIG` are used identically across tasks.
 ```
