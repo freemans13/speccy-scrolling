@@ -1465,6 +1465,41 @@ build_slot_templates:
         ret
 
 ;----------------------------------------------------------------
+; write_jrskip_column — fill one pipe's entire PIPE_PROGRAM column
+; with the JR-skip pattern, making that column a no-op (cap-skip
+; style: JR e=$04 advances PC 6 bytes = exactly one slot).
+;
+; In:  A = pipe index (0..3).
+; Out: 160 slots of that column set to $18 $04 $00 $00 $00 $00.
+;      Only this pipe's 6 bytes per row are touched — EXX byte,
+;      other columns, row trailer and pad bytes are left intact.
+; Clobbers: AF, BC, DE, HL, IY.
+;----------------------------------------------------------------
+write_jrskip_column:
+        ; IY = slot[0][pipe] = SLOT_GRID_BASE + 1 + pipe*6
+        add     a, a                            ; A = pipe*2
+        ld      l, a
+        add     a, a                            ; A = pipe*4
+        add     a, l                            ; A = pipe*6
+        ld      e, a
+        ld      d, 0                            ; DE = pipe*6
+        ld      iy, SLOT_GRID_BASE + 1
+        add     iy, de                          ; IY → slot[0][pipe]
+        ld      b, GROUND_TOP                   ; B = 160 rows
+.wjc_lp:
+        ld      (iy+0), $18                     ; JR e
+        ld      (iy+1), $04                     ; displacement → next slot
+        ld      (iy+2), 0
+        ld      (iy+3), 0
+        ld      (iy+4), 0
+        ld      (iy+5), 0
+        ; advance IY to same column in next row: +SLOT_ROW_STRIDE
+        ld      de, SLOT_ROW_STRIDE
+        add     iy, de
+        djnz    .wjc_lp
+        ret
+
+;----------------------------------------------------------------
 init_pipes:
         xor     a
         ld      (phase), a
