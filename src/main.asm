@@ -2810,201 +2810,48 @@ do_swap:
         ;    (= byte_x=29 buffer col) instead of $0000. After swap the incoming
         ;    pipe's body slots already point at byte_x=29. No per-swap rewrite needed.
 
-        ; 5. Surgical patch of dep's slot column (replaces the 15.4 k T full clear).
-        ;    Pre-swap dep's column has:
-        ;      band 1: rows 0..G-2          → body slots drawing at OLD byte_x (visible)
-        ;      cap_top: row G-1             → JP cap_top_handler (fires)
-        ;      cap-skip: rows G..G+47       → already NOPs (no touch needed)
-        ;      cap_bot: row G+48            → JP cap_bot_handler (fires)
-        ;      band 2: rows G+49..159       → body slots drawing at OLD byte_x
-        ;    where G = ds_old_gap_y, PIPE_GAP = 48.
-        ;
-        ;    Strategy:
-        ;      5b. Band 1: rewrite each body slot's target imm (+1, +2) to
-        ;          line_addr+34 (= byte_x=29 buffer col, invisible).
-        ;      5c. Band 2: same.
-        ;      5d. Cap rows: clear 3 bytes ($00 $00 $00) at slot+0..+2 to disarm
-        ;          the JP. (3 bytes — not 1 — to ensure any handler-address byte
-        ;          at slot+1 or slot+2 cannot decode as a multi-byte opcode.)
-        ;    Cost ~3.4 k T (vs 15.4 k T full clear).
-
-        ; 5a. Compute dep*6 (slot column base offset). Save to ds_pipe6.
+        ; 5. Departing column becomes JR-skip.
+        ;    write_jrskip_column writes the 6-byte JR-skip pattern
+        ;    ($18 $04 $00 $00 $00 $00) into ALL 160 slots of dep's column —
+        ;    body rows, cap rows and cap-skip rows alike. PIPE_PROGRAM then
+        ;    JR-skips dep's column (12 T/row) instead of executing wasteful
+        ;    body pushes into invisible memory.
+        ;    Because every slot's 6 bytes are fully overwritten, no stale
+        ;    target bytes survive (avoids do_swap_partial_rewrite_bug) and the
+        ;    old cap-slot $C3 JP opcodes are disarmed (no separate deactivate
+        ;    sub-step needed).
+        ;    write_jrskip_column clobbers AF,BC,DE,HL,IY — do_swap holds no
+        ;    live state in those registers at this point (ds_* scratch is in
+        ;    memory; HL' is untouched). Nothing to preserve.
         ld      a, (ds_dep)
-        ld      e, a
-        add     a, a    ; dep*2
-        add     a, e    ; dep*3
-        add     a, e    ; dep*4
-        add     a, e    ; dep*5
-        add     a, e    ; dep*6
-        ld      (ds_pipe6), a
+        call    write_jrskip_column
 
-        ; 5a (cont). Compute old_cap_top_row = ds_old_gap_y - 1 → ds_cap_top.
-        ld      a, (ds_old_gap_y)
-        dec     a
-        ld      (ds_cap_top), a
-
-        ; 5a (cont). Compute old_cap_bot_row = ds_old_gap_y + PIPE_GAP → ds_cap_bot.
-        ld      a, (ds_old_gap_y)
-        add     a, PIPE_GAP
-        ld      (ds_cap_bot), a
-
-        ; 5b. Band 1: patch body slots in rows 0..(old_cap_top_row - 1).
-        ;     Row count = old_cap_top_row.
-        ld      a, (ds_cap_top)
-        or      a
-        jp      z, .ds_band1_done               ; G=1 → cap_top_row=0, band 1 empty
-
-        ; --- Save real HL' on stack, then load table base into alt HL ---
-        exx
-        push    hl                              ; save real alt HL
-        exx
-        ld      hl, screen_target_table_29
-        exx                                     ; alt HL = table base; main HL = junk
-        ; --- Compute grid HL = slot[0][dep]+1 in main bank ---
-        ld      a, (ds_pipe6)
-        ld      l, a
-        ld      h, 0
-        ld      de, SLOT_GRID_BASE + 2          ; +1 (EXX byte) + 1 (skip $31 opcode)
-        add     hl, de                          ; main HL = slot[0][dep]+1
-        ld      de, SLOT_ROW_STRIDE - 1         ; 31: stride after the inc hl on +2
-        ; Set B AFTER the 3 setup exx (odd count) so djnz operates on the
-        ; current-bank B. Loop body has 4 exx per iter (even) → preserved.
-        ld      a, (ds_cap_top)
-        ld      b, a                            ; B = band-1 row count
-.ds_band1_lp:
-        exx
-        ld      a, (hl)                         ; A = target.lo
-        inc     hl
-        exx
-        ld      (hl), a                         ; write to slot[r][dep]+1
-        inc     hl                              ; HL → slot[r][dep]+2
-        exx
-        ld      a, (hl)                         ; A = target.hi
-        inc     hl
-        exx
-        ld      (hl), a                         ; write to slot[r][dep]+2
-        add     hl, de                          ; HL += 31 → slot[r+1][dep]+1
-        djnz    .ds_band1_lp
-        exx
-        pop     hl                              ; restore real alt HL
-        exx
-.ds_band1_done:
-
-        ; 5c. Band 2: patch body slots in rows (old_cap_bot_row+1)..159.
-        ;     Row count = 159 - old_cap_bot_row.
-        ld      a, (ds_cap_bot)
-        ld      b, a
-        ld      a, 159
-        sub     b                               ; A = 159 - old_cap_bot_row
-        jp      z, .ds_band2_done               ; band 2 empty
-        jp      c, .ds_band2_done               ; overshoot (shouldn't happen)
-        ld      (ds_band2_count), a             ; save row count; set B after setup exx
-
-        ; --- Save real HL' on stack ---
-        exx
-        push    hl                              ; save real alt HL
-        exx
-        ; --- Compute table addr = screen_target_table_29 + start_row*2 in main, swap into alt ---
-        ld      a, (ds_cap_bot)
-        inc     a                               ; A = start_row
-        add     a, a                            ; A = start_row * 2
-        ld      e, a
-        ld      d, 0
-        ld      hl, screen_target_table_29
-        add     hl, de                          ; main HL = table addr
-        exx                                     ; alt HL = table addr; main HL = junk
-        ; --- Compute grid HL = slot[start_row][dep]+1 in main bank ---
-        ld      a, (ds_cap_bot)
-        inc     a                               ; A = start_row
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; HL = start_row * 32
-        ld      a, (ds_pipe6)
-        ld      e, a
-        ld      d, 0
-        add     hl, de                          ; HL += dep*6
-        ld      de, SLOT_GRID_BASE + 2
-        add     hl, de                          ; main HL = slot[start_row][dep]+1
-        ld      de, SLOT_ROW_STRIDE - 1         ; 31
-        ; Set B AFTER the 3 setup exx (odd count) so djnz sees correct count.
-        ld      a, (ds_band2_count)
-        ld      b, a
-.ds_band2_lp:
-        exx
-        ld      a, (hl)
-        inc     hl
-        exx
-        ld      (hl), a
-        inc     hl
-        exx
-        ld      a, (hl)
-        inc     hl
-        exx
-        ld      (hl), a
-        add     hl, de
-        djnz    .ds_band2_lp
-        exx
-        pop     hl                              ; restore real alt HL
-        exx
-.ds_band2_done:
-
-        ; 5d. Cap rows: clear 3 bytes ($00 $00 $00) at slot[cap_top_row][dep]
-        ;     and slot[cap_bot_row][dep]. Three bytes (not one) protects against
-        ;     any handler-address byte at +1, +2 decoding as a multi-byte opcode.
-
-        ; --- cap_top_row clear ---
-        ld      a, (ds_cap_top)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; HL = cap_top_row * 32
-        ld      a, (ds_pipe6)
-        ld      e, a
-        ld      d, 0
-        add     hl, de                          ; HL += dep*6
-        ld      de, SLOT_GRID_BASE + 1
-        add     hl, de                          ; HL = slot[cap_top_row][dep]
-        xor     a
-        ld      (hl), a                         ; byte 0
-        inc     hl
-        ld      (hl), a                         ; byte 1
-        inc     hl
-        ld      (hl), a                         ; byte 2
-
-        ; --- cap_bot_row clear ---
-        ld      a, (ds_cap_bot)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; HL = cap_bot_row * 32
-        ld      a, (ds_pipe6)
-        ld      e, a
-        ld      d, 0
-        add     hl, de
-        ld      de, SLOT_GRID_BASE + 1
-        add     hl, de                          ; HL = slot[cap_bot_row][dep]
-        xor     a
-        ld      (hl), a                         ; byte 0
-        inc     hl
-        ld      (hl), a                         ; byte 1
-        inc     hl
-        ld      (hl), a                         ; byte 2
-
-        ; 7. Update prep_pipe_idx, pick new gap_y, reset prep state.
+        ; 7. Update prep_pipe_idx, reset prep state, trigger post-swap build.
         ld      a, (ds_dep)
         ld      (prep_pipe_idx), a              ; departing pipe is now the prep pipe
-        call    random_gap_y                    ; A = new random gap_y for next prep cycle
-        ld      (prep_gap_y), a
+
+        ; The incoming (just-activated) pipe's column is currently JR-skip
+        ; (it was the prep pipe). prep_step must FULLY rebuild it post-swap.
+        ; Trigger that build:
+        ;   activate_pipe_idx = ds_inc  → makes prep_step start building
+        ;   prep_phase = 0, prep_row = 0 → restart the build state machine
+        ;   prep_gap_y = incoming gap_y → prep_step builds the column to this
+        ;                                 gap_y. Step 1 stored prep_gap_y (as
+        ;                                 it was on entry) into
+        ;                                 pipe_state[ds_inc].gap_y, so re-read
+        ;                                 it from there to be unambiguous.
+        ld      a, (ds_inc)
+        ld      (activate_pipe_idx), a          ; the pipe prep_step now builds
+
+        ld      a, (ds_inc)
+        add     a, a                            ; inc*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
+        add     hl, de                          ; HL = &pipe_state[ds_inc].gap_y
+        ld      a, (hl)
+        ld      (prep_gap_y), a                 ; gap_y of the column to build
+
         ; ps_cap_top_row/ps_cap_bot_row will be reset by prep_step phase 3.
         xor     a
         ld      (prep_phase), a                 ; reset to phase 0 (start fresh)
