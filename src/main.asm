@@ -41,7 +41,7 @@ EDGE_FIXED_ITERS  EQU 14                 ; per-edge non-delay overhead in delay-
 ; Per-frame sound budget (delay-iters). One slice per frame, in the idle tail.
 ; Classified per frame type: build frames (~67k) and wrap/swap frames are
 ; heavier, so they get less sound budget to stay under the 70k T ceiling.
-SND_SLICE_NORMAL  EQU 1100               ; budget on normal frames (CALIBRATE)
+SND_SLICE_NORMAL  EQU 0                  ; sound parked (0) during the renderer rewrite — Stage 8 restores it
 SND_SLICE_WRAP    EQU 0                  ; wrap/swap frames already at ~70k — no room for sound
 SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no room for sound
 
@@ -2682,6 +2682,11 @@ rolling_rebuild_step:
         ld      a, (activate_pipe_idx)
         inc     a                               ; 255 (idle) → 0 sets Z
         ret     nz                              ; nonzero ⇒ build in progress → skip
+        ; Transitional (Stage 4-5): also skip wrap frames — wrap-frame work plus
+        ; the ~30k rebuild overruns 70k until the old machinery is removed.
+        ld      a, (phase)
+        cp      6                               ; phase 6 at frame top ⇒ this frame wraps
+        ret     z
         ; Current cursor pipe.
         ld      a, (rc_cursor)
         ld      c, a                            ; C = candidate pipe
