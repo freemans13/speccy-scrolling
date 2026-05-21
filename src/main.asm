@@ -151,6 +151,18 @@ main_loop:
         call    frame_update
         ld      a, 7                    ; PROFILE: WHITE = state prep
         out     ($fe), a
+        ; Spread the shadow-grid target-imm patch across the 4-frame byte
+        ; window. Steady state needs -2/window (the shadow grid skipped a
+        ; window as the live grid) → 2 passes/window = 2 calls/frame. The
+        ; first window needs only -1 (both grids start identical) → 1
+        ; call/frame while first_window is set. Runs BEFORE do_white_work
+        ; so the shadow is fully patched before do_white_work's wrap swaps.
+        call    patch_shadow_step
+        ld      a, (first_window)
+        or      a
+        jr      nz, .skip_second_patch
+        call    patch_shadow_step
+.skip_second_patch:
         call    do_white_work
         ld      a, 5                    ; PROFILE: CYAN = update_cap_imm_v2
         out     ($fe), a
@@ -241,6 +253,9 @@ shadow_grid:    dw GRID_B               ; the grid being rebuilt (not the one re
 ; pss_pipe_idx: which pipe sublist is processed next (0..3, wraps).
 ; One call handles one pipe's 112 entries; 4 calls = full pass.
 pss_pipe_idx:   db 0
+first_window:   db 1                    ; 1 only during the first byte window
+                                        ; (both grids start identical → -1 patch);
+                                        ; cleared at the first swap → steady -2
 pss_saved_sp:   dw 0                    ; SP save slot (SP-hijack)
 
 ; Scratch bytes for update_cap_imm_v2's phase-shifted cap values
@@ -3084,8 +3099,19 @@ wrap_byte_x:
         inc     iy
         inc     iy
         djnz    .outer
-        ; Run patch_pipe_targets so NEXT frame's PIPE_PROGRAM renders at NEW byte_x.
-        call    patch_pipe_targets
+        ; Byte boundary crossed: swap the live and shadow grids. The shadow
+        ; grid was patched to the new byte position over the just-finished
+        ; window, so SMC-patch the grid_call operand to render it next frame.
+        ; The old single-shot patch_pipe_targets spike is retired — the patch
+        ; is now spread by patch_shadow_step. Reset the patch cursor and clear
+        ; first_window so every subsequent window patches -2.
+        ld      hl, (grid_call + 1)             ; HL = current live grid base
+        ld      de, (shadow_grid)               ; DE = shadow grid base
+        ld      (grid_call + 1), de             ; live := shadow (SMC)
+        ld      (shadow_grid), hl               ; shadow := old live
+        xor     a
+        ld      (pss_pipe_idx), a               ; restart patch pass for new window
+        ld      (first_window), a               ; first window done → steady -2
         ret
 
 ;----------------------------------------------------------------
