@@ -2421,12 +2421,12 @@ ps_cap_bot_next:   dw 0
 ;   rc_pipe       : db   pipe index 0..3
 ;   rc_grid_base  : dw   target grid base address
 ;
-; Worst-case cost ~22k T (~110 body rows × ~183 T + 48 skip rows × ~150 T
-; + 2 cap slots + setup).  Acceptable: in the final design this replaces
+; Worst-case cost ~30k T (~110 body rows × ~207 T + 48 skip rows × ~136 T
+; + caps + setup).  Acceptable: in the final design this replaces
 ; prep_step/do_swap/configure_pipe_slots, so a steady-state frame is
-; render ~16k + rebuild ~20k + bird/ground ~10k ≈ 45k T, flat.
+; render ~16k + rebuild ~30k + bird/ground ~10k ≈ 57k T, flat — under 70k.
 ;
-; Clobbers: AF, BC, DE, HL, IY.
+; Clobbers: AF, BC, DE, HL.
 ;----------------------------------------------------------------
 rebuild_column:
         ; ── Cache geometry: byte_x, gap_y, cap_top_row, cap_bot_row ──
@@ -2674,7 +2674,7 @@ rc_cursor:       db 0                           ; next pipe index to rebuild
 ; rotating cursor.  Skipped entirely on build/configure frames
 ; (activate_pipe_idx != 255) so Stage 4's transitional overlap with
 ; the old machinery cannot overrun the 70k frame budget.
-; Clobbers: AF, BC, DE, HL, IY.
+; Clobbers: AF, BC, DE, HL.
 ;----------------------------------------------------------------
 rolling_rebuild_step:
         ; Skip on build/configure frames — old prep_step machinery is
@@ -2696,11 +2696,8 @@ rolling_rebuild_step:
         ld      a, (prep_pipe_idx)
         cp      c
         ret     z
-        ; Skip the activating pipe (build in progress). activate_pipe_idx
-        ; is 255 here (guarded above) so this only matters defensively.
-        ld      a, (activate_pipe_idx)
-        cp      c
-        ret     z
+        ; (No activate_pipe_idx guard needed here: the guard at routine
+        ; entry guarantees activate_pipe_idx == 255 at this point.)
         ; Rebuild candidate pipe C into GRID_A at its current geometry.
         ld      a, c
         ld      (rc_pipe), a
