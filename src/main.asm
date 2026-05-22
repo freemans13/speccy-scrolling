@@ -146,6 +146,21 @@ main_loop:
         call    advance_bird_anim
         call    draw_bird
         call    paint_bird_attrs
+        ; Deferred GRID_B column blank from a do_swap last frame — done here
+        ; (before frame_update renders) so GRID_B never shows the departed
+        ; pipe's stale column. rc_step's GRID_B pass is still ~10 frames away.
+        ld      a, (pending_blank_b)
+        or      a
+        jr      z, .no_pending_blank_b
+        xor     a
+        ld      (pending_blank_b), a
+        ld      hl, GRID_B + 1
+        ld      (wjc_base), hl
+        ld      a, (prep_pipe_idx)              ; the just-parked pipe
+        call    write_jrskip_column
+        ld      hl, GRID_A + 1                  ; restore wjc_base default
+        ld      (wjc_base), hl
+.no_pending_blank_b:
         ld      a, 3                    ; PROFILE: MAGENTA = PIPE_PROGRAM
         out     ($fe), a
         call    frame_update
@@ -1602,6 +1617,7 @@ write_jrskip_column:
         ret
 
 wjc_base:       dw SLOT_GRID_BASE + 1           ; slot[0][0] base; do_swap sets per grid
+pending_blank_b: db 0                           ; 1 = main_loop must blank GRID_B's parked column
 
 ;----------------------------------------------------------------
 init_pipes:
@@ -3376,19 +3392,17 @@ do_swap:                                        ; A = departing pipe (D)
 .ds_gy_nc:
         ld      (hl), c                         ; pipe_state[D].gap_y
 
-        ; Blank D's column in BOTH grids now — its old byte_x≈1 column would
-        ; otherwise show fragments (cols 4-6 visible) until rc_step overwrites
-        ; it. rc_step then rebuilds it row-by-row over the parked window.
+        ; Blank D's old (byte_x≈1) column so it stops showing fragments.
+        ; GRID_A now — rc_step starts rebuilding GRID_A's column this frame.
+        ; GRID_B is deferred to next frame's main_loop: rc_step won't touch
+        ; GRID_B until its 2nd pass (~10 frames out), and splitting the two
+        ; ~8k T blanks across two frames keeps the do_swap frame in budget.
         ld      hl, GRID_A + 1
         ld      (wjc_base), hl
         ld      a, (ds_dep)
         call    write_jrskip_column
-        ld      hl, GRID_B + 1
-        ld      (wjc_base), hl
-        ld      a, (ds_dep)
-        call    write_jrskip_column
-        ld      hl, GRID_A + 1                  ; restore default for other callers
-        ld      (wjc_base), hl
+        ld      a, 1
+        ld      (pending_blank_b), a            ; main_loop blanks GRID_B next frame
 
         ; Arm the incremental two-grid rebuild of D (byte_x=29, new gap_y).
         ld      a, (ds_dep)
