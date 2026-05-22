@@ -2732,7 +2732,9 @@ rolling_rebuild_step:
 ; so a half-rebuilt column never tears — every row is always a valid
 ; slot (JR-skip from do_swap, or freshly-stamped body/cap/skip).
 ;================================================================
-ROWS_PER_STEP   EQU 16
+ROWS_PER_STEP   EQU 10           ; 320 rows / 10 = 32 frames — spread thin to
+                                 ; fill the parked window (≥36 frames) so the
+                                 ; YELLOW build band is a small flat slice
 
 rcs_state:      db 0            ; 0=idle, 1=GRID_A pass, 2=GRID_B pass
 rcs_row:        db 0            ; next row to stamp (0..160)
