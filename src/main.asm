@@ -45,34 +45,41 @@ SND_SLICE_NORMAL  EQU 1100               ; budget on normal frames (CALIBRATE)
 SND_SLICE_WRAP    EQU 0                  ; wrap/swap frames already at ~70k — no room for sound
 SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no room for sound
 
-; ─── Slot grid layout — Stage 2a: band-interleaved ───────────────
-; The grid is emitted as 80 pipe-bands. A pipe-band = 8 char-cell-
-; consecutive screen rows of ONE pipe, physically contiguous, plus a
-; trailer JP to the next band. Bands are ordered band-interleaved:
-;   P0.b0, P1.b0, P2.b0, P3.b0, P0.b1, P1.b1, …, P3.b19
-; where band K (0..19) is screen rows 8K..8K+7.
+; ─── Slot grid layout — Stage 2b: band-interleaved, IX-walk body ──
+; The grid is 80 pipe-bands, band-interleaved:
+;   P0.b0, P1.b0, P2.b0, P3.b0, P0.b1, …, P3.b19
+; where band K (0..19) is screen rows 8K..8K+7 of one pipe.
 ;
-; Per-row slot format is UNCHANGED (Stage 2a is a pure reorder):
-;   $D9            EXX                (per-row A/B dither bank swap)
-;   $31 lo hi      ld sp,target
-;   $E5 $D5 $C5    push hl ; push de ; push bc
-; = 1 (EXX) + 6 (slot) = 7 bytes per row. 8 rows = 56 bytes; + 3-byte
-; trailer JP = 59 bytes used. Padded to BAND_STRIDE = 64 so the band
-; index multiply is a shift (band << 6).
+; Every band is BAND_STRIDE = 80 bytes; entry at +0; trailer JP at a
+; uniform +68 (JP next_band_base+0; band 79 → epilogue). Two forms:
 ;
-; Within a band the 8 rows fall through contiguously (no per-row JP);
-; only the band trailer jumps. 80 trailers/frame vs the old 160 — no
-; added overhead. Band 79's trailer reaches the epilogue.
+;   BODY band  (12/pipe, outside the gap & caps):
+;     +0   ld ix,band_screen_base        (4 B: $DD $21 lo hi)
+;     +4   8 IX-walk rows, 8 B each:
+;            D9        EXX            (per-row A/B dither)
+;            DD F9     ld sp,ix
+;            E5 D5 C5  push hl ; push de ; push bc   (HL=0 trailing zero)
+;            DD 24     inc ixh        (+256 → next pixel row in the cell)
+;     +68  trailer JP
+;   Scrolling patches ONE immediate per body band (ld ix operand, +2..3).
+;
+;   CAP/SKIP band  (cap-edge ×2/pipe, skip ×6/pipe — 2a per-row form):
+;     +0   8 per-row slots, 7 B each:  D9 EXX ; 31 lo hi ; E5 D5 C5
+;     +56  the last row ends here; +56..67 are NOP ($00) and fall
+;          through to the +68 trailer (NOP bridge — see init_pipe_program).
+;   cap-edge bands keep per-row scroll targets (Stage 4 folds them in).
 SLOT_GRID_BASE         EQU $DB00
 BAND_ROWS              EQU 8                          ; rows per char-cell band
 NUM_BANDS              EQU 80                         ; 20 char-cells × 4 pipes
-BAND_ROW_STRIDE        EQU 7                          ; EXX(1) + 6-byte slot
-BAND_STRIDE            EQU 64                         ; 8*7=56 + 3 trailer + 5 pad → band<<6
-SLOT_GRID_END          EQU SLOT_GRID_BASE + NUM_BANDS * BAND_STRIDE  ; $DB00 + 80*64 = $EF00
+BAND_ROW_STRIDE        EQU 7                          ; cap/skip row: EXX(1) + 6-byte slot
+BAND_IX_PREFIX         EQU 4                          ; body band: ld ix,nn  ($DD $21 lo hi)
+BAND_IXROW_STRIDE      EQU 8                          ; body row: EXX+ld sp,ix+3 push+inc ixh
+BAND_STRIDE            EQU 80                         ; 4 + 8*8 = 68 used (body); +3 trailer; +9 pad
+SLOT_GRID_END          EQU SLOT_GRID_BASE + NUM_BANDS * BAND_STRIDE  ; $DB00 + 80*80 = $F400
 PIPE_PROGRAM           EQU SLOT_GRID_BASE              ; entry point alias
 
-; Trailer JP sits at band_base + 8*7 = +56.
-BAND_TRAILER_OFFSET    EQU BAND_ROWS * BAND_ROW_STRIDE ; 56
+; Trailer JP at a uniform offset for both band forms.
+BAND_TRAILER_OFFSET    EQU 68
 
 ; Slot format: $31 lo hi $E5 $D5 $C5  =  ld sp,target ; push hl ; push de ; push bc
 ; HL is set to $0000 once at PIPE_PROGRAM entry; the extra push HL writes the
@@ -538,31 +545,35 @@ init_slot_addr_table:
         ld      e, a                            ; E = K*4 (pipe 0's band index)
         ld      b, NUM_PIPES                    ; 4 pipes
 .wp_lp:
-        ; HL = SLOT_GRID_BASE + e*BAND_STRIDE + C   (e = E here)
+        ; HL = SLOT_GRID_BASE + e*BAND_STRIDE + C  (BAND_STRIDE = 80; e = E)
+        ; e*80 = e*16 + e*64.  Band index e is held in B'... no — kept in E,
+        ; preserved across the arithmetic via the stack.
+        push    de                              ; save band index e (in E)
         ld      l, e
         ld      h, 0
         add     hl, hl                          ; e*2
         add     hl, hl                          ; e*4
         add     hl, hl                          ; e*8
         add     hl, hl                          ; e*16
-        add     hl, hl                          ; e*32
-        add     hl, hl                          ; e*64 = e*BAND_STRIDE
-        ld      d, 0
-        push    de
-        ld      e, c                            ; DE = band_row*7 + 1
-        add     hl, de
-        pop     de
         ld      d, h
+        ld      e, l                            ; DE = e*16
+        add     hl, hl                          ; e*32
+        add     hl, hl                          ; e*64
+        add     hl, de                          ; e*64 + e*16 = e*80
+        ld      d, 0
+        ld      e, c                            ; DE = band_row*7 + 1
+        add     hl, de                          ; HL = e*80 + C
         ld      a, l
         add     a, low SLOT_GRID_BASE
         ld      l, a
-        ld      a, d
+        ld      a, h
         adc     a, high SLOT_GRID_BASE
         ld      h, a                            ; HL = slot addr
         ld      (ix+0), l
         ld      (ix+1), h
         inc     ix
         inc     ix
+        pop     de                              ; restore band index e
         inc     e                               ; next pipe → e += 1
         djnz    .wp_lp
 
@@ -574,113 +585,29 @@ init_slot_addr_table:
         ret
 
 ;----------------------------------------------------------------
-; init_pipe_program: emit the initial slot grid into PIPE_PROGRAM
-; memory ($DB00+).  Caller must call init_slot_addr_table first
-; (this routine assumes the table is already populated).
+; init_pipe_program: lay down the band skeleton in PIPE_PROGRAM memory.
 ;
-; Stage 2a band-interleaved layout. For each (row 0..159, pipe 0..3):
-;   - Looks up slot[row][pipe] from SLOT_ADDR_TABLE.
-;   - Writes $D9 (EXX) at (slot - 1).
-;   - Writes the 6-byte body template (ld sp,target ; push hl/de/bc).
-; Then writes the 80 band trailers (one JP per pipe-band → next band;
-; band 79 → SLOT_GRID_END) and the 5-byte epilogue at SLOT_GRID_END:
-;   ED 7B lo hi C9  =  ld sp,(saved_sp) ; ret
-;
-; Scratch: ipp_byte_x (4 bytes) caches byte_x for each pipe so we
-; don't touch pipe_state during the inner loop.
+; Stage 2b: every band's BODY content is written later by
+; configure_pipe_slots (pipes 0-2) or write_jrskip_column (pipe 3),
+; before the grid is ever executed. This routine only:
+;   - NOP-fills the whole grid body (+0..67 of every band). NOPs fall
+;     through to the trailer — a valid no-op chain — and also serve as
+;     the +56..67 bridge for cap/skip bands (whose rows end at +56).
+;   - Writes the 80 band trailers at +BAND_TRAILER_OFFSET (68): each a
+;     JP to the next band's base; band 79 → SLOT_GRID_END.
+;   - Writes the 5-byte epilogue at SLOT_GRID_END (ld sp,(saved_sp); ret).
 ;----------------------------------------------------------------
 init_pipe_program:
-        ; Cache byte_x (first byte of each pipe_state entry).
-        ; pipe_state layout: db byte_x, gap_y  for each pipe.
-        ld      a, (pipe_state + 0)
-        ld      (ipp_byte_x + 0), a
-        ld      a, (pipe_state + 2)
-        ld      (ipp_byte_x + 1), a
-        ld      a, (pipe_state + 4)
-        ld      (ipp_byte_x + 2), a
-        ld      a, (pipe_state + 6)     ; Phase 3: cache pipe 3 byte_x
-        ld      (ipp_byte_x + 3), a
-
-        ld      b, 0                    ; row counter 0..159
-.ipp_row_lp:
-        push    bc                      ; save B=row
-
-        ; All 160 rows × 4 pipes: write the per-row EXX + 6-byte slot.
-        ;   $D9                     EXX
-        ;   $31 lo hi $E5 $D5 $C5   ld sp,target ; push hl ; push de ; push bc
-        ; Slot addresses come from SLOT_ADDR_TABLE (band-interleaved).
-        ld      c, 0                    ; pipe index 0..3
-.ipp_pipe_lp:
-        ; ── Look up slot[row][pipe] address from SLOT_ADDR_TABLE ──
-        ; entry index = row*4 + pipe ; byte offset = index*2 = row*8 + pipe*2
-        ld      l, b
-        ld      h, 0
-        add     hl, hl                  ; row*2
-        add     hl, hl                  ; row*4
-        add     hl, hl                  ; row*8
-        ld      a, c
-        add     a, a                    ; pipe*2
-        add     a, l
-        ld      l, a
-        jr      nc, .ipp_tbl_nc
-        inc     h
-.ipp_tbl_nc:
-        ld      de, SLOT_ADDR_TABLE
-        add     hl, de                  ; HL → table[row*4+pipe]
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = slot[row][pipe] address
-        push    de
-        pop     iy                      ; IY = write cursor at slot[row][pipe]
-
-        ; Write EXX ($D9) at (slot_addr - 1).
-        ld      (iy-1), $D9
-
-        ; Compute screen_target = line_table[B] + byte_x[C] + 5
-        ld      a, b
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                  ; row*2
-        ld      de, line_table
-        add     hl, de                  ; HL → line_table[row]
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                 ; DE = line_addr
-
-        ld      hl, ipp_byte_x
-        ld      a, c
-        add     a, l
-        ld      l, a
-        jr      nc, .ipp_bx_nc
-        inc     h
-.ipp_bx_nc:
-        ld      a, (hl)                 ; A = byte_x[C]
-        add     a, 5                    ; +5 for stack-blast offset (4 body + 2 trail bytes)
-        ld      l, a
-        ld      h, 0
-        add     hl, de                  ; HL = screen_target
-
-        ld      (iy+0), $31
-        ld      (iy+1), l
-        ld      (iy+2), h
-        ld      (iy+3), $E5             ; push hl  (Phase 1: HL=0 trailing zero)
-        ld      (iy+4), $D5             ; push de
-        ld      (iy+5), $C5             ; push bc
-
-        inc     c
-        ld      a, c
-        cp      NUM_PIPES
-        jr      nz, .ipp_pipe_lp
-
-        pop     bc                      ; restore B=row
-        inc     b
-        ld      a, b
-        cp      GROUND_TOP              ; 160
-        jp      nz, .ipp_row_lp
+        ; ── NOP-fill the whole grid body ($00) ───────────────────
+        ld      hl, SLOT_GRID_BASE
+        ld      de, SLOT_GRID_BASE + 1
+        ld      (hl), 0
+        ld      bc, NUM_BANDS * BAND_STRIDE - 1
+        ldir
 
         ; ── Write the 80 band trailers ───────────────────────────
-        ; Band e (0..79) trailer sits at SLOT_GRID_BASE + e*64 + 56.
-        ; Bands 0..78: JP next band base = SLOT_GRID_BASE + (e+1)*64.
+        ; Band e (0..79) trailer at SLOT_GRID_BASE + e*80 + 68.
+        ; Bands 0..78: JP next band base = SLOT_GRID_BASE + (e+1)*80.
         ; Band 79    : JP SLOT_GRID_END (epilogue).
         ld      hl, SLOT_GRID_BASE + BAND_TRAILER_OFFSET   ; trailer of band 0
         ld      de, SLOT_GRID_BASE + BAND_STRIDE            ; base of band 1
@@ -700,9 +627,9 @@ init_pipe_program:
         ld      (hl), e                         ; next band base lo
         inc     hl
         ld      (hl), d                         ; next band base hi
-        ; advance HL to next band's trailer, DE to next band's base
+        ; advance HL (trailer+2 → next trailer) and DE (→ next band base)
         ld      a, l
-        add     a, BAND_STRIDE - 2              ; from trailer+2 to trailer+64
+        add     a, BAND_STRIDE - 2              ; from trailer+2 to next trailer
         ld      l, a
         jr      nc, .ipp_tr_hnc
         inc     h
@@ -732,6 +659,52 @@ init_pipe_program:
 
 ipp_byte_x:     ds 4, 0                 ; scratch: byte_x per pipe (Phase 3: 4 bytes)
 init_pipe_bx_tmp: db 0                 ; scratch: byte_x for the pipe being configured at init
+
+;----------------------------------------------------------------
+; emit_body_band: write a pure-body band into the grid (IX-walk form).
+;   +0   ld ix,<screen_base>     ($DD $21 lo hi)
+;   +4   8 IX-walk rows, 8 bytes each:
+;          D9        EXX
+;          DD F9     ld sp,ix
+;          E5 D5 C5  push hl ; push de ; push bc
+;          DD 24     inc ixh
+; The trailer at +68 is left untouched (written by init_pipe_program).
+; band_base+0 IS overwritten, so any prior JR-skip / per-row content is
+; cleanly replaced — no stale-byte hazard.
+;
+; In:  HL = grid band base address
+;      DE = screen base value (the ld ix operand = band_row-0 target)
+; Clobbers: AF, B, HL.  DE preserved.
+;----------------------------------------------------------------
+emit_body_band:
+        ld      (hl), $DD               ; ld ix,nn  byte 1
+        inc     hl
+        ld      (hl), $21               ; ld ix,nn  byte 2
+        inc     hl
+        ld      (hl), e                 ; operand lo
+        inc     hl
+        ld      (hl), d                 ; operand hi
+        inc     hl                      ; HL → band_base+4 (first IX row)
+        ld      b, 8                    ; 8 rows
+.ebb_row:
+        ld      (hl), $D9               ; EXX
+        inc     hl
+        ld      (hl), $DD               ; ld sp,ix  byte 1
+        inc     hl
+        ld      (hl), $F9               ; ld sp,ix  byte 2
+        inc     hl
+        ld      (hl), $E5               ; push hl
+        inc     hl
+        ld      (hl), $D5               ; push de
+        inc     hl
+        ld      (hl), $C5               ; push bc
+        inc     hl
+        ld      (hl), $DD               ; inc ixh  byte 1
+        inc     hl
+        ld      (hl), $24               ; inc ixh  byte 2
+        inc     hl
+        djnz    .ebb_row
+        ret
 
 ;----------------------------------------------------------------
 ; configure_pipe_slots(A=pipe 0..2, E=new_gap_y 1..111)
@@ -818,6 +791,10 @@ configure_pipe_slots:
         ld      c, (hl)
         call    slot_addr_lookup                ; HL = slot[row][pipe]
         ex      de, hl                          ; DE = dest slot
+        dec     de
+        ld      a, $D9
+        ld      (de), a                         ; EXX byte at slot-1
+        inc     de
         pop     hl                              ; HL = template src
         ldi
         ldi
@@ -864,6 +841,10 @@ configure_pipe_slots:
         ld      c, (hl)
         call    slot_addr_lookup                ; HL = slot[row][pipe]
         ex      de, hl                          ; DE = dest slot
+        dec     de
+        ld      a, $D9
+        ld      (de), a                         ; EXX byte at slot-1
+        inc     de
         pop     hl                              ; HL = template src
         ldi
         ldi
@@ -892,6 +873,10 @@ configure_pipe_slots:
         ld      c, (hl)
         call    slot_addr_lookup                ; HL = slot[row][pipe]
         ex      de, hl                          ; DE = dest slot
+        dec     de
+        ld      a, $D9
+        ld      (de), a                         ; EXX byte at slot-1
+        inc     de
         pop     hl                              ; HL = template src
         ldi
         ldi
@@ -904,6 +889,9 @@ configure_pipe_slots:
         ld      (cps_row_cursor), a
         dec     iyl
         jr      nz, .cps_cap_stamp_lp
+
+        ; ─── Step 2b: convert pure-body bands to the IX-walk form ───
+        call    cps_emit_body_bands
 
         ; ─── Step 3: patch cap-slot handler addresses (pipe-specific) ─
         ; slot[cap_top_row][pipe] +1..+2 := cap_top_handler_pipe_<pipe>
@@ -1063,123 +1051,8 @@ configure_pipe_slots:
         ld      a, h
         ld      (bc), a
 
-        ; ─── Step 6: build active sublist (forward fill) ────────────
-        ; Active list layout = 112 entries × 2 bytes per pipe:
-        ;   [0..N-1]   band1 body entries  (rows 0..cap_top_row-1)
-        ;   [N]        cap_top entry
-        ;   [N+1]      cap_bot entry
-        ;   [N+2..111] band2 body entries  (rows cap_bot_row+1..159)
-        ; Each body entry = slot[row][pipe] + 1 (the ld sp,imm target lo).
-        ; Band-interleaved: slot addresses are looked up per row via
-        ; SLOT_ADDR_TABLE, so the list is filled forward with (de) writes
-        ; (the SP-hijack push form is incompatible with calling
-        ; slot_addr_lookup, which itself uses the stack).
-        ;
-        ; DE = write cursor (ACTIVE_BASE), advances +2 per entry.
-        ld      a, (cps_pipe)
-        add     a, a                            ; A = pipe*2
-        ld      hl, cps_sublist_base_table
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_act_sl_nc
-        inc     h
-.cps_act_sl_nc:
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = ACTIVE_BASE
-
-        ; --- Band 1: rows [0, cap_top_row-1] ---
-        ld      a, (cps_cap_top_row)
-        or      a
-        jr      z, .cps_act_b1_done
-        ld      iyl, a                          ; counter = N
-        xor     a
-        ld      (cps_row_cursor), a             ; row cursor = 0
-.cps_act_b1_lp:
-        push    de                              ; save write cursor (slot_addr_lookup clobbers DE)
-        ld      a, (cps_row_cursor)
-        ld      hl, cps_pipe
-        ld      c, (hl)
-        call    slot_addr_lookup                ; HL = slot[row][pipe]
-        inc     hl                              ; HL = slot+1 (target imm lo)
-        pop     de                              ; DE = write cursor
-        ex      de, hl                          ; HL = cursor, DE = entry value
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-        inc     hl
-        ex      de, hl                          ; DE = cursor advanced
-        ld      a, (cps_row_cursor)
-        inc     a
-        ld      (cps_row_cursor), a
-        dec     iyl
-        jr      nz, .cps_act_b1_lp
-.cps_act_b1_done:
-
-        ; --- cap_top entry: cap_top_target_imm_addrs[pipe] ---
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, cap_top_target_imm_addrs
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_act_ct_nc
-        inc     h
-.cps_act_ct_nc:
-        ld      a, (hl)
-        ld      (de), a
-        inc     de
-        inc     hl
-        ld      a, (hl)
-        ld      (de), a
-        inc     de
-
-        ; --- cap_bot entry: cap_bot_target_imm_addrs[pipe] ---
-        ld      a, (cps_pipe)
-        add     a, a
-        ld      hl, cap_bot_target_imm_addrs
-        add     a, l
-        ld      l, a
-        jr      nc, .cps_act_cb_nc
-        inc     h
-.cps_act_cb_nc:
-        ld      a, (hl)
-        ld      (de), a
-        inc     de
-        inc     hl
-        ld      a, (hl)
-        ld      (de), a
-        inc     de
-
-        ; --- Band 2: rows [cap_bot_row+1, 159] ---
-        ld      a, (cps_cap_bot_row)
-        cpl
-        sub     255 - 159                       ; A = 159 - cap_bot_row = M
-        jr      z, .cps_act_b2_done
-        jr      c, .cps_act_b2_done             ; safety: cap_bot_row > 159
-        ld      iyl, a                          ; counter = M
-        ld      a, (cps_cap_bot_row)
-        inc     a
-        ld      (cps_row_cursor), a             ; row cursor = cap_bot_row+1
-.cps_act_b2_lp:
-        push    de                              ; save write cursor (slot_addr_lookup clobbers DE)
-        ld      a, (cps_row_cursor)
-        ld      hl, cps_pipe
-        ld      c, (hl)
-        call    slot_addr_lookup                ; HL = slot[row][pipe]
-        inc     hl                              ; HL = slot+1
-        pop     de                              ; DE = write cursor
-        ex      de, hl                          ; HL = cursor, DE = entry value
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-        inc     hl
-        ex      de, hl                          ; DE = cursor advanced
-        ld      a, (cps_row_cursor)
-        inc     a
-        ld      (cps_row_cursor), a
-        dec     iyl
-        jr      nz, .cps_act_b2_lp
-.cps_act_b2_done:
+        ; ─── Step 6: build active sublist (per-band, 112 entries) ───
+        call    cps_build_active_list
 
         ; ─── Step 7: store new gap_y back to pipe_state[pipe*2 + 1] ─
         ld      a, (cps_pipe)
@@ -1253,13 +1126,257 @@ compute_next_slot:
         dec     hl                      ; HL = EXX byte before it
         ret
 .cns_band_last:
-        ; cap_top (band_row 7): next = this band's trailer = slot[row][pipe]+6
+        ; cap_top (band_row 7): next = slot[row][pipe]+6 = band_base+56.
+        ; +56..67 are NOP (init_pipe_program), so execution falls through
+        ; the NOP bridge to the +68 trailer.
         ld      a, b
         ld      hl, cps_pipe
         ld      c, (hl)
         call    slot_addr_lookup        ; HL = slot[cap_top_row][pipe]
         ld      de, 6
-        add     hl, de                  ; HL = band trailer address
+        add     hl, de                  ; HL = band_base+56 (NOP bridge → trailer)
+        ret
+
+;----------------------------------------------------------------
+; cps_band_base: HL = grid base of band (cps_k, cps_pipe).
+;   = SLOT_GRID_BASE + (cps_k*4 + cps_pipe) * 80
+; In:  cps_k, cps_pipe (memory).   Clobbers: AF, DE, HL.
+;----------------------------------------------------------------
+cps_band_base:
+        ld      a, (cps_k)
+        add     a, a
+        add     a, a                            ; K*4
+        ld      hl, cps_pipe
+        add     a, (hl)                         ; e = K*4 + pipe
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; e*2
+        add     hl, hl                          ; e*4
+        add     hl, hl                          ; e*8
+        add     hl, hl                          ; e*16
+        ld      d, h
+        ld      e, l                            ; DE = e*16
+        add     hl, hl                          ; e*32
+        add     hl, hl                          ; e*64
+        add     hl, de                          ; e*80
+        ld      de, SLOT_GRID_BASE
+        add     hl, de                          ; HL = band base
+        ret
+
+;----------------------------------------------------------------
+; cps_emit_body_rows: write IYL active-list entries, one per row, each
+; = slot_addr(cps_row_cursor, cps_pipe)+1; advances cps_row_cursor.
+; In:  DE = write cursor, IYL = count (>0), cps_row_cursor = first row.
+; Out: DE advanced.   Clobbers: AF, BC, HL, IYL.
+;----------------------------------------------------------------
+cps_emit_body_rows:
+.cebr_lp:
+        push    de
+        ld      a, (cps_row_cursor)
+        ld      hl, cps_pipe
+        ld      c, (hl)
+        call    slot_addr_lookup                ; HL = slot[row][pipe]
+        inc     hl                              ; HL = slot+1 (target imm lo)
+        pop     de
+        ex      de, hl                          ; HL = cursor, DE = entry
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ex      de, hl                          ; DE = cursor advanced
+        ld      a, (cps_row_cursor)
+        inc     a
+        ld      (cps_row_cursor), a
+        dec     iyl
+        jr      nz, .cebr_lp
+        ret
+
+;----------------------------------------------------------------
+; cps_emit_capedge: write a cap-edge band's 8 active-list entries.
+; cps_k is K_top or K_bot.
+;   K_top: 7 body-row entries (rows 8K..8K+6, slot+1) then cap_top imm.
+;   K_bot: cap_bot imm then 7 body-row entries (rows 8K+1..8K+7, slot+1).
+; In:  DE = write cursor.   Out: DE advanced by 16 (8 entries).
+; Clobbers: AF, BC, HL, IYL.
+;----------------------------------------------------------------
+cps_emit_capedge:
+        ld      a, (cps_k)
+        ld      hl, cps_k_bot
+        cp      (hl)
+        jr      z, .cec_bot
+        ; --- K_top: 7 body rows (8K..8K+6) then cap_top imm ---
+        ld      a, (cps_k)
+        add     a, a
+        add     a, a
+        add     a, a                            ; row = 8*K_top
+        ld      (cps_row_cursor), a
+        ld      iyl, 7
+        call    cps_emit_body_rows
+        ld      hl, cap_top_target_imm_addrs
+        jr      .cec_capimm
+.cec_bot:
+        ; --- K_bot: cap_bot imm then 7 body rows (8K+1..8K+7) ---
+        ld      hl, cap_bot_target_imm_addrs
+        call    .cec_capimm
+        ld      a, (cps_k)
+        add     a, a
+        add     a, a
+        add     a, a                            ; 8*K_bot (= cap_bot_row)
+        inc     a                               ; first body row = cap_bot_row+1
+        ld      (cps_row_cursor), a
+        ld      iyl, 7
+        jp      cps_emit_body_rows              ; tail: 7 entries then ret
+.cec_capimm:
+        ; HL = &cap_*_target_imm_addrs ; write entry [cps_pipe] to (DE)
+        ld      a, (cps_pipe)
+        add     a, a
+        add     a, l
+        ld      l, a
+        jr      nc, .cec_ci_nc
+        inc     h
+.cec_ci_nc:
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        inc     hl
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        ret
+
+;----------------------------------------------------------------
+; cps_set_k_bounds: cps_k_top = cap_top_row>>3 ; cps_k_bot = cap_bot_row>>3.
+; In: cps_cap_top_row, cps_cap_bot_row.   Clobbers: AF.
+;----------------------------------------------------------------
+cps_set_k_bounds:
+        ld      a, (cps_cap_top_row)
+        rrca
+        rrca
+        rrca
+        and     $1F
+        ld      (cps_k_top), a
+        ld      a, (cps_cap_bot_row)
+        rrca
+        rrca
+        rrca
+        and     $1F
+        ld      (cps_k_bot), a
+        ret
+
+;----------------------------------------------------------------
+; cps_emit_body_bands: overwrite every pure-body band (K<K_top or
+; K>K_bot) of pipe cps_pipe with the IX-walk form (emit_body_band);
+; cap-edge (K_top, K_bot) and skip bands are left in per-row form.
+; Sets cps_k_top / cps_k_bot first. Body band's ld ix base comes from
+; screen_target_table_29[8K] (byte_x=29 — shift_pipe_targets adjusts).
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+cps_emit_body_bands:
+        call    cps_set_k_bounds
+        xor     a
+        ld      (cps_k), a
+.cebb_lp:
+        ld      a, (cps_k)
+        ld      hl, cps_k_top
+        cp      (hl)
+        jr      c, .cebb_body                   ; K < K_top → body
+        ld      hl, cps_k_bot
+        cp      (hl)
+        jr      z, .cebb_next                   ; K == K_bot → cap-edge
+        jr      c, .cebb_capskip_chk
+        jr      .cebb_body                      ; K > K_bot → body
+.cebb_capskip_chk:
+        ld      hl, cps_k_top
+        cp      (hl)
+        jr      .cebb_next                      ; K_top<=K<K_bot → leave per-row
+.cebb_body:
+        call    cps_band_base                   ; HL = grid band base
+        push    hl
+        ; DE = screen_target_table_29[8K]  (entry 8K → byte offset 16K)
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K*16
+        ld      de, screen_target_table_29
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = screen base (byte_x=29)
+        pop     hl                              ; HL = grid band base
+        call    emit_body_band
+.cebb_next:
+        ld      a, (cps_k)
+        inc     a
+        ld      (cps_k), a
+        cp      20
+        jr      nz, .cebb_lp
+        ret
+
+;----------------------------------------------------------------
+; cps_build_active_list: build pipe cps_pipe's 112-entry active sublist.
+;   body band: ld ix operand (band_base+2) + 7 × scroll_sink.
+;   cap-edge:  8 entries (cps_emit_capedge).
+;   skip band: 0 entries.
+; Requires cps_k_top / cps_k_bot already set.   Clobbers: AF,BC,DE,HL,IYL.
+;----------------------------------------------------------------
+cps_build_active_list:
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      hl, cps_sublist_base_table
+        add     a, l
+        ld      l, a
+        jr      nc, .cbal_sl_nc
+        inc     h
+.cbal_sl_nc:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = ACTIVE_BASE
+        xor     a
+        ld      (cps_k), a
+.cbal_lp:
+        ld      a, (cps_k)
+        ld      hl, cps_k_top
+        cp      (hl)
+        jr      c, .cbal_body                   ; K < K_top → body
+        ld      hl, cps_k_bot
+        cp      (hl)
+        jr      z, .cbal_capedge                ; K == K_bot → cap-edge
+        jr      nc, .cbal_body                  ; K > K_bot → body
+        ld      hl, cps_k_top
+        cp      (hl)
+        jr      z, .cbal_capedge                ; K == K_top → cap-edge
+        jr      .cbal_next                      ; skip band → 0 entries
+.cbal_body:
+        push    de
+        call    cps_band_base                   ; HL = grid band base
+        inc     hl
+        inc     hl                              ; HL = band_base+2 (ld ix operand lo)
+        pop     de
+        ex      de, hl                          ; HL = cursor, DE = entry
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ld      b, 7
+.cbal_dummy:
+        ld      (hl), low scroll_sink
+        inc     hl
+        ld      (hl), high scroll_sink
+        inc     hl
+        djnz    .cbal_dummy
+        ex      de, hl                          ; DE = cursor advanced
+        jr      .cbal_next
+.cbal_capedge:
+        call    cps_emit_capedge                ; 8 entries, advances DE
+.cbal_next:
+        ld      a, (cps_k)
+        inc     a
+        ld      (cps_k), a
+        cp      20
+        jr      nz, .cbal_lp
         ret
 
 ;----------------------------------------------------------------
@@ -1311,7 +1428,16 @@ cps_gap_y:              db 0
 cps_cap_top_row:        db 0
 cps_cap_bot_row:        db 0
 cps_row_cursor:         db 0    ; Stage 2a: screen-row cursor for per-row table lookups
+cps_k:                  db 0    ; Stage 2b: char-cell band cursor (0..19)
+cps_k_top:              db 0    ; Stage 2b: cap_top_row >> 3
+cps_k_bot:              db 0    ; Stage 2b: cap_bot_row >> 3
 cps_saved_sp:           dw 0    ; (retained for compat; SP-hijack removed in 2a)
+
+; Stage 2b: dummy active-list sink. A body band contributes 1 real
+; entry (its ld ix operand) + 7 entries pointing here, keeping the
+; list a fixed 112 entries (patch/shift_pipe_targets unchanged).
+; Decrementing this 2-byte cell each wrap is harmless — never executed.
+scroll_sink:            dw 0
 
 ; ── Per-pipe active sublist base table ───────────────────────────
 cps_sublist_base_table:
@@ -1508,45 +1634,54 @@ build_slot_templates:
         ret
 
 ;----------------------------------------------------------------
-; write_jrskip_column — fill one pipe's entire PIPE_PROGRAM column
-; with the JR-skip pattern, making that column a no-op.
+; write_jrskip_column — make one pipe's whole PIPE_PROGRAM column a
+; no-op skip. Used for the parked prep pipe and to disarm the
+; departing pipe in do_swap.
 ;
-; Only bytes 0-1 of each slot are written: $18 $04 = JR e=$04, which
-; advances PC 6 bytes = exactly one slot. Bytes 2-5 are UNREACHABLE
-; (the JR jumps over them) so they are deliberately left untouched —
-; whatever stale content they hold is never executed. prep_step
-; overwrites all 6 bytes when the column is later rebuilt. Writing
-; only 2 bytes/slot keeps this fast enough for the swap-frame budget.
+; Stage 2b: NOP-fills the body region (+0..67) of all 20 of the pipe's
+; bands. A NOP-filled band falls through +0..67 to the +68 trailer —
+; a valid no-op. Critically, NOP-filling the WHOLE band (not just a
+; couple of bytes) is what makes prep_step's INCREMENTAL rebuild safe:
+; as prep_step re-stamps rows over several frames, every not-yet-
+; stamped byte is a NOP (falls through), so a half-built band never
+; executes stale departing-pipe content (IX-walk fragments etc.).
+; The +68 trailer is left intact (written once by init_pipe_program).
 ;
 ; In:  A = pipe index (0..3).
-; Out: 160 slots of that column: bytes 0-1 set to $18 $04.
-;      Only this pipe's 2 bytes per row are touched — EXX byte,
-;      other columns, row trailer and pad bytes are left intact.
 ; Clobbers: AF, BC, DE, HL.
 ;----------------------------------------------------------------
 write_jrskip_column:
-        ; Band-interleaved: each row's slot address is looked up from
-        ; SLOT_ADDR_TABLE; only bytes 0-1 of each slot are written.
-        ld      (wjc_pipe), a                   ; C arg = pipe
-        xor     a
-        ld      (wjc_row), a                    ; row cursor 0
-.wjc_lp:
-        ld      a, (wjc_row)
-        ld      hl, wjc_pipe
-        ld      c, (hl)
-        call    slot_addr_lookup                ; HL = slot[row][pipe]
-        ld      (hl), $18                       ; byte 0 = JR e opcode
-        inc     hl
-        ld      (hl), $04                       ; byte 1 = displacement → next slot
-        ld      a, (wjc_row)
-        inc     a
-        ld      (wjc_row), a
-        cp      GROUND_TOP                      ; 160 rows
-        jr      nz, .wjc_lp
+        ; HL = band base for (K=0, pipe) = SLOT_GRID_BASE + pipe*80.
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; pipe*2
+        add     hl, hl                          ; pipe*4
+        add     hl, hl                          ; pipe*8
+        add     hl, hl                          ; pipe*16
+        ld      d, h
+        ld      e, l                            ; DE = pipe*16
+        add     hl, hl                          ; pipe*32
+        add     hl, hl                          ; pipe*64
+        add     hl, de                          ; pipe*80
+        ld      de, SLOT_GRID_BASE
+        add     hl, de                          ; HL = band base (K=0, pipe)
+        ld      b, 20                           ; 20 bands
+.wjc_band:
+        push    bc
+        push    hl                              ; save band base
+        ; NOP-fill +0..67 (68 bytes) of this band
+        ld      (hl), 0
+        ld      d, h
+        ld      e, l
+        inc     de                              ; DE = band base + 1
+        ld      bc, BAND_TRAILER_OFFSET - 1     ; 67 → fills +0..67
+        ldir
+        pop     hl                              ; HL = band base
+        ld      de, 4 * BAND_STRIDE             ; +320 → next K, same pipe
+        add     hl, de                          ; HL = next band base
+        pop     bc
+        djnz    .wjc_band
         ret
-
-wjc_pipe:   db 0
-wjc_row:    db 0
 
 ;----------------------------------------------------------------
 init_pipes:
@@ -1749,7 +1884,12 @@ ps_phase0:
         ld      a, (ps_row_cursor)
         call    ps_slot_addr_for_row            ; HL = slot[row][pipe]; A = row
         ex      de, hl                          ; DE = slot addr
-        ; --- HL = screen_target_table_29 + row*2 (A still = row) ---
+        dec     de
+        ld      a, $D9
+        ld      (de), a                         ; EXX byte at slot-1
+        inc     de
+        ; --- HL = screen_target_table_29 + row*2 ---
+        ld      a, (ps_row_cursor)              ; reload row (the EXX write above clobbered A)
         ld      l, a
         ld      h, 0
         add     hl, hl                          ; row*2
@@ -1819,6 +1959,9 @@ ps_phase1:
         ld      a, (ps_row_cursor)
         call    ps_slot_addr_for_row            ; HL = slot[row][pipe]
         pop     bc                              ; restore B
+        dec     hl
+        ld      (hl), $D9                       ; EXX byte at slot-1
+        inc     hl
         xor     a
         ld      (hl), a                         ; NOP byte 0
         inc     hl
@@ -1880,7 +2023,12 @@ ps_phase2:
         ld      a, (ps_row_cursor)
         call    ps_slot_addr_for_row            ; HL = slot[row][pipe]; A = row
         ex      de, hl                          ; DE = slot addr
+        dec     de
+        ld      a, $D9
+        ld      (de), a                         ; EXX byte at slot-1
+        inc     de
         ; HL = screen_target_table_29 + row*2
+        ld      a, (ps_row_cursor)              ; reload row (the EXX write above clobbered A)
         ld      l, a
         ld      h, 0
         add     hl, hl                          ; row*2
@@ -2056,111 +2204,19 @@ ps_phase6:
         add     a, e                            ; *6
         ld      (ps_p6_pipe6), a
 
-        ; ── Build the ACTIVE sublist (forward fill, band-interleaved) ──
-        ; Layout (low→high): band1 [rows 0..cap_top-1], cap_top, cap_bot,
-        ; band2 [rows cap_bot+1..159]. Body entry = slot[row][pipe]+1.
-        ; DE = write cursor at ACTIVE_PIPE_<activate_pipe_idx>.
+        ; ── Convert pure-body bands to IX-walk + build the active list ──
+        ; prep_step phases 0-2 stamped this column per-row (with EXX) into
+        ; the freshly JR-skipped grid. Now publish the cps_* state for the
+        ; band-aware builders and run the same code configure_pipe_slots
+        ; uses, so the recycled pipe ends up in the SAME band form.
         ld      a, (activate_pipe_idx)
-        add     a, a                            ; *2 (2-byte table entries)
-        ld      l, a
-        ld      h, 0
-        ld      de, cps_sublist_base_table
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = ACTIVE_BASE
-
-        ; --- Band 1: rows [0, cap_top_row-1] ---
-        ld      a, (prep_gap_y)
-        dec     a                               ; A = N = cap_top_row
-        jr      z, .act_b1_done
-        ld      (ps_count), a                   ; N = band1 count
-        xor     a
-        ld      (ps_row_cursor), a              ; row cursor 0
-.act_b1_lp:
-        push    de                              ; save write cursor (ps_slot_addr_for_row clobbers DE)
-        ld      a, (ps_row_cursor)
-        call    ps_slot_addr_for_row            ; HL = slot[row][activate_pipe_idx]
-        inc     hl                              ; HL = slot+1 (target imm lo)
-        pop     de                              ; DE = write cursor
-        ex      de, hl                          ; HL = cursor, DE = entry value
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-        inc     hl
-        ex      de, hl                          ; DE = cursor advanced
-        ld      a, (ps_row_cursor)
-        inc     a
-        ld      (ps_row_cursor), a
-        ld      hl, ps_count
-        dec     (hl)
-        jr      nz, .act_b1_lp
-.act_b1_done:
-
-        ; --- cap_top entry: cap_top_target_imm_addrs[activate_pipe_idx] ---
-        ld      a, (activate_pipe_idx)
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        push    de
-        ld      de, cap_top_target_imm_addrs
-        add     hl, de
-        pop     de
-        ld      a, (hl)
-        ld      (de), a
-        inc     de
-        inc     hl
-        ld      a, (hl)
-        ld      (de), a
-        inc     de
-
-        ; --- cap_bot entry: cap_bot_target_imm_addrs[activate_pipe_idx] ---
-        ld      a, (activate_pipe_idx)
-        add     a, a
-        ld      l, a
-        ld      h, 0
-        push    de
-        ld      de, cap_bot_target_imm_addrs
-        add     hl, de
-        pop     de
-        ld      a, (hl)
-        ld      (de), a
-        inc     de
-        inc     hl
-        ld      a, (hl)
-        ld      (de), a
-        inc     de
-
-        ; --- Band 2: rows [cap_bot_row+1, 159] ---
-        ld      a, (prep_gap_y)
-        ld      c, a
-        ld      a, 111
-        sub     c                               ; A = M
-        jr      z, .act_b2_done
-        jr      c, .act_b2_done
-        ld      (ps_count), a                   ; M = band2 count
-        ld      a, (prep_gap_y)
-        add     a, PIPE_GAP + 1                 ; A = cap_bot_row + 1
-        ld      (ps_row_cursor), a
-.act_b2_lp:
-        push    de                              ; save write cursor
-        ld      a, (ps_row_cursor)
-        call    ps_slot_addr_for_row            ; HL = slot[row][activate_pipe_idx]
-        inc     hl                              ; HL = slot+1
-        pop     de                              ; DE = write cursor
-        ex      de, hl                          ; HL = cursor, DE = entry value
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-        inc     hl
-        ex      de, hl                          ; DE = cursor advanced
-        ld      a, (ps_row_cursor)
-        inc     a
-        ld      (ps_row_cursor), a
-        ld      hl, ps_count
-        dec     (hl)
-        jr      nz, .act_b2_lp
-.act_b2_done:
+        ld      (cps_pipe), a
+        ld      a, (ps_cap_top_row)
+        ld      (cps_cap_top_row), a
+        ld      a, (ps_cap_bot_row)
+        ld      (cps_cap_bot_row), a
+        call    cps_emit_body_bands             ; pure-body bands → IX-walk (sets k_top/k_bot)
+        call    cps_build_active_list           ; 112-entry per-band active list
 
         ; ── Arm incoming cap slots in PIPE_PROGRAM (relocated from do_swap) ──
         ; Runs once at build completion: after the column has been (re)built and
@@ -2749,16 +2805,13 @@ do_swap:
         ;    (= byte_x=29 buffer col) instead of $0000. After swap the incoming
         ;    pipe's body slots already point at byte_x=29. No per-swap rewrite needed.
 
-        ; 5. Departing column becomes JR-skip.
-        ;    write_jrskip_column writes $18 $04 (JR e=$04) into bytes 0-1 of
-        ;    ALL 160 slots of dep's column — body rows, cap rows and cap-skip
-        ;    rows alike. PIPE_PROGRAM then JR-skips dep's column (12 T/row)
-        ;    instead of executing wasteful body pushes into invisible memory.
-        ;    Byte 0 (the opcode) IS overwritten, so the slot is unambiguously
-        ;    a JR — no JP-to-ROM hazard (do_swap_partial_rewrite_bug). Bytes
-        ;    2-5 are left stale but are UNREACHABLE (the JR jumps over them),
-        ;    so they are never executed; prep_step overwrites all 6 bytes
-        ;    when the column is rebuilt.
+        ; 5. Departing column becomes a no-op skip.
+        ;    Stage 2b: write_jrskip_column NOP-fills the body (+0..67) of
+        ;    all 20 of dep's bands. A NOP band falls through to the +68
+        ;    trailer. Filling the WHOLE band (not a couple of bytes) is
+        ;    essential: it erases the departing pipe's stale content so
+        ;    prep_step's later incremental rebuild never executes a
+        ;    half-stamped band's leftover IX-walk / per-row fragments.
         ;    write_jrskip_column clobbers AF,BC,DE,HL — do_swap holds no
         ;    live state in those registers at this point (ds_* scratch is in
         ;    memory; HL' is untouched). Nothing to preserve.
