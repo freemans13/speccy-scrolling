@@ -146,21 +146,6 @@ main_loop:
         call    advance_bird_anim
         call    draw_bird
         call    paint_bird_attrs
-        ; Deferred GRID_B column blank from a do_swap last frame — done here
-        ; (before frame_update renders) so GRID_B never shows the departed
-        ; pipe's stale column. rc_step's GRID_B pass is still ~10 frames away.
-        ld      a, (pending_blank_b)
-        or      a
-        jr      z, .no_pending_blank_b
-        xor     a
-        ld      (pending_blank_b), a
-        ld      hl, GRID_B + 1
-        ld      (wjc_base), hl
-        ld      a, (prep_pipe_idx)              ; the just-parked pipe
-        call    write_jrskip_column
-        ld      hl, GRID_A + 1                  ; restore wjc_base default
-        ld      (wjc_base), hl
-.no_pending_blank_b:
         ld      a, 3                    ; PROFILE: MAGENTA = PIPE_PROGRAM
         out     ($fe), a
         call    frame_update
@@ -189,6 +174,7 @@ main_loop:
         ; list regen) then GRID_B. Armed by do_swap (and by init for the
         ; first parked pipe); a no-op when idle.
         call    rc_step
+        call    boot_step               ; leapfrog-bootstrap a freshly-activated pipe (sliced)
         call    sfx_slice               ; sound — single slice in the idle tail
         ld      a, 0                    ; PROFILE: BLACK = idle before halt
         out     ($fe), a
@@ -1616,8 +1602,7 @@ write_jrskip_column:
         djnz    .wjc_lp
         ret
 
-wjc_base:       dw SLOT_GRID_BASE + 1           ; slot[0][0] base; do_swap sets per grid
-pending_blank_b: db 0                           ; 1 = main_loop must blank GRID_B's parked column
+wjc_base:       dw SLOT_GRID_BASE + 1           ; slot[0][0] base (init pipe-3 blank)
 
 ;----------------------------------------------------------------
 init_pipes:
@@ -3273,23 +3258,17 @@ wrap_byte_x:
         ld      a, (activate_pipe_idx)          ; freeze activating pipe (255 when idle)
         cp      c
         jr      z, .wbx_skip                   ; skip the activating pipe — build in progress
-        ; active pipe: check byte_x
+        ; active pipe: check byte_x. Swap at byte_x==0 (not 1): there the
+        ; departing column is invisible in BOTH grids (live grid byte_x 0,
+        ; shadow grid byte_x ±1 — body all in buffer cols 0-3), so the
+        ; recycle needs no blanking pass at all.
         ld      a, (iy+0)
-        cp      1
+        or      a
         jr      z, .swap_with_prep
         dec     a
         jr      .wbx_save
 .swap_with_prep:
-        ; Pipe reached byte_x=1. Only swap if prep is fully ready (phase 7).
-        ; Otherwise DEFER: leave byte_x=1 (no save), retry next wrap.
-        ; patch_pipe_targets keeps decrementing the deferred pipe's targets,
-        ; so it scrolls visibly off-screen left into buffer cols 0..3 then
-        ; into ROM (silent writes). Next wrap re-evaluates when prep may be
-        ; ready. Avoids fallback path's half-configured-OLD-prep corruption.
-        ld      a, (prep_phase)
-        cp      7
-        jr      nz, .wbx_skip                   ; defer — prep not ready
-        ; Phase 5: pipe reached byte_x=1. Swap with the prep pipe.
+        ; Pipe reached byte_x=0 (invisible). Swap with the parked pipe.
         push    bc
         push    iy
         ld      a, c                            ; A = departing pipe index
@@ -3392,68 +3371,93 @@ do_swap:                                        ; A = departing pipe (D)
 .ds_gy_nc:
         ld      (hl), c                         ; pipe_state[D].gap_y
 
-        ; Blank D's old (byte_x≈1) column so it stops showing fragments.
-        ; GRID_A now — rc_step starts rebuilding GRID_A's column this frame.
-        ; GRID_B is deferred to next frame's main_loop: rc_step won't touch
-        ; GRID_B until its 2nd pass (~10 frames out), and splitting the two
-        ; ~8k T blanks across two frames keeps the do_swap frame in budget.
-        ld      hl, GRID_A + 1
-        ld      (wjc_base), hl
-        ld      a, (ds_dep)
-        call    write_jrskip_column
-        ld      a, 1
-        ld      (pending_blank_b), a            ; main_loop blanks GRID_B next frame
+        ; D departs at byte_x=0 — already invisible in BOTH grids (live grid
+        ; byte_x 0, shadow grid byte_x ±1; bodies in buffer cols, trailing
+        ; zeros write sky). So D's old column needs NO blanking: rc_step
+        ; rebuilds it (byte_x→29) over the parked window and every
+        ; intermediate row stays invisible.
 
         ; Arm the incremental two-grid rebuild of D (byte_x=29, new gap_y).
         ld      a, (ds_dep)
         call    rc_arm
 
-        ; Leapfrog-bootstrap the activating pipe P. rc_step built P's column
-        ; identically in both grids; the double buffer needs the shadow grid
-        ; one byte ahead of the live grid. The window after this swap has
-        ; live = (pre-swap shadow_grid), shadow = (pre-swap grid_call+1).
-        ; So bump P's column +1 in the grid currently at grid_call+1.
-        jp      boot_activated_pipe             ; tail call (does its own ret)
+        ; Arm the leapfrog bootstrap of the activating pipe P. rc_step built
+        ; P's column identically in both grids; the double buffer needs the
+        ; shadow one byte ahead. boot_step (driven from main_loop) spreads
+        ; the +1 over the next few frames so this frame stays in budget.
+        xor     a
+        ld      (boot_cursor), a
+        inc     a
+        ld      (boot_active), a
+        ret
 
 ;----------------------------------------------------------------
-; boot_activated_pipe — increment pipe (boot_pipe)'s 110 body target
-; imms by +1 in the grid currently at grid_call+1, so its two grid
-; columns become leapfrogged (shadow = live + 1). Walks ACTIVE_PIPE_P
-; (regenerated by rc_step during the pipe's parked rebuild).
-; Clobbers: AF, BC, DE, HL. Saves/restores SP.
+; boot_step — leapfrog-bootstrap a freshly-activated pipe, sliced.
+; Increments BOOT_SLICE of pipe (boot_pipe)'s 110 body target imms by
+; +1 in the current shadow grid per call; main_loop calls it each
+; frame until boot_active clears. The shadow grid is stable across the
+; activating pipe's first window, so the slices land in one grid.
+; Clobbers: AF, BC, DE, HL. Saves/restores SP. No-op when idle.
 ;----------------------------------------------------------------
-boot_activated_pipe:
-        ld      hl, (grid_call + 1)             ; target grid base
+BOOT_SLICE      EQU 40
+
+boot_step:
+        ld      a, (boot_active)
+        or      a
+        ret     z
+        ; DE = shadow_grid - GRID_A  (offset to the grid being bumped)
+        ld      hl, (shadow_grid)
         ld      de, GRID_A
         or      a
         sbc     hl, de
-        ex      de, hl                          ; DE = grid offset from GRID_A
+        ex      de, hl                          ; DE = offset
+        ; HL = ACTIVE_PIPE_<boot_pipe> + boot_cursor*2
         ld      a, (boot_pipe)
         add     a, a
         ld      hl, cps_sublist_base_table
         add     a, l
         ld      l, a
-        jr      nc, .bap_base_nc
+        jr      nc, .bs_base_nc
         inc     h
-.bap_base_nc:
+.bs_base_nc:
         ld      a, (hl)
         inc     hl
         ld      h, (hl)
-        ld      l, a                            ; HL = ACTIVE_PIPE_<P>
+        ld      l, a                            ; HL = ACTIVE_PIPE base
+        ld      a, (boot_cursor)
+        add     a, a
+        add     a, l
+        ld      l, a
+        jr      nc, .bs_cur_nc
+        inc     h
+.bs_cur_nc:                                     ; HL = &entry[boot_cursor]
         ld      (bap_saved_sp), sp
         ld      sp, hl
-        ld      b, 110
-.bap_lp:
+        ; B = min(BOOT_SLICE, 110 - boot_cursor); advance cursor
+        ld      a, (boot_cursor)
+        ld      c, a
+        add     a, BOOT_SLICE
+        cp      110
+        jr      c, .bs_count
+        ld      a, 110
+.bs_count:
+        ld      (boot_cursor), a                ; new cursor
+        sub     c
+        ld      b, a                            ; B = entries this slice
+        ld      a, (boot_cursor)
+        cp      110
+        jr      c, .bs_lp
+        xor     a
+        ld      (boot_active), a                ; reached 110 → done
+.bs_lp:
         pop     hl                              ; HL = GRID_A target-imm addr
-        add     hl, de                          ; → target grid
-        ld      a, (hl)
-        add     a, 1
-        ld      (hl), a
-        jr      nc, .bap_no
+        add     hl, de                          ; → shadow grid
+        inc     (hl)                            ; +1 (16-bit, little-endian)
+        jr      nz, .bs_no
         inc     hl
         inc     (hl)
-.bap_no:
-        djnz    .bap_lp
+.bs_no:
+        djnz    .bs_lp
         ld      sp, (bap_saved_sp)
         ret
 
@@ -3461,7 +3465,9 @@ boot_activated_pipe:
 do_swap_fired: db 0                            ; main_loop reads and clears each frame
 ds_dep:     db 0                               ; departing pipe index
 ds_inc:     db 0                               ; incoming pipe index
-boot_pipe:  db 0                               ; activating pipe, for boot_activated_pipe
+boot_pipe:  db 0                               ; activating pipe, for boot_step
+boot_cursor: db 0                              ; boot_step progress (0..110)
+boot_active: db 0                              ; 1 = leapfrog bootstrap in progress
 bap_saved_sp: dw 0                             ; SP save slot (SP-hijack)
 ds_old_gap_y: db 0                             ; dep's OLD gap_y, captured at .ds_full_swap entry
 
