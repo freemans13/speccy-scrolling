@@ -3357,6 +3357,28 @@ do_swap:                                        ; A = departing pipe (D)
         add     hl, de
         ld      (hl), 29
 
+        ; Disarm D's OLD cap slots (both grids) before gap_y changes. A
+        ; stale `jp cap_handler` left at an old cap row would jump via the
+        ; handler's _next imm — which update_cap_geometry repoints to the
+        ; NEW gap_y this very frame — sending the grid off into a runaway
+        ; jp chain (freeze). See project_split_cap_handler_race.
+        ld      a, (ds_dep)
+        add     a, a
+        inc     a                               ; D*2 + 1
+        ld      hl, pipe_state
+        add     a, l
+        ld      l, a
+        jr      nc, .ds_gp_nc
+        inc     h
+.ds_gp_nc:
+        ld      a, (hl)                         ; A = OLD gap_y
+        ld      c, a
+        dec     a                               ; old cap_top_row = gap_y - 1
+        call    disarm_cap_row
+        ld      a, c
+        add     a, PIPE_GAP                     ; old cap_bot_row = gap_y + 48
+        call    disarm_cap_row
+
         ; D.gap_y = fresh random (rc_arm reads it below).
         call    random_gap_y                    ; A = gap_y; clobbers AF, HL
         ld      c, a
@@ -3389,6 +3411,45 @@ do_swap:                                        ; A = departing pipe (D)
         ld      (boot_cursor), a
         inc     a
         ld      (boot_active), a
+        ret
+
+;----------------------------------------------------------------
+; disarm_cap_row — overwrite pipe (ds_dep)'s slot at row A with a
+; JR-skip ($18 $04) in BOTH grids, so a stale `jp cap_handler` cannot
+; fire after the pipe's gap_y changes. rc_step later restamps the row.
+; In: A = row, ds_dep = pipe. Clobbers: AF, DE, HL. Preserves BC.
+;----------------------------------------------------------------
+disarm_cap_row:
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; *2
+        add     hl, hl                          ; *4
+        add     hl, hl                          ; *8
+        add     hl, hl                          ; *16
+        add     hl, hl                          ; row*32
+        ld      a, (ds_dep)
+        ld      e, a
+        add     a, a
+        add     a, e
+        add     a, e
+        add     a, e
+        add     a, e                            ; A = dep*6
+        inc     a                               ; + 1 (EXX byte) → slot offset
+        ld      e, a
+        ld      d, 0
+        add     hl, de                          ; HL = 1 + row*32 + dep*6
+        ld      de, GRID_A
+        push    hl
+        add     hl, de
+        ld      (hl), $18                       ; JR e
+        inc     hl
+        ld      (hl), $04                       ; displacement → next slot
+        pop     hl
+        ld      de, GRID_B
+        add     hl, de
+        ld      (hl), $18
+        inc     hl
+        ld      (hl), $04
         ret
 
 ;----------------------------------------------------------------
