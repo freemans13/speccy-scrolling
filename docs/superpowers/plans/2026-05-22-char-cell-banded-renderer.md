@@ -45,40 +45,47 @@ Stages run in order; later stages depend on earlier ones.
 
 ---
 
-## Stage 2: Re-emit the grid band-interleaved (slots unchanged)
+## Stage 2: Band-interleaved IX-walk grid
 
-**Goal:** Change only the grid's **emit order** to band-interleaved (P0.band0, P1.band0, P2.band0, P3.band0, P0.band1, …) — 8-row char-cell bands. Slots stay exactly as they are (`ld sp,imm ; push hl ; push de ; push bc`, per-row, with the per-row `EXX`). This de-risks the race-the-beam question *before* the slot mechanism changes.
+> **Note:** the original Stage 2 ("re-emit order, slots unchanged") and Stage 3
+> ("IX-walk slots") were found to be inseparable during implementation — the
+> current grid's 4 pipe slots per row fall through contiguously under one
+> trailer, so band-interleaving single-pipe units *without* the IX-walk forces
+> a JP per unit (+~4.8k T/frame). Band-interleaving is only overhead-free once
+> the IX-walk lets a band's 8 rows fall through under one trailer. So they are
+> merged here. This is the core renderer rewrite; race-the-beam is verified at
+> this stage's checkpoint.
 
-**Study first:** the grid builder (`init_pipe_program` or equivalent in the restored renderer); how rows chain (the per-row JP-trailer / fall-through); how `redraw_pipes_v2` enters the grid; the row→screen-address mapping (`line_table`); `SLOT_ROW_STRIDE`.
+**Goal:** Rebuild `PIPE_PROGRAM` as a band-interleaved grid of 80 pipe-bands
+(P0.b0, P1.b0, P2.b0, P3.b0, P0.b1, …), where each pure-body pipe-band is one
+`ld ix,band_base` followed by an 8-row IX running-pointer walk. Each body band
+carries ONE base immediate; the scroll patch decrements those bases.
 
-**Files:** `src/main.asm` — the grid builder; the grid layout EQUs.
+**Study first:** the grid builder (`init_pipe_program`); the body/cap/skip slot
+formats; `redraw_pipes_v2` (grid entry + register setup); the scroll patcher
+(`patch_pipe_targets` or equivalent); `configure_pipe_slots` and its
+screen-row-sequential loops; `compute_next_slot`; the cap handlers and
+`write_jrskip_column`; `SLOT_ADDR_TABLE`; `line_table`; `ps_slot_addr_for_row`
+and the `prep_step` phases. The `(row,pipe)` slot-address formula
+`SLOT_GRID_BASE + 1 + row*32 + pipe*6` is inline in ~8 routines — all must move
+to the band layout. Confirm sjasmplus emits `inc ixh` as `$DD $24`.
 
-- [ ] **Step 1:** Re-order the grid builder so it emits, for band K = 0..19, the 8 rows of pipe 0's char-cell band K, then pipe 1's, pipe 2's, pipe 3's, then band K+1. Each emitted "row" is the existing per-row slot. Adjust the inter-slot chaining (trailer JPs or contiguous fall-through) so execution flows in the new order; the final slot falls through to the epilogue.
-- [ ] **Step 2:** Update any routine that addresses a slot by `(row,pipe)` (e.g. `SLOT_ADDR_TABLE`, the scroll patch, the recycle config) to the new band-interleaved offset formula. The scroll patch and recycle must still find the same slots.
-- [ ] **Step 3: Build check** — `make` → clean, `ASSERT` passes.
-- [ ] **Step 4: Commit** — `git commit -m "refactor: emit the pipe grid band-interleaved (8-row char-cell bands)"`.
-- [ ] **Step 5: CHECKPOINT** — Human `make run`: rendering is **pixel-identical** to Stage 1 (same pipes, same scroll, same dither — only the internal emit order changed). Border profiler: **no tearing** — confirm the band-interleaved execution order still stays ahead of the raster. This is the critical race-the-beam check; if it tears, stop and report.
+**Files:** `src/main.asm` — grid builder, `redraw_pipes_v2`, scroll patcher,
+`configure_pipe_slots`, `compute_next_slot`, `write_jrskip_column`,
+`SLOT_ADDR_TABLE` init, `prep_step`/`ps_*` slot addressing, slot/grid EQUs.
+
+- [ ] **Step 1:** Restructure the grid into 80 pipe-bands emitted band-interleaved (P0.b0,P1.b0,P2.b0,P3.b0,P0.b1,…). A pipe-band = 8 char-cell rows of one pipe + a trailer `JP` to the next band; the last band reaches the epilogue.
+- [ ] **Step 2:** Pure-body bands: emit `ld ix,band_base` then 8 rows of `ld sp,ix ; push hl ; push de ; push bc ; inc ixh`, with per-row `EXX` for the A/B dither and `HL=0` for the trailing-zero pair (kept this stage — Stage 3 removes `EXX`/trailing-zero). One base immediate per band.
+- [ ] **Step 3:** Cap-edge bands (the 2/pipe straddling a cap) and skip bands (the 6/pipe in the gap): for this stage, emit cap-edge bands as 8 per-row slots chained as one band unit, and skip bands as a skip — both are folded into the IX-walk in Stage 4.
+- [ ] **Step 4:** Rewrite the scroll patcher: decrement the per-band base immediates of the IX-walk body bands. (Cap-edge bands' per-row targets are still patched per-row this stage.)
+- [ ] **Step 5:** Update `configure_pipe_slots`, `compute_next_slot`, the recycle code, `SLOT_ADDR_TABLE` and every `(row,pipe)` site to the band-interleaved layout. `IX` is free during grid execution (only init / `configure` / `update_cap_imm` use it, none concurrent) — no save/restore needed inside the grid.
+- [ ] **Step 6: Build check** — `make` → `Errors: 0, warnings: 0`.
+- [ ] **Step 7: Commit** — `git commit -m "feat: band-interleaved IX-walk pipe grid"`.
+- [ ] **Step 8: CHECKPOINT** — Human `make run`: pipes render correctly (pixels, dither, smooth scroll, caps, gaps); recycle still works; **no tearing** — the band-interleaved order stays ahead of the raster (the race-the-beam verification). Border profiler: wrap-frame scroll cost visibly smaller than Stage 1. Per-frame cost may be slightly *up* temporarily (per-row `EXX` + `inc ixh`); Stage 3 brings it down.
 
 ---
 
-## Stage 3: IX-pointer body bands + per-band scroll
-
-**Goal:** Convert **pure-body bands** from 8 per-row `ld sp,imm` slots to one `ld ix,base` + an 8-row IX-walk (`ld sp,ix ; push hl ; push de ; push bc ; inc ixh`). Keep the per-row `EXX` dither and the `HL=0` trailing-zero push for now (3-push slot). Change the scroll patch to decrement the **band bases**. Cap-edge bands and skip bands stay in per-row form this stage.
-
-**Study first:** the restored slot format and `redraw_pipes_v2`'s register setup; the scroll patch routine (`patch_pipe_targets` or equivalent) and how it walks slots; `inc ixh` (undocumented — confirm sjasmplus emits `$DD $24`); the screen-address `+256` per-row relationship within a char cell.
-
-**Files:** `src/main.asm` — grid builder (body-band emission), `redraw_pipes_v2`, the scroll patch, the slot/grid EQUs.
-
-- [ ] **Step 1:** Grid builder — emit pure-body bands as `ld ix,band_base` followed by 8 rows of `ld sp,ix ; push hl ; push de ; push bc ; inc ixh` (the 8th `inc ixh` may be omitted). `band_base` = the row-0-of-band screen target. Cap-edge bands (the 2 per pipe straddling a cap) and the 6 skip bands stay as before.
-- [ ] **Step 2:** Verify `IX` is unused during grid execution (it is — only init / `configure_pipe_slots` / `update_cap_imm` touch it, none concurrent with the grid). No save/restore of IX needed inside the grid.
-- [ ] **Step 3:** Rewrite the scroll patch: for each active pipe, decrement its body bands' `ld ix,base` operands (≈18 bands/pipe at this stage; the 2 cap-edge bands still per-row). Build a small list of band-base addresses (or compute them) — model it on the existing active-list walk.
-- [ ] **Step 4: Build check** — `make` → clean, `ASSERT` passes.
-- [ ] **Step 5: Commit** — `git commit -m "feat: IX-pointer body bands; scroll by per-band base"`.
-- [ ] **Step 6: CHECKPOINT** — Human `make run`: pipes render correctly, scroll smoothly, dither intact. Border profiler: the wrap-frame scroll cost is **visibly smaller** than Stage 1 (most of the patch is now per-band).
-
----
-
-## Stage 4: EXX-free dither + once-per-wrap trailing clear
+## Stage 3: EXX-free dither + once-per-wrap trailing clear
 
 **Goal:** Free `HL` by dropping the per-slot trailing-zero push (3-push → 2-push slot) and removing `EXX`. Load `BC` = bitmap bytes 0,1; `DE` = bytes 2,3 of variant A; `HL` = bytes 2,3 of variant B. A-rows `push de ; push bc`, B-rows `push hl ; push bc`. Add a once-per-wrap pass that clears the single column each active pipe vacated.
 
@@ -95,7 +102,7 @@ Stages run in order; later stages depend on earlier ones.
 
 ---
 
-## Stage 5: Cap-edge bands folded into the IX band
+## Stage 4: Cap-edge bands folded into the IX band
 
 **Goal:** The 2 cap-edge bands per pipe (7 body rows + 1 cap row, cap on the band edge) currently render per-row. Fold them into the IX-band walk so they too carry a single base immediate — the cap row shares the band's IX position, only the pushed data differs. This brings the scroll patch to the full ~20 bands/pipe (~60 total).
 
@@ -112,7 +119,7 @@ Stages run in order; later stages depend on earlier ones.
 
 ---
 
-## Stage 6: Recycle — band-granular rebuild
+## Stage 5: Recycle — band-granular rebuild
 
 **Goal:** When a pipe recycles (`byte_x→29`, new `gap_y`), rebuild its 20 bands for the new gap position. Amortise over the parked lead-time (a few bands per frame), into the single grid. Replace the old `prep_step`/`configure_pipe_slots` recycle path.
 
@@ -122,14 +129,14 @@ Stages run in order; later stages depend on earlier ones.
 
 - [ ] **Step 1:** On recycle, set `byte_x=29` + new `gap_y`, mark the pipe's column "needs band rebuild".
 - [ ] **Step 2:** Amortised driver: each frame, re-stamp a bounded number of the recycled pipe's bands (body/skip/cap per the new `gap_y`); complete before the pipe scrolls into view. The parked pipe's not-yet-rebuilt bands are JR-skip.
-- [ ] **Step 3:** Remove the old `prep_step` / `configure_pipe_slots` recycle calls (routines left defined; deleted in Stage 7).
+- [ ] **Step 3:** Remove the old `prep_step` / `configure_pipe_slots` recycle calls (routines left defined; deleted in Stage 6).
 - [ ] **Step 4: Build check** — `make` → clean.
 - [ ] **Step 5: Commit** — `git commit -m "feat: band-granular amortised pipe recycle"`.
 - [ ] **Step 6: CHECKPOINT** — Human `make run`: pipes recycle correctly — re-enter from the right with a new gap, no corruption, no freeze, full session survives. Border profiler: **no recycle spike**.
 
 ---
 
-## Stage 7: Cleanup; re-tune sound budget
+## Stage 6: Cleanup; re-tune sound budget
 
 **Goal:** Delete now-dead machinery; measure the real per-frame headroom and set the beeper budget from it.
 
@@ -145,7 +152,7 @@ Stages run in order; later stages depend on earlier ones.
 
 ## Self-review notes
 
-- **Spec coverage:** char-cell bands + IX pointer (Stage 3 ✓), band-interleaved layout (Stage 2 ✓), EXX-free dither (Stage 4 ✓), per-band scroll (Stages 3,5 ✓), once-per-wrap trailing clear (Stage 4 ✓), caps on band edges (Stage 5 ✓), recycle (Stage 6 ✓), double-buffer deleted (Stage 1 revert ✓), single grid (✓) — all spec sections mapped. `apply/restore_pipe_attrs` is spec-out-of-scope and untouched.
+- **Spec coverage:** band-interleaved IX-walk grid + per-band scroll (Stage 2 ✓), EXX-free dither + once-per-wrap trailing clear (Stage 3 ✓), caps on band edges (Stage 4 ✓), recycle (Stage 5 ✓), cleanup + sound (Stage 6 ✓), double-buffer deleted + single grid (Stage 1 revert ✓) — all spec sections mapped. `apply/restore_pipe_attrs` is spec-out-of-scope and untouched.
 - **Staging discipline:** every stage builds clean and runnable; Stages 2 (race-the-beam) and 3 (IX conversion) are the high-risk ones — each independently committed and checkpoint-gated. Stage 2 deliberately isolates the race-the-beam risk before the slot mechanism changes.
 - **No pre-written Z80:** the renderer is rewritten by adapting named existing routines; the heavy steps say what to build and what to study, not fabricated assembly. Same discipline as the prior renderer plan.
 - **Measure, don't estimate:** all T-state expectations are checked with the border profiler at each checkpoint; if a stage's measurement contradicts the design, stop and re-plan.
