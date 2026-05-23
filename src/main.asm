@@ -688,6 +688,32 @@ init_pipe_bx_tmp: db 0                 ; scratch: byte_x for the pipe being conf
 ;      DE = screen base value (the ld ix operand = band_row-0 target)
 ; Clobbers: AF, B, C, HL.  DE preserved.
 ;----------------------------------------------------------------
+; ── Stage 4 cap-edge band layout ─────────────────────────────────
+;
+; K_top band  (cap at band-row 7, last row of band):
+;   +0..3   DD 21 lo hi      ld ix, screen_target_table_29[8*K_top]
+;   +4..45  7 IX-walk rows (band-rows 0..6, A,B,A,B,A,B,A; 6 B each)
+;   +46     C3               JP cap_top_handler (handler addr patched later)
+;   +47..48 00 00            cap handler operand placeholder
+;   +49..67 NOP bridge
+;   +68..   band trailer
+;
+; K_bot band  (cap at band-row 0, first row of band):
+;   +0..3   DD 21 lo hi      ld ix, screen_target_table_29[8*K_bot + 1]
+;                            (NB: +1 entry — band-row 0 is the cap, doesn't
+;                            use IX; the IX-walk covers band-rows 1..7 from
+;                            base+256, so the operand must point at band-row
+;                            1's address, not band-row 0's.)
+;   +4      C3               JP cap_bot_handler (handler addr patched later)
+;   +5..6   00 00            cap handler operand placeholder
+;   +7..48  7 IX-walk rows (band-rows 1..7, B,A,B,A,B,A,B; 6 B each)
+;   +49..67 NOP bridge
+;   +68..   band trailer
+;
+; cap handler _next imms (cap_top / cap_bot) point to:
+;   cap_top: band_base + 68  (the trailer; JPs to next band base)
+;   cap_bot: band_base + 7   (first byte of the IX-walk)
+;----------------------------------------------------------------
 emit_body_band:
         ld      (hl), $DD               ; ld ix,nn  byte 1
         inc     hl
@@ -728,6 +754,146 @@ emit_body_band:
         ld      (hl), $24
         inc     hl
         djnz    .ebb_pair
+        ret
+
+;----------------------------------------------------------------
+; emit_capedge_band: write a K_top or K_bot cap-edge band into the grid
+; in the IX-walk form. Identical scrolling cost to a body band — the
+; band carries ONE base immediate (the ld ix operand at +2).
+;
+; In:  HL = grid band base address
+;      DE = screen base value for the ld ix operand
+;           K_top: screen_target_table_29[8*K_top]      (band-row 0)
+;           K_bot: screen_target_table_29[8*K_bot + 1]  (band-row 1!)
+;      A  = 0 for K_top, 1 for K_bot
+; The cap-slot $C3 (JP) opcode is stamped here; the cap handler ADDRESS
+; (the JP operand) is patched separately by the cap-arm step in
+; configure_pipe_slots / ps_phase6. The cap handler's _next imm is
+; patched by compute_next_slot.
+; Clobbers: AF, B, C, HL.  DE preserved (re-used by callers across bands).
+;----------------------------------------------------------------
+emit_capedge_band:
+        or      a
+        jr      nz, .ecb_bot
+        ; ── K_top: 7 IX-walk rows (A,B,A,B,A,B,A) then cap slot ──
+        ld      (hl), $DD               ; ld ix,nn
+        inc     hl
+        ld      (hl), $21
+        inc     hl
+        ld      (hl), e                 ; operand lo
+        inc     hl
+        ld      (hl), d                 ; operand hi
+        inc     hl                      ; HL = band_base+4
+        ; band-rows 0..6: A,B,A,B,A,B,A — 3 A/B pairs + 1 A row.
+        ld      b, 3
+.ecb_top_pair:
+        ; A-row
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $F9
+        inc     hl
+        ld      (hl), $D5               ; push de
+        inc     hl
+        ld      (hl), $C5               ; push bc
+        inc     hl
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $24
+        inc     hl
+        ; B-row
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $F9
+        inc     hl
+        ld      (hl), $E5               ; push hl
+        inc     hl
+        ld      (hl), $C5
+        inc     hl
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $24
+        inc     hl
+        djnz    .ecb_top_pair
+        ; Trailing A-row (band-row 6)
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $F9
+        inc     hl
+        ld      (hl), $D5
+        inc     hl
+        ld      (hl), $C5
+        inc     hl
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $24
+        inc     hl                      ; HL = band_base+46 (cap slot)
+        ; Cap slot: JP cap_top_handler (operand placeholder; patched later)
+        ld      (hl), $C3
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
+        ret
+.ecb_bot:
+        ; ── K_bot: cap slot then 7 IX-walk rows (B,A,B,A,B,A,B) ──
+        ld      (hl), $DD               ; ld ix,nn
+        inc     hl
+        ld      (hl), $21
+        inc     hl
+        ld      (hl), e                 ; operand lo (band-row 1's address)
+        inc     hl
+        ld      (hl), d                 ; operand hi
+        inc     hl                      ; HL = band_base+4 (cap slot)
+        ; Cap slot: JP cap_bot_handler
+        ld      (hl), $C3
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
+        inc     hl                      ; HL = band_base+7 (first IX-walk row)
+        ; band-rows 1..7: B,A,B,A,B,A,B — 1 B row then 3 A/B-as-pair iters.
+        ; Leading B-row (band-row 1)
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $F9
+        inc     hl
+        ld      (hl), $E5
+        inc     hl
+        ld      (hl), $C5
+        inc     hl
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $24
+        inc     hl
+        ld      b, 3
+.ecb_bot_pair:
+        ; A-row
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $F9
+        inc     hl
+        ld      (hl), $D5
+        inc     hl
+        ld      (hl), $C5
+        inc     hl
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $24
+        inc     hl
+        ; B-row
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $F9
+        inc     hl
+        ld      (hl), $E5
+        inc     hl
+        ld      (hl), $C5
+        inc     hl
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $24
+        inc     hl
+        djnz    .ecb_bot_pair
         ret
 
 ;----------------------------------------------------------------
@@ -902,15 +1068,19 @@ configure_pipe_slots:
         call    cps_emit_body_bands
 
         ; ─── Step 3: patch cap-slot handler addresses (pipe-specific) ─
-        ; slot[cap_top_row][pipe] +1..+2 := cap_top_handler_pipe_<pipe>
-        ; slot[cap_bot_row][pipe] +1..+2 := cap_bot_handler_pipe_<pipe>
+        ; Stage 4: cap slot positions are now computed from cps_band_base
+        ; (the per-row slot_addr_lookup formula no longer addresses cap rows
+        ;  inside the IX-walk cap-edge band).
+        ;   K_top band: cap slot at band_base + 46 (after 7 IX-walk rows)
+        ;   K_bot band: cap slot at band_base + 4  (after the ld ix)
+        ; The +1 step (skip the $C3 opcode) is the same.
 
-        ; cap_top: HL = slot[cap_top_row][pipe] + 1
-        ld      a, (cps_cap_top_row)
-        ld      hl, cps_pipe
-        ld      c, (hl)
-        call    slot_addr_lookup                ; HL = slot[cap_top_row][pipe]
-        inc     hl                              ; HL = slot+1 (skip $C3 JP opcode)
+        ; cap_top: HL = band_base(K_top) + 46 + 1 = band_base + 47 (operand lo)
+        ld      a, (cps_k_top)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_top band base
+        ld      de, 47                          ; +46 cap slot, +1 to skip $C3
+        add     hl, de
         ; Look up cap_top_handler_pipe_<pipe> from cap_top_handler_addrs[pipe]
         ld      a, (cps_pipe)
         add     a, a
@@ -927,12 +1097,12 @@ configure_pipe_slots:
         ld      a, (de)
         ld      (hl), a                         ; write handler.hi
 
-        ; cap_bot: HL = slot[cap_bot_row][pipe] + 1
-        ld      a, (cps_cap_bot_row)
-        ld      hl, cps_pipe
-        ld      c, (hl)
-        call    slot_addr_lookup                ; HL = slot[cap_bot_row][pipe]
-        inc     hl                              ; HL = slot+1
+        ; cap_bot: HL = band_base(K_bot) + 4 + 1 = band_base + 5 (operand lo)
+        ld      a, (cps_k_bot)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_bot band base
+        ld      de, 5                           ; +4 cap slot, +1 to skip $C3
+        add     hl, de
         ld      a, (cps_pipe)
         add     a, a
         ld      de, cap_bot_handler_addrs
@@ -1108,39 +1278,40 @@ slot_addr_lookup:
 ; compute_next_slot: given a cap row and the current pipe, return the address
 ; of the next slot to execute after the cap handler finishes.
 ;
-; Band-interleaved layout (Stage 3, 5-byte slot stride, no EXX):
-;   cap_top_row = gap_y-1  → band_row 7 (last row of its band).
-;   cap_bot_row = gap_y+48 → band_row 0 (first row of its band).
-; cap_top: next = this band's NOP bridge (slot[cap_top_row][pipe]+5 =
-;          band_base+40), then NOP-falls through to the +68 trailer.
-; cap_bot: next = slot[row+1][pipe] (same pipe, next band_row) — Stage 3
-;          has no EXX byte to skip back to.
+; Stage 4 band-interleaved IX-walk cap-edge layout:
+;   cap_top_row = gap_y-1  → K_top band-row 7 (cap slot at band_base+46).
+;   cap_bot_row = gap_y+48 → K_bot band-row 0 (cap slot at band_base+4).
+;
+; cap_top: next = band_base + 68 (the band trailer; JPs to next band base).
+;          Skips the NOP bridge — the trailer alone is enough.
+; cap_bot: next = band_base + 7 (first byte of the 7-row IX-walk for
+;          band-rows 1..7, i.e. the leading `ld sp,ix` opcode `$DD F9`).
 ;
 ; Input:  A = cap_row (0..159), cps_pipe = pipe index (0..3)
 ; Output: HL = address of next slot
-; Clobbers: A, B, C, D, E
+; Clobbers: AF, BC, DE
 ;----------------------------------------------------------------
 compute_next_slot:
         ld      b, a                    ; B = cap row
+        ; K = cap_row >> 3
+        srl     a
+        srl     a
+        srl     a                       ; A = K
+        ld      (cps_k), a
+        ld      a, b
         and     7
         cp      7
         jr      z, .cns_band_last
-        ; cap_bot (band_row 0): next = slot[row+1][pipe] (Stage 3: no EXX byte)
-        ld      a, b
-        inc     a                       ; row + 1
-        ld      hl, cps_pipe
-        ld      c, (hl)
-        jp      slot_addr_lookup        ; tail: HL = slot[row+1][pipe]
+        ; cap_bot (band-row 0): next = band_base + 7
+        call    cps_band_base           ; HL = K_bot band base (uses cps_k)
+        ld      de, 7
+        add     hl, de
+        ret
 .cns_band_last:
-        ; cap_top (band_row 7): next = slot[row][pipe]+5 = band_base+40.
-        ; +40..67 are NOP (init_pipe_program), so execution falls through
-        ; the NOP bridge to the +68 trailer.
-        ld      a, b
-        ld      hl, cps_pipe
-        ld      c, (hl)
-        call    slot_addr_lookup        ; HL = slot[cap_top_row][pipe]
-        ld      de, 5
-        add     hl, de                  ; HL = band_base+40 (NOP bridge → trailer)
+        ; cap_top (band-row 7): next = band_base + 68 (trailer)
+        call    cps_band_base           ; HL = K_top band base (uses cps_k)
+        ld      de, BAND_TRAILER_OFFSET ; = 68
+        add     hl, de
         ret
 
 ;----------------------------------------------------------------
@@ -1199,41 +1370,42 @@ cps_emit_body_rows:
 
 ;----------------------------------------------------------------
 ; cps_emit_capedge: write a cap-edge band's 8 active-list entries.
+; Stage 4: the cap-edge band is now IX-walk, so it carries ONE base
+; immediate (the ld ix operand at band_base+2) — same as a body band.
+; The 7 body rows are walked via inc ixh and have no scroll targets.
+; The cap row has its own target imm in the cap handler.
+; Entry layout (8 entries):
+;   +0 (1)  band_base+2          (ld ix operand low byte address)
+;   +1 (1)  cap_*_target_imm     (from cap_*_target_imm_addrs[cps_pipe])
+;   +2..+7  scroll_sink ×6       (dummies — keep list length 112/pipe)
 ; cps_k is K_top or K_bot.
-;   K_top: 7 body-row entries (rows 8K..8K+6, slot+1) then cap_top imm.
-;   K_bot: cap_bot imm then 7 body-row entries (rows 8K+1..8K+7, slot+1).
 ; In:  DE = write cursor.   Out: DE advanced by 16 (8 entries).
-; Clobbers: AF, BC, HL, IYL.
+; Clobbers: AF, BC, HL.
 ;----------------------------------------------------------------
 cps_emit_capedge:
+        ; --- entry 0: band base ld-ix operand (band_base+2) ---
+        push    de
+        call    cps_band_base                   ; HL = band base
+        inc     hl
+        inc     hl                              ; HL = band_base+2 (ld ix operand lo)
+        pop     de
+        ex      de, hl                          ; HL = cursor, DE = entry
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+        inc     hl
+        ex      de, hl                          ; DE = cursor
+
+        ; --- entry 1: cap_*_target_imm[cps_pipe] ---
         ld      a, (cps_k)
         ld      hl, cps_k_bot
         cp      (hl)
-        jr      z, .cec_bot
-        ; --- K_top: 7 body rows (8K..8K+6) then cap_top imm ---
-        ld      a, (cps_k)
-        add     a, a
-        add     a, a
-        add     a, a                            ; row = 8*K_top
-        ld      (cps_row_cursor), a
-        ld      iyl, 7
-        call    cps_emit_body_rows
+        jr      z, .cec_cap_bot
         ld      hl, cap_top_target_imm_addrs
         jr      .cec_capimm
-.cec_bot:
-        ; --- K_bot: cap_bot imm then 7 body rows (8K+1..8K+7) ---
+.cec_cap_bot:
         ld      hl, cap_bot_target_imm_addrs
-        call    .cec_capimm
-        ld      a, (cps_k)
-        add     a, a
-        add     a, a
-        add     a, a                            ; 8*K_bot (= cap_bot_row)
-        inc     a                               ; first body row = cap_bot_row+1
-        ld      (cps_row_cursor), a
-        ld      iyl, 7
-        jp      cps_emit_body_rows              ; tail: 7 entries then ret
 .cec_capimm:
-        ; HL = &cap_*_target_imm_addrs ; write entry [cps_pipe] to (DE)
         ld      a, (cps_pipe)
         add     a, a
         add     a, l
@@ -1248,6 +1420,17 @@ cps_emit_capedge:
         ld      a, (hl)
         ld      (de), a
         inc     de
+
+        ; --- entries 2..7: 6 × scroll_sink dummies ---
+        ld      b, 6
+.cec_dummy:
+        ld      a, low scroll_sink
+        ld      (de), a
+        inc     de
+        ld      a, high scroll_sink
+        ld      (de), a
+        inc     de
+        djnz    .cec_dummy
         ret
 
 ;----------------------------------------------------------------
@@ -1270,11 +1453,16 @@ cps_set_k_bounds:
         ret
 
 ;----------------------------------------------------------------
-; cps_emit_body_bands: overwrite every pure-body band (K<K_top or
-; K>K_bot) of pipe cps_pipe with the IX-walk form (emit_body_band);
-; cap-edge (K_top, K_bot) and skip bands are left in per-row form.
-; Sets cps_k_top / cps_k_bot first. Body band's ld ix base comes from
-; screen_target_table_29[8K] (byte_x=29 — shift_pipe_targets adjusts).
+; cps_emit_body_bands: overwrite every IX-walk band of pipe cps_pipe with
+; its IX-walk form:
+;   K < K_top  or  K > K_bot   → pure body band (emit_body_band)
+;   K == K_top                 → K_top cap-edge band (emit_capedge_band, flag=0)
+;   K == K_bot                 → K_bot cap-edge band (emit_capedge_band, flag=1)
+;   K_top < K < K_bot          → skip band, left in per-row CAP_BLOCK form
+;                                (the 48 skip rows in between).
+; Sets cps_k_top / cps_k_bot first. The ld ix operand comes from
+; screen_target_table_29 — see emit_capedge_band's header for the K_bot
+; +1 entry subtlety. byte_x=29 baseline; shift_pipe_targets adjusts.
 ; Clobbers: AF, BC, DE, HL.
 ;----------------------------------------------------------------
 cps_emit_body_bands:
@@ -1286,15 +1474,12 @@ cps_emit_body_bands:
         ld      hl, cps_k_top
         cp      (hl)
         jr      c, .cebb_body                   ; K < K_top → body
+        jr      z, .cebb_capedge_top            ; K == K_top → cap-edge top
         ld      hl, cps_k_bot
         cp      (hl)
-        jr      z, .cebb_next                   ; K == K_bot → cap-edge
-        jr      c, .cebb_capskip_chk
+        jr      z, .cebb_capedge_bot            ; K == K_bot → cap-edge bot
+        jr      c, .cebb_next                   ; K_top < K < K_bot → skip
         jr      .cebb_body                      ; K > K_bot → body
-.cebb_capskip_chk:
-        ld      hl, cps_k_top
-        cp      (hl)
-        jr      .cebb_next                      ; K_top<=K<K_bot → leave per-row
 .cebb_body:
         call    cps_band_base                   ; HL = grid band base
         push    hl
@@ -1313,6 +1498,47 @@ cps_emit_body_bands:
         ld      d, (hl)                         ; DE = screen base (byte_x=29)
         pop     hl                              ; HL = grid band base
         call    emit_body_band
+        jr      .cebb_next
+.cebb_capedge_top:
+        call    cps_band_base                   ; HL = grid band base
+        push    hl
+        ; DE = screen_target_table_29[8*K_top]  (band-row 0 of K_top band)
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K_top*16
+        ld      de, screen_target_table_29
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = screen base for band-row 0
+        pop     hl                              ; HL = grid band base
+        xor     a                               ; flag = 0 → K_top
+        call    emit_capedge_band
+        jr      .cebb_next
+.cebb_capedge_bot:
+        call    cps_band_base                   ; HL = grid band base
+        push    hl
+        ; DE = screen_target_table_29[8*K_bot + 1]  (band-row 1 of K_bot band!)
+        ; Byte offset = K_bot*16 + 2.
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K_bot*16
+        ld      de, screen_target_table_29 + 2
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = screen base for band-row 1
+        pop     hl                              ; HL = grid band base
+        ld      a, 1                            ; flag = 1 → K_bot
+        call    emit_capedge_band
 .cebb_next:
         ld      a, (cps_k)
         inc     a
@@ -2221,42 +2447,46 @@ ps_phase6:
         call    cps_build_active_list           ; 112-entry per-band active list
 
         ; ── Arm incoming cap slots in PIPE_PROGRAM (relocated from do_swap) ──
-        ; Runs once at build completion: after the column has been (re)built and
-        ; ps_phase1's NOP-fill of the cap range is done. Arming here ensures the
-        ; $C3 JP opcodes survive into gameplay. Indexed by activate_pipe_idx.
-        ; Slot addresses are looked up from SLOT_ADDR_TABLE (band-interleaved).
+        ; Runs once at build completion: after cps_emit_body_bands has stamped
+        ; the IX-walk form (including the $C3 placeholder at each cap slot)
+        ; and ps_phase1's NOP-fill of the cap range is done.
+        ;
+        ; Stage 4 cap slot positions are computed from cps_band_base (the
+        ; per-row slot_addr_lookup formula no longer addresses IX-walk cap
+        ; rows):
+        ;   K_top cap slot: band_base + 46 (after 7 IX-walk rows)
+        ;   K_bot cap slot: band_base + 4  (after the ld ix)
+        ; The $C3 opcode is already in place from cps_emit_body_bands; here we
+        ; only write the handler address at slot+1..+2. cps_pipe is published
+        ; (and cps_k_top/k_bot set) above by cps_emit_body_bands/build_active_list.
 
-        ; --- cap_top slot ---
-        ld      a, (ps_cap_top_row)
-        ld      hl, activate_pipe_idx
-        ld      c, (hl)
-        call    slot_addr_lookup                ; HL = slot[cap_top_row][inc]
-        ; Write $C3 + handler addr (lo, hi)
-        ld      (hl), $C3                       ; JP opcode
-        inc     hl
-        ; Look up cap_top_handler_pipe_<inc> from cap_top_handler_addrs[inc]
+        ; --- cap_top slot: band_base(K_top) + 47 (handler operand lo) ---
+        ld      a, (cps_k_top)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_top band base
+        ld      de, 47                          ; +46 cap slot, +1 to skip $C3
+        add     hl, de                          ; HL = handler-addr operand lo
         ld      a, (activate_pipe_idx)
         add     a, a                            ; inc * 2
         ld      e, a
         ld      d, 0
-        push    hl                              ; save slot+1 addr
+        push    hl                              ; save operand-lo addr
         ld      hl, cap_top_handler_addrs
         add     hl, de                          ; HL = &cap_top_handler_addrs[inc]
         ld      e, (hl)
         inc     hl
         ld      d, (hl)                         ; DE = handler address
-        pop     hl                              ; restore slot+1 addr
+        pop     hl                              ; restore operand-lo addr
         ld      (hl), e                         ; write handler.lo
         inc     hl
         ld      (hl), d                         ; write handler.hi
 
-        ; --- cap_bot slot ---
-        ld      a, (ps_cap_bot_row)
-        ld      hl, activate_pipe_idx
-        ld      c, (hl)
-        call    slot_addr_lookup                ; HL = slot[cap_bot_row][inc]
-        ld      (hl), $C3                       ; JP opcode
-        inc     hl
+        ; --- cap_bot slot: band_base(K_bot) + 5 (handler operand lo) ---
+        ld      a, (cps_k_bot)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_bot band base
+        ld      de, 5                           ; +4 cap slot, +1 to skip $C3
+        add     hl, de                          ; HL = handler-addr operand lo
         ld      a, (activate_pipe_idx)
         add     a, a
         ld      e, a
