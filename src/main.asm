@@ -45,7 +45,7 @@ SND_SLICE_NORMAL  EQU 1100               ; budget on normal frames (CALIBRATE)
 SND_SLICE_WRAP    EQU 0                  ; wrap/swap frames already at ~70k — no room for sound
 SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no room for sound
 
-; ─── Slot grid layout — Stage 2b: band-interleaved, IX-walk body ──
+; ─── Slot grid layout — Stage 3: EXX-free 2-push slots ────────────
 ; The grid is 80 pipe-bands, band-interleaved:
 ;   P0.b0, P1.b0, P2.b0, P3.b0, P0.b1, …, P3.b19
 ; where band K (0..19) is screen rows 8K..8K+7 of one pipe.
@@ -55,48 +55,57 @@ SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no 
 ;
 ;   BODY band  (12/pipe, outside the gap & caps):
 ;     +0   ld ix,band_screen_base        (4 B: $DD $21 lo hi)
-;     +4   8 IX-walk rows, 8 B each:
-;            D9        EXX            (per-row A/B dither)
-;            DD F9     ld sp,ix
-;            E5 D5 C5  push hl ; push de ; push bc   (HL=0 trailing zero)
-;            DD 24     inc ixh        (+256 → next pixel row in the cell)
-;     +68  trailer JP
+;     +4   8 IX-walk rows, 6 B each (A on even band-rows, B on odd):
+;       A:  DD F9   ld sp,ix
+;           D5      push de              (DE = body bytes 2,3 of variant A)
+;           C5      push bc              (BC = body bytes 0,1 shared by A/B)
+;           DD 24   inc ixh              (+256 → next pixel row in cell)
+;       B:  DD F9   ld sp,ix
+;           E5      push hl              (HL = body bytes 2,3 of variant B)
+;           C5      push bc
+;           DD 24   inc ixh
+;     +52  end of last row; +52..67 NOP-bridge to the +68 trailer.
 ;   Scrolling patches ONE immediate per body band (ld ix operand, +2..3).
 ;
-;   CAP/SKIP band  (cap-edge ×2/pipe, skip ×6/pipe — 2a per-row form):
-;     +0   8 per-row slots, 7 B each:  D9 EXX ; 31 lo hi ; E5 D5 C5
-;     +56  the last row ends here; +56..67 are NOP ($00) and fall
-;          through to the +68 trailer (NOP bridge — see init_pipe_program).
+;   CAP/SKIP band  (cap-edge ×2/pipe, skip ×6/pipe — still per-row in S3):
+;     +0   8 per-row slots, 5 B each (A on even band-rows, B on odd):
+;       A:  31 lo hi D5 C5   ld sp,target ; push de ; push bc
+;       B:  31 lo hi E5 C5   ld sp,target ; push hl ; push bc
+;     Skip row: 18 03 00 00 00              JR +3 → next slot.
+;     Cap row: C3 lo hi 00 00               JP cap_handler; 2 pad.
+;     +40  end of last row; +40..67 NOP-bridge to the +68 trailer.
 ;   cap-edge bands keep per-row scroll targets (Stage 4 folds them in).
+;
+; A/B parity: a band starts at screen row 8K (even), so band-row index N's
+; screen-row parity = N mod 2. Even band-rows are A; odd are B.
 SLOT_GRID_BASE         EQU $DB00
 BAND_ROWS              EQU 8                          ; rows per char-cell band
 NUM_BANDS              EQU 80                         ; 20 char-cells × 4 pipes
-BAND_ROW_STRIDE        EQU 7                          ; cap/skip row: EXX(1) + 6-byte slot
+BAND_ROW_STRIDE        EQU 5                          ; cap/skip row: 5-byte slot (no EXX)
 BAND_IX_PREFIX         EQU 4                          ; body band: ld ix,nn  ($DD $21 lo hi)
-BAND_IXROW_STRIDE      EQU 8                          ; body row: EXX+ld sp,ix+3 push+inc ixh
-BAND_STRIDE            EQU 80                         ; 4 + 8*8 = 68 used (body); +3 trailer; +9 pad
+BAND_IXROW_STRIDE      EQU 6                          ; body row: ld sp,ix + 2 push + inc ixh
+BAND_STRIDE            EQU 80                         ; 4 + 8*6 = 52 used (body); trailer at +68
 SLOT_GRID_END          EQU SLOT_GRID_BASE + NUM_BANDS * BAND_STRIDE  ; $DB00 + 80*80 = $F400
 PIPE_PROGRAM           EQU SLOT_GRID_BASE              ; entry point alias
 
 ; Trailer JP at a uniform offset for both band forms.
 BAND_TRAILER_OFFSET    EQU 68
 
-; Slot format: $31 lo hi $E5 $D5 $C5  =  ld sp,target ; push hl ; push de ; push bc
-; HL is set to $0000 once at PIPE_PROGRAM entry; the extra push HL writes the
-; trailing-zero pair that replaces the old deferred-clear mechanism.
-SLOT_STRIDE            EQU 6
+; Slot format (Stage 3): 5 bytes. Two variants:
+;   A-row: $31 lo hi $D5 $C5   ld sp,target ; push de ; push bc
+;   B-row: $31 lo hi $E5 $C5   ld sp,target ; push hl ; push bc
+; The single differing byte is at slot+3 ($D5 for A, $E5 for B).
+SLOT_STRIDE            EQU 5
 
 ; ─── Slot-grid template store (init-time, then read-only) ─────────
-; Single cap_block content is identical for every gap_y (only the
-; stamp offset varies), so we share one 300-byte block. Total store:
-;   BODY_TEMPLATE       960 bytes  (160 rows × 6 bytes, byte_x=29 body slots)
-;   CAP_BLOCK           300 bytes  (50 rows × 6 bytes: cap_top + 48 skip + cap_bot)
-;   CAP_TARGET_TABLE     48 bytes  (12 gap_y entries × 4 bytes:
-;                                    word(cap_top_target), word(cap_bot_target))
+; Stage 3: 5-byte slot stride (no EXX). A/B variants alternate per row.
+;   BODY_TEMPLATE       800 bytes  (160 rows × 5 bytes, byte_x=29 body slots)
+;   CAP_BLOCK           250 bytes  (50 rows × 5 bytes: cap_top + 48 skip + cap_bot)
+;   CAP_TARGET_TABLE     48 bytes  (12 gap_y entries × 4 bytes)
 TEMPLATE_BASE          EQU $C000
-BODY_TEMPLATE          EQU TEMPLATE_BASE                  ; $C000..$C3BF (Phase 1: 160*6=960 bytes)
-CAP_BLOCK              EQU BODY_TEMPLATE + 960            ; Phase 1: body=160*6=960 bytes → cap_block starts here
-CAP_TARGET_TABLE       EQU CAP_BLOCK + 300                ; Phase 1: 50 rows × 6 bytes/slot
+BODY_TEMPLATE          EQU TEMPLATE_BASE                  ; $C000..$C31F (160*5=800 bytes)
+CAP_BLOCK              EQU BODY_TEMPLATE + 800            ; 800 bytes for body → cap_block starts here
+CAP_TARGET_TABLE       EQU CAP_BLOCK + 250                ; 50 rows × 5 bytes/slot
 TEMPLATE_END           EQU CAP_TARGET_TABLE + 48
 
 ; ─── Pre-computed slot addresses ─────────────────────────────────
@@ -508,13 +517,14 @@ paint_attrs:
 
 ;----------------------------------------------------------------
 ; init_slot_addr_table: pre-compute slot_addr_table[row][pipe] = byte address
-; of the (row, pipe) slot's first byte (the byte AFTER that row's EXX).
+; of the (row, pipe) slot's first byte.
 ;
-; Stage 2a band-interleaved layout. For screen row R (0..159), pipe P (0..3):
+; Stage 3 band-interleaved layout. For screen row R (0..159), pipe P (0..3):
 ;   K        = R >> 3            char-cell band index (0..19)
 ;   band_row = R & 7             row within the band (0..7)
 ;   e        = K*4 + P           band-interleaved execution index (0..79)
-;   slot_addr = SLOT_GRID_BASE + e*BAND_STRIDE + band_row*BAND_ROW_STRIDE + 1
+;   slot_addr = SLOT_GRID_BASE + e*BAND_STRIDE + band_row*BAND_ROW_STRIDE
+;             (BAND_ROW_STRIDE = 5; no leading EXX)
 ;
 ; This table is the SINGLE SOURCE OF TRUTH for slot addresses — every
 ; consumer routine looks slots up here rather than recomputing a formula.
@@ -527,17 +537,15 @@ init_slot_addr_table:
         ld      b, 0                            ; B = screen row 0..159
 .row_lp:
         push    bc
-        ; --- band_row offset within band = (R & 7) * BAND_ROW_STRIDE + 1 ---
-        ; BAND_ROW_STRIDE = 7 = 8 - 1: triple-double to *8, then subtract *1.
+        ; --- band_row offset within band = (R & 7) * BAND_ROW_STRIDE ---
+        ; BAND_ROW_STRIDE = 5 = 4 + 1: double-double to *4, then add *1.
         ld      a, b
         and     7
         ld      c, a                            ; C = band_row (0..7)
         add     a, a                            ; *2
         add     a, a                            ; *4
-        add     a, a                            ; *8
-        sub     c                               ; *8 - *1 = *7  = band_row*7
-        inc     a                               ; + 1 (skip EXX byte)
-        ld      c, a                            ; C = band_row*7 + 1
+        add     a, c                            ; *4 + *1 = *5  = band_row*5
+        ld      c, a                            ; C = band_row*5
         ; --- K*4 = (R >> 3) << 2 = (R & ~7) >> 1 ---
         ld      a, b
         and     $F8                             ; A = R with low 3 bits cleared = K*8
@@ -561,7 +569,7 @@ init_slot_addr_table:
         add     hl, hl                          ; e*64
         add     hl, de                          ; e*64 + e*16 = e*80
         ld      d, 0
-        ld      e, c                            ; DE = band_row*7 + 1
+        ld      e, c                            ; DE = band_row*5
         add     hl, de                          ; HL = e*80 + C
         ld      a, l
         add     a, low SLOT_GRID_BASE
@@ -663,18 +671,22 @@ init_pipe_bx_tmp: db 0                 ; scratch: byte_x for the pipe being conf
 ;----------------------------------------------------------------
 ; emit_body_band: write a pure-body band into the grid (IX-walk form).
 ;   +0   ld ix,<screen_base>     ($DD $21 lo hi)
-;   +4   8 IX-walk rows, 8 bytes each:
-;          D9        EXX
-;          DD F9     ld sp,ix
-;          E5 D5 C5  push hl ; push de ; push bc
-;          DD 24     inc ixh
+;   +4   8 IX-walk rows, 6 bytes each (no EXX; A/B by row parity):
+;          A-row:  DD F9   ld sp,ix
+;                  D5      push de         (variant A bytes 2,3)
+;                  C5      push bc         (shared bytes 0,1)
+;                  DD 24   inc ixh         (+256 → next pixel row)
+;          B-row:  DD F9   ld sp,ix
+;                  E5      push hl         (variant B bytes 2,3)
+;                  C5      push bc
+;                  DD 24   inc ixh
 ; The trailer at +68 is left untouched (written by init_pipe_program).
 ; band_base+0 IS overwritten, so any prior JR-skip / per-row content is
 ; cleanly replaced — no stale-byte hazard.
 ;
 ; In:  HL = grid band base address
 ;      DE = screen base value (the ld ix operand = band_row-0 target)
-; Clobbers: AF, B, HL.  DE preserved.
+; Clobbers: AF, B, C, HL.  DE preserved.
 ;----------------------------------------------------------------
 emit_body_band:
         ld      (hl), $DD               ; ld ix,nn  byte 1
@@ -685,25 +697,37 @@ emit_body_band:
         inc     hl
         ld      (hl), d                 ; operand hi
         inc     hl                      ; HL → band_base+4 (first IX row)
-        ld      b, 8                    ; 8 rows
-.ebb_row:
-        ld      (hl), $D9               ; EXX
+        ; Rows 0..7. Even = A (push de = $D5), odd = B (push hl = $E5).
+        ; Unroll as 4 A/B pairs.
+        ld      b, 4                    ; 4 A/B pairs = 8 rows
+.ebb_pair:
+        ; --- A-row (even band-row): ld sp,ix ; push de ; push bc ; inc ixh ---
+        ld      (hl), $DD
         inc     hl
-        ld      (hl), $DD               ; ld sp,ix  byte 1
-        inc     hl
-        ld      (hl), $F9               ; ld sp,ix  byte 2
-        inc     hl
-        ld      (hl), $E5               ; push hl
+        ld      (hl), $F9
         inc     hl
         ld      (hl), $D5               ; push de
         inc     hl
         ld      (hl), $C5               ; push bc
         inc     hl
-        ld      (hl), $DD               ; inc ixh  byte 1
+        ld      (hl), $DD
         inc     hl
-        ld      (hl), $24               ; inc ixh  byte 2
+        ld      (hl), $24
         inc     hl
-        djnz    .ebb_row
+        ; --- B-row (odd band-row): ld sp,ix ; push hl ; push bc ; inc ixh ---
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $F9
+        inc     hl
+        ld      (hl), $E5               ; push hl
+        inc     hl
+        ld      (hl), $C5               ; push bc
+        inc     hl
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $24
+        inc     hl
+        djnz    .ebb_pair
         ret
 
 ;----------------------------------------------------------------
@@ -776,12 +800,12 @@ configure_pipe_slots:
 
         ; --- Region A: stamp rows [0, cap_top_row-1] ---
         ; Band-interleaved: each row's dest slot is looked up from
-        ; SLOT_ADDR_TABLE; the template src advances 6 bytes per row.
+        ; SLOT_ADDR_TABLE; the template src advances 5 bytes per row (Stage 3).
         ld      a, (cps_cap_top_row)
         or      a
         jr      z, .cps_body_a_done             ; skip if cap_top_row == 0
         ld      iyl, a                          ; counter = cap_top_row
-        ld      hl, BODY_TEMPLATE               ; src (advances +6/row)
+        ld      hl, BODY_TEMPLATE               ; src (advances +5/row)
         xor     a
         ld      (cps_row_cursor), a             ; row cursor starts at 0
 .cps_body_a_lp:
@@ -790,13 +814,8 @@ configure_pipe_slots:
         ld      hl, cps_pipe
         ld      c, (hl)
         call    slot_addr_lookup                ; HL = slot[row][pipe]
-        ex      de, hl                          ; DE = dest slot
-        dec     de
-        ld      a, $D9
-        ld      (de), a                         ; EXX byte at slot-1
-        inc     de
+        ex      de, hl                          ; DE = dest slot (Stage 3: no leading EXX)
         pop     hl                              ; HL = template src
-        ldi
         ldi
         ldi
         ldi
@@ -821,7 +840,7 @@ configure_pipe_slots:
         ld      a, (cps_cap_bot_row)
         inc     a
         ld      (cps_row_cursor), a
-        ; HL = BODY_TEMPLATE + (cap_bot_row+1) * 6
+        ; HL = BODY_TEMPLATE + (cap_bot_row+1) * 5  (Stage 3 stride)
         ld      a, (cps_cap_bot_row)
         inc     a                               ; A = cap_bot_row + 1
         ld      l, a
@@ -831,9 +850,8 @@ configure_pipe_slots:
         add     hl, hl                          ; HL = (cap_bot_row+1) * 2
         add     hl, hl                          ; HL = (cap_bot_row+1) * 4
         add     hl, de                          ; HL = (cap_bot_row+1) * 5
-        add     hl, de                          ; HL = (cap_bot_row+1) * 6
         ld      de, BODY_TEMPLATE
-        add     hl, de                          ; HL = BODY_TEMPLATE + (cap_bot_row+1)*6
+        add     hl, de                          ; HL = BODY_TEMPLATE + (cap_bot_row+1)*5
 .cps_body_b_lp:
         push    hl                              ; save template src
         ld      a, (cps_row_cursor)
@@ -841,12 +859,7 @@ configure_pipe_slots:
         ld      c, (hl)
         call    slot_addr_lookup                ; HL = slot[row][pipe]
         ex      de, hl                          ; DE = dest slot
-        dec     de
-        ld      a, $D9
-        ld      (de), a                         ; EXX byte at slot-1
-        inc     de
         pop     hl                              ; HL = template src
-        ldi
         ldi
         ldi
         ldi
@@ -872,13 +885,8 @@ configure_pipe_slots:
         ld      hl, cps_pipe
         ld      c, (hl)
         call    slot_addr_lookup                ; HL = slot[row][pipe]
-        ex      de, hl                          ; DE = dest slot
-        dec     de
-        ld      a, $D9
-        ld      (de), a                         ; EXX byte at slot-1
-        inc     de
+        ex      de, hl                          ; DE = dest slot (Stage 3: no leading EXX)
         pop     hl                              ; HL = template src
-        ldi
         ldi
         ldi
         ldi
@@ -1100,13 +1108,13 @@ slot_addr_lookup:
 ; compute_next_slot: given a cap row and the current pipe, return the address
 ; of the next slot to execute after the cap handler finishes.
 ;
-; Band-interleaved layout (Stage 2a): caps sit on band edges —
+; Band-interleaved layout (Stage 3, 5-byte slot stride, no EXX):
 ;   cap_top_row = gap_y-1  → band_row 7 (last row of its band).
 ;   cap_bot_row = gap_y+48 → band_row 0 (first row of its band).
-; cap_top: next = this band's trailer (= slot[cap_top_row][pipe]+6, which is
-;          band_base+56), so the band trailer JP carries to the next band.
-; cap_bot: next = the EXX byte before slot[cap_row+1][pipe] (same pipe, next
-;          band_row), so the next row's EXX dither still fires.
+; cap_top: next = this band's NOP bridge (slot[cap_top_row][pipe]+5 =
+;          band_base+40), then NOP-falls through to the +68 trailer.
+; cap_bot: next = slot[row+1][pipe] (same pipe, next band_row) — Stage 3
+;          has no EXX byte to skip back to.
 ;
 ; Input:  A = cap_row (0..159), cps_pipe = pipe index (0..3)
 ; Output: HL = address of next slot
@@ -1117,24 +1125,22 @@ compute_next_slot:
         and     7
         cp      7
         jr      z, .cns_band_last
-        ; cap_bot (band_row 0): next = slot[row+1][pipe] - 1 (EXX byte)
+        ; cap_bot (band_row 0): next = slot[row+1][pipe] (Stage 3: no EXX byte)
         ld      a, b
         inc     a                       ; row + 1
         ld      hl, cps_pipe
         ld      c, (hl)
-        call    slot_addr_lookup        ; HL = slot[row+1][pipe]
-        dec     hl                      ; HL = EXX byte before it
-        ret
+        jp      slot_addr_lookup        ; tail: HL = slot[row+1][pipe]
 .cns_band_last:
-        ; cap_top (band_row 7): next = slot[row][pipe]+6 = band_base+56.
-        ; +56..67 are NOP (init_pipe_program), so execution falls through
+        ; cap_top (band_row 7): next = slot[row][pipe]+5 = band_base+40.
+        ; +40..67 are NOP (init_pipe_program), so execution falls through
         ; the NOP bridge to the +68 trailer.
         ld      a, b
         ld      hl, cps_pipe
         ld      c, (hl)
         call    slot_addr_lookup        ; HL = slot[cap_top_row][pipe]
-        ld      de, 6
-        add     hl, de                  ; HL = band_base+56 (NOP bridge → trailer)
+        ld      de, 5
+        add     hl, de                  ; HL = band_base+40 (NOP bridge → trailer)
         ret
 
 ;----------------------------------------------------------------
@@ -1477,7 +1483,7 @@ init_screen_target_table:
         ld      b, 160
 .istt_lp:
         ld      a, (hl)
-        add     a, 34                           ; Phase 1: +34 = byte_x=29 + 5 (was +32)
+        add     a, 32                           ; Stage 3: +32 = byte_x=29 + 3 (2-push slot: pipe at target-4..target-1)
         ld      (de), a
         inc     hl
         inc     de
@@ -1492,65 +1498,67 @@ init_screen_target_table:
 ;----------------------------------------------------------------
 ; build_slot_templates — one-shot init builder for the template store.
 ; Walks line_table to populate:
-;   BODY_TEMPLATE:    160 rows × ($31, lo+34, hi, $E5, $D5, $C5) for byte_x=29
-;   CAP_BLOCK:         50 rows: cap_top stub, 48 skip rows, cap_bot stub
+;   BODY_TEMPLATE:    160 rows × 5 bytes ($31, lo+32, hi, $D5/$E5, $C5)
+;                     for byte_x=29. Even rows = A (push de = $D5),
+;                     odd rows = B (push hl = $E5).
+;   CAP_BLOCK:         50 rows × 5 bytes: cap_top stub, 48 skip rows, cap_bot stub
 ;   CAP_TARGET_TABLE:  12 (gap_y) entries × (cap_top_target, cap_bot_target)
 ;
 ; Called once at boot, BEFORE init_pipes. Cost ~80k T-states, run-once.
 ; Clobbers AF, BC, DE, HL, IX.
 ;----------------------------------------------------------------
 build_slot_templates:
-        ; ─── Fill BODY_TEMPLATE: 160 rows × 6 bytes ─────────────────
+        ; ─── Fill BODY_TEMPLATE: 160 rows × 5 bytes (A/B by parity) ──
         ld      hl, line_table
         ld      de, BODY_TEMPLATE
         ld      b, GROUND_TOP                   ; B = row counter (160)
+        ; C will hold the per-row push-2 opcode: $D5 (A) or $E5 (B).
+        ld      c, $D5                          ; row 0 = A → push de
 .bst_body_lp:
         ld      a, $31                          ; opcode: ld sp, nn
         ld      (de), a
         inc     de
         ld      a, (hl)                         ; line_table[R].lo
-        add     a, 34                           ; Phase 1: +34 = byte_x=29 + 5 offset (was +32)
+        add     a, 32                           ; Stage 3: +32 = byte_x=29 + 3 (2-push slot)
         ld      (de), a
         inc     de
         inc     hl
         ld      a, (hl)                         ; line_table[R].hi
-        adc     a, 0                            ; carry from +34
+        adc     a, 0                            ; carry from +32
         ld      (de), a
         inc     de
         inc     hl
-        ld      a, $E5                          ; opcode: push hl  (Phase 1: NEW — HL=0 trailing zero)
+        ld      a, c                            ; push de ($D5) or push hl ($E5)
         ld      (de), a
         inc     de
-        ld      a, $D5                          ; opcode: push de
+        ld      a, $C5                          ; push bc
         ld      (de), a
         inc     de
-        ld      a, $C5                          ; opcode: push bc
-        ld      (de), a
-        inc     de
+        ; Flip C between $D5 (push de) and $E5 (push hl): $D5 XOR $E5 = $30.
+        ld      a, c
+        xor     $30
+        ld      c, a
         djnz    .bst_body_lp
 
-        ; ─── Fill CAP_BLOCK: 50 rows × 6 bytes ───────────────────
-        ; Row 0 (cap_top): $C3, 0, 0, 0, 0, 0  (JP nn + 3 pad — handler addr patched at recycle)
-        ; Rows 1..48 (skip): 0, 0, 0, 0, 0, 0  (6 NOPs)
-        ; Row 49 (cap_bot): $C3, 0, 0, 0, 0, 0
+        ; ─── Fill CAP_BLOCK: 50 rows × 5 bytes ───────────────────
+        ; Row 0 (cap_top): $C3, 0, 0, 0, 0  (JP nn + 2 pad — handler addr patched at recycle)
+        ; Rows 1..48 (skip): JR +3 + 3 zero pads → 5 bytes total
+        ; Row 49 (cap_bot): $C3, 0, 0, 0, 0
         ld      hl, CAP_BLOCK
         ld      (hl), $C3                       ; cap_top stub: jp nn opcode
         inc     hl
-        ld      b, 5                            ; remaining cap_top bytes (now 5: jp target lo, hi, then 3 pad)
+        ld      b, 4                            ; remaining cap_top bytes (jp target lo, hi, 2 pad)
 .bst_cap_top_zero:
         ld      (hl), 0
         inc     hl
         djnz    .bst_cap_top_zero
-        ; 48 skip rows × 6 bytes — JR +4 pattern so PIPE_PROGRAM
-        ; jumps the slot in 12 T instead of executing 6 NOPs in 24 T.
-        ; JR e: PC += 2 + e; e = $04 → +6 from slot start = next slot.
+        ; 48 skip rows × 5 bytes — JR e=$03 pattern: at slot+0..+1 the JR
+        ; advances PC by 2+3=5 bytes, landing on the next slot's first byte.
         ld      b, 48
 .bst_cap_skip_lp:
         ld      (hl), $18                       ; opcode: JR e
         inc     hl
-        ld      (hl), $04                       ; displacement: skip 6 bytes
-        inc     hl
-        ld      (hl), 0
+        ld      (hl), $03                       ; displacement: skip 3 bytes from PC+2
         inc     hl
         ld      (hl), 0
         inc     hl
@@ -1562,7 +1570,7 @@ build_slot_templates:
         ; cap_bot stub
         ld      (hl), $C3
         inc     hl
-        ld      b, 5
+        ld      b, 4
 .bst_cap_bot_zero:
         ld      (hl), 0
         inc     hl
@@ -1592,7 +1600,7 @@ build_slot_templates:
         inc     hl
         ld      d, (hl)                         ; DE = line_addr
         ld      a, e
-        add     a, 34                           ; Phase 1: +34 = byte_x=29 + 5 (was +32)
+        add     a, 32                           ; Stage 3: +32 = byte_x=29 + 3 (2-push slot: pipe at target-4..target-1)
         ld      (ix+0), a
         ld      a, d
         adc     a, 0
@@ -1615,7 +1623,7 @@ build_slot_templates:
         inc     hl
         ld      d, (hl)
         ld      a, e
-        add     a, 34                           ; Phase 1: +34 = byte_x=29 + 5 (was +32)
+        add     a, 32                           ; Stage 3: +32 = byte_x=29 + 3 (2-push slot: pipe at target-4..target-1)
         ld      (ix+2), a
         ld      a, d
         adc     a, 0
@@ -1880,41 +1888,40 @@ ps_phase0:
         ld      (ps_row_cursor), a
 .p0_lp:
         ; --- dest slot = slot[ps_row_cursor][activate_pipe_idx] ---
-        push    bc                              ; save B=loop counter
+        push    bc                              ; save B = loop counter
         ld      a, (ps_row_cursor)
         call    ps_slot_addr_for_row            ; HL = slot[row][pipe]; A = row
-        ex      de, hl                          ; DE = slot addr
-        dec     de
-        ld      a, $D9
-        ld      (de), a                         ; EXX byte at slot-1
-        inc     de
+        ex      de, hl                          ; DE = slot addr (Stage 3: no leading EXX)
         ; --- HL = screen_target_table_29 + row*2 ---
-        ld      a, (ps_row_cursor)              ; reload row (the EXX write above clobbered A)
+        ld      a, (ps_row_cursor)
         ld      l, a
         ld      h, 0
         add     hl, hl                          ; row*2
         ld      bc, screen_target_table_29
         add     hl, bc
         pop     bc                              ; restore B
-        ; Write: $31 lo hi $E5 $D5 $C5  (ld sp,line_addr+34; push hl; push de; push bc)
+        ; Write 5-byte slot: $31 lo hi {D5|E5} C5
         ld      a, $31
         ld      (de), a
         inc     de
         ld      a, (hl)
-        ld      (de), a                         ; target.lo = line_table[row]+34
+        ld      (de), a                         ; target.lo = line_table[row]+32
         inc     de
         inc     hl
         ld      a, (hl)
         ld      (de), a                         ; target.hi
         inc     de
-        ld      a, $E5
-        ld      (de), a                         ; push hl
+        ; Row parity selects A ($D5 push de) or B ($E5 push hl) variant.
+        ld      a, (ps_row_cursor)
+        rrca
+        ld      a, $D5                          ; default A
+        jr      nc, .p0_set_push                ; even row → A
+        ld      a, $E5                          ; odd row → B (push hl)
+.p0_set_push:
+        ld      (de), a
         inc     de
-        ld      a, $D5
-        ld      (de), a                         ; push de
-        inc     de
-        ld      a, $C5
-        ld      (de), a                         ; push bc
+        ld      a, $C5                          ; push bc
+        ld      (de), a
         ; advance the row cursor
         ld      a, (ps_row_cursor)
         inc     a
@@ -1959,9 +1966,7 @@ ps_phase1:
         ld      a, (ps_row_cursor)
         call    ps_slot_addr_for_row            ; HL = slot[row][pipe]
         pop     bc                              ; restore B
-        dec     hl
-        ld      (hl), $D9                       ; EXX byte at slot-1
-        inc     hl
+        ; Stage 3: 5-byte slot, no leading EXX. NOP-fill all 5 bytes.
         xor     a
         ld      (hl), a                         ; NOP byte 0
         inc     hl
@@ -1972,8 +1977,6 @@ ps_phase1:
         ld      (hl), a                         ; NOP byte 3
         inc     hl
         ld      (hl), a                         ; NOP byte 4
-        inc     hl
-        ld      (hl), a                         ; NOP byte 5
         ld      a, (ps_row_cursor)
         inc     a
         ld      (ps_row_cursor), a
@@ -2022,37 +2025,36 @@ ps_phase2:
         push    bc                              ; save B = loop counter
         ld      a, (ps_row_cursor)
         call    ps_slot_addr_for_row            ; HL = slot[row][pipe]; A = row
-        ex      de, hl                          ; DE = slot addr
-        dec     de
-        ld      a, $D9
-        ld      (de), a                         ; EXX byte at slot-1
-        inc     de
+        ex      de, hl                          ; DE = slot addr (Stage 3: no leading EXX)
         ; HL = screen_target_table_29 + row*2
-        ld      a, (ps_row_cursor)              ; reload row (the EXX write above clobbered A)
+        ld      a, (ps_row_cursor)
         ld      l, a
         ld      h, 0
         add     hl, hl                          ; row*2
         ld      bc, screen_target_table_29
         add     hl, bc
         pop     bc                              ; restore B
-        ; Write: $31 lo hi $E5 $D5 $C5  (ld sp,line_addr+34; push hl; push de; push bc)
+        ; Write 5-byte slot: $31 lo hi {D5|E5} C5
         ld      a, $31
         ld      (de), a
         inc     de
         ld      a, (hl)
-        ld      (de), a                         ; target.lo = line_table[row]+34
+        ld      (de), a                         ; target.lo = line_table[row]+32
         inc     de
         inc     hl
         ld      a, (hl)
         ld      (de), a                         ; target.hi
         inc     de
-        ld      a, $E5
+        ; Row parity selects A ($D5 push de) or B ($E5 push hl) variant.
+        ld      a, (ps_row_cursor)
+        rrca
+        ld      a, $D5                          ; default A
+        jr      nc, .p2_set_push
+        ld      a, $E5                          ; odd row → B (push hl)
+.p2_set_push:
         ld      (de), a
         inc     de
-        ld      a, $D5
-        ld      (de), a
-        inc     de
-        ld      a, $C5
+        ld      a, $C5                          ; push bc
         ld      (de), a
         ld      a, (ps_row_cursor)
         inc     a
@@ -2685,7 +2687,8 @@ patch_pipe_targets:
 ; Tail-call patch_pipe_targets to decrement every active body slot's screen
 ; target by ROW_OFFSET (= 1) so they walk to the next column.
 ;
-; Column clearing is handled by the trailing-zero pair in every pipe stamp.
+; Stage 3: column clearing is done by clear_vacated_columns (also called
+; here) — the per-slot trailing-zero pair has been removed.
 ;----------------------------------------------------------------
 wrap_byte_x:
         ld      iy, pipe_state
@@ -2731,9 +2734,108 @@ wrap_byte_x:
         inc     iy
         inc     iy
         djnz    .outer
+        ; Stage 3: zero the column each active pipe just vacated (replaces the
+        ; per-slot trailing-zero clear). Must run BEFORE patch_pipe_targets
+        ; (which only walks active sublists — independent ordering, but doing
+        ; the clear first keeps the wrap path's read of pipe_state consistent).
+        call    clear_vacated_columns
         ; Run patch_pipe_targets so NEXT frame's PIPE_PROGRAM renders at NEW byte_x.
         call    patch_pipe_targets
         ret
+
+;----------------------------------------------------------------
+; clear_vacated_columns: for each active (non-prep, non-activating) pipe,
+; zero the screen column it just scrolled out of, all 160 rows. Replaces
+; the per-slot trailing-zero pair that used to clear it every frame.
+;
+; Vacated col (Stage 3, 2-push slot): byte_x_NEW + 3 = byte_x_OLD + 2 (R col).
+; byte_x is already decremented by wrap_byte_x at this point.
+;
+; Per band (8 rows): compute screen address (line_table[8K] + col), then 8
+; `ld (hl), a ; inc h` writes (high byte of screen addr stride = +256 per
+; pixel-row inside a char cell — same trick as the renderer's `inc ixh`).
+; Between bands the high byte / low byte both change, so per-band reload.
+;
+; Cost (rough): ~118 T per band × 20 bands × 3 pipes ≈ 7.2 k T per wrap frame.
+; Clobbers: AF, BC, DE, HL, IY.
+;----------------------------------------------------------------
+clear_vacated_columns:
+        ld      iy, pipe_state
+        ld      b, NUM_PIPES
+.cvc_outer:
+        push    bc
+        ld      a, NUM_PIPES
+        sub     b
+        ld      c, a                            ; C = pipe index 0..3
+        ld      a, (prep_pipe_idx)
+        cp      c
+        jr      z, .cvc_skip                    ; skip preparing pipe
+        ld      a, (activate_pipe_idx)
+        cp      c
+        jr      z, .cvc_skip                    ; skip activating pipe (build in progress)
+        ; vacated_col = byte_x + 3
+        ld      a, (iy+0)
+        add     a, 3
+        cp      32                              ; off-screen (col 32+) — skip
+        jr      nc, .cvc_skip
+        cp      4                               ; in buffer cols 0..3 — also harmless to skip
+        jr      c, .cvc_skip
+        ld      (cvc_col), a
+        ; Walk 20 bands × 8 rows of single-byte clears.
+        ; Each band: HL = line_table[8K] + col; then 8 × (ld (hl),0 ; inc h).
+        ld      a, 0                            ; A = K = band index
+        ld      (cvc_k), a
+.cvc_band:
+        ld      a, (cvc_k)
+        add     a, a                            ; K*2
+        add     a, a                            ; K*4
+        add     a, a                            ; K*8 = first screen row of band
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                          ; row*2 (line_table is 2 B/entry)
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = line_addr[8K]
+        ld      a, (cvc_col)
+        add     a, e
+        ld      l, a
+        ld      a, d
+        adc     a, 0
+        ld      h, a                            ; HL = screen byte at (8K, col)
+        xor     a
+        ; 8 single-byte clears, walking +256 (inc h) per pixel row in the cell.
+        ld      (hl), a
+        inc     h
+        ld      (hl), a
+        inc     h
+        ld      (hl), a
+        inc     h
+        ld      (hl), a
+        inc     h
+        ld      (hl), a
+        inc     h
+        ld      (hl), a
+        inc     h
+        ld      (hl), a
+        inc     h
+        ld      (hl), a
+        ; Advance K
+        ld      a, (cvc_k)
+        inc     a
+        ld      (cvc_k), a
+        cp      20
+        jr      nz, .cvc_band
+.cvc_skip:
+        inc     iy
+        inc     iy
+        pop     bc
+        djnz    .cvc_outer
+        ret
+
+cvc_col:        db 0
+cvc_k:          db 0
 
 ;----------------------------------------------------------------
 ; do_swap: called when pipe A (departing) has reached byte_x=1.
@@ -2884,14 +2986,16 @@ active_pipe_addrs:
 ;   1. Hijacks SP to the cap's screen target (SMC slot patched by patch_pipe_targets)
 ;   2. Loads cap M2/R byte pair into HL via SMC imm, pushes (writes M2/R cells)
 ;   3. Loads cap L/M1 byte pair into HL via SMC imm, pushes (writes L/M1 cells)
-;   4. JPs to next slot (SMC imm patched by configure_pipe_slots)
+;   4. Restores HL = body_b_de (the B-row dither pair); JPs to next slot.
 ;
-; No CALL/RET — the slot emits JP $CD→$C3 so SP is never pushed with a
+; No CALL/RET — the slot emits JP $C3 so SP is never pushed with a
 ; return address while pointing into screen RAM.  The next slot's ld sp,target
 ; will set SP correctly, so the interim SP value doesn't matter.
 ;
-; HL is used (not BC/DE) so the row's main register set survives —
-; this preserves A/B row-parity dithering across cap rows.
+; Stage 3: 2-push slot. Pipe at target-4..target-1; no trailing-zero pair.
+; HL is the B-row dither pair (bytes 2,3 of variant B); the handler clobbers
+; it during the cap stamp, then reloads from (body_b_de) before returning so
+; subsequent B-rows in the band still render correctly.  DE and BC survive.
 ;
 ; SMC slots:
 ;   *_target  : 2-byte screen address, patched by configure_pipe_slots
@@ -2903,112 +3007,104 @@ active_pipe_addrs:
 cap_top_handler_pipe_0:
 cap_top_handler_pipe_0_target EQU $+1
         ld      sp, $0000                       ; SMC: cap row's screen target
-        push    hl                              ; Phase 1: HL=0 → writes trailing zero pair
 cap_top_handler_pipe_0_de EQU $+1
         ld      hl, $0000                       ; SMC: M2/R pair (low=M2, high=R)
         push    hl
 cap_top_handler_pipe_0_bc EQU $+1
         ld      hl, $0000                       ; SMC: L/M1 pair (low=L, high=M1)
         push    hl
-        ld      hl, 0                           ; Phase 1: restore HL=0 invariant
+        ld      hl, (body_b_de)                 ; restore B-row dither pair (HL invariant)
 cap_top_handler_pipe_0_next EQU $+1
         jp      $0000                           ; SMC: address of next slot after cap row
 
 cap_top_handler_pipe_1:
 cap_top_handler_pipe_1_target EQU $+1
         ld      sp, $0000
-        push    hl                              ; Phase 1: HL=0 → writes trailing zero pair
 cap_top_handler_pipe_1_de EQU $+1
         ld      hl, $0000
         push    hl
 cap_top_handler_pipe_1_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      hl, 0                           ; Phase 1: restore HL=0 invariant
+        ld      hl, (body_b_de)
 cap_top_handler_pipe_1_next EQU $+1
         jp      $0000
 
 cap_top_handler_pipe_2:
 cap_top_handler_pipe_2_target EQU $+1
         ld      sp, $0000
-        push    hl                              ; Phase 1: HL=0 → writes trailing zero pair
 cap_top_handler_pipe_2_de EQU $+1
         ld      hl, $0000
         push    hl
 cap_top_handler_pipe_2_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      hl, 0                           ; Phase 1: restore HL=0 invariant
+        ld      hl, (body_b_de)
 cap_top_handler_pipe_2_next EQU $+1
         jp      $0000
 
 cap_top_handler_pipe_3:                         ; Phase 3
 cap_top_handler_pipe_3_target EQU $+1
         ld      sp, $0000
-        push    hl                              ; HL=0 → writes trailing zero pair
 cap_top_handler_pipe_3_de EQU $+1
         ld      hl, $0000
         push    hl
 cap_top_handler_pipe_3_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      hl, 0                           ; restore HL=0 invariant
+        ld      hl, (body_b_de)
 cap_top_handler_pipe_3_next EQU $+1
         jp      $0000
 
 cap_bot_handler_pipe_0:
 cap_bot_handler_pipe_0_target EQU $+1
         ld      sp, $0000
-        push    hl                              ; Phase 1: HL=0 → writes trailing zero pair
 cap_bot_handler_pipe_0_de EQU $+1
         ld      hl, $0000
         push    hl
 cap_bot_handler_pipe_0_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      hl, 0                           ; Phase 1: restore HL=0 invariant
+        ld      hl, (body_b_de)
 cap_bot_handler_pipe_0_next EQU $+1
         jp      $0000
 
 cap_bot_handler_pipe_1:
 cap_bot_handler_pipe_1_target EQU $+1
         ld      sp, $0000
-        push    hl                              ; Phase 1: HL=0 → writes trailing zero pair
 cap_bot_handler_pipe_1_de EQU $+1
         ld      hl, $0000
         push    hl
 cap_bot_handler_pipe_1_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      hl, 0                           ; Phase 1: restore HL=0 invariant
+        ld      hl, (body_b_de)
 cap_bot_handler_pipe_1_next EQU $+1
         jp      $0000
 
 cap_bot_handler_pipe_2:
 cap_bot_handler_pipe_2_target EQU $+1
         ld      sp, $0000
-        push    hl                              ; Phase 1: HL=0 → writes trailing zero pair
 cap_bot_handler_pipe_2_de EQU $+1
         ld      hl, $0000
         push    hl
 cap_bot_handler_pipe_2_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      hl, 0                           ; Phase 1: restore HL=0 invariant
+        ld      hl, (body_b_de)
 cap_bot_handler_pipe_2_next EQU $+1
         jp      $0000
 
 cap_bot_handler_pipe_3:                         ; Phase 3
 cap_bot_handler_pipe_3_target EQU $+1
         ld      sp, $0000
-        push    hl                              ; HL=0 → writes trailing zero pair
 cap_bot_handler_pipe_3_de EQU $+1
         ld      hl, $0000
         push    hl
 cap_bot_handler_pipe_3_bc EQU $+1
         ld      hl, $0000
         push    hl
-        ld      hl, 0                           ; restore HL=0 invariant
+        ld      hl, (body_b_de)
 cap_bot_handler_pipe_3_next EQU $+1
         jp      $0000
 
@@ -3068,21 +3164,16 @@ cap_bot_next_imm_addrs:
 
 ;----------------------------------------------------------------
 ; redraw_pipes_v2: per-frame entry into the flat code-gen renderer.
-; Loads BC/DE with sky-A pre-shifted body bytes, BC'/DE' with sky-B,
-; then jumps to the generated program at PIPE_PROGRAM.
-;
-; Register convention inside PIPE_PROGRAM:
-;   BC  = M1_A << 8 | L_A      (body sky-A pair 1)
-;   DE  = R_A  << 8 | M2_A     (body sky-A pair 2)
-;   BC' = M1_B << 8 | L_B      (body sky-B pair 1)
-;   DE' = R_B  << 8 | M2_B     (body sky-B pair 2)
+; Stage 3 register convention (no EXX; dither by push-order in slot):
+;   BC  = M1 << 8 | L         (body bytes 0,1 — shared by A and B variants)
+;   DE  = R_A << 8 | M2_A     (body bytes 2,3 of variant A; pushed on A-rows)
+;   HL  = R_B << 8 | M2_B     (body bytes 2,3 of variant B; pushed on B-rows)
+; pipe_bitmap   layout: db L, M1, M2, R per phase.
+; pipe_bitmap_b layout: db L, M1, M2, R per phase. Bytes 0,1 (L,M1) match
+;   pipe_bitmap; only bytes 2,3 (M2,R) differ — verified across all 8 phases.
 ;----------------------------------------------------------------
 redraw_pipes_v2:
-        ; Phase 5: deferred_configure / pending_regen removed. Recycle is now
-        ; O(1) via do_swap. redraw_pipes_v2 is now pure: loads BC/DE/BC'/DE'
-        ; from pre-computed body bytes then calls PIPE_PROGRAM.
-
-        ; --- Sky-A pair into BC/DE ---
+        ; --- Shared bytes 0,1 → BC; variant A bytes 2,3 → DE ---
         ld      a, (phase)
         add     a, a
         add     a, a                    ; phase * 4
@@ -3090,52 +3181,41 @@ redraw_pipes_v2:
         ld      b, 0
         ld      hl, pipe_bitmap
         add     hl, bc
-        ld      c, (hl)
+        ld      c, (hl)                 ; C = L
         inc     hl
-        ld      b, (hl)
+        ld      b, (hl)                 ; B = M1   → BC = M1<<8 | L
         inc     hl
-        ld      e, (hl)
+        ld      e, (hl)                 ; E = M2_A
         inc     hl
-        ld      d, (hl)
-        ld      (body_a_bc), bc
+        ld      d, (hl)                 ; D = R_A  → DE = R_A<<8 | M2_A
+        ld      (body_a_bc), bc         ; shared L,M1 pair (kept for diag/cap update use)
         ld      (body_a_de), de
-        ; --- Sky-B pair into BC'/DE' ---
-        exx
+
+        ; --- Variant B bytes 2,3 → (body_b_de) scratch (also into HL below) ---
         ld      a, (phase)
         add     a, a
-        add     a, a
-        ld      c, a
-        ld      b, 0
-        ld      hl, pipe_bitmap_b
+        add     a, a                    ; phase * 4
+        ld      l, a
+        ld      h, 0
+        push    bc                      ; preserve BC (shared L/M1) across the load
+        ld      bc, pipe_bitmap_b
         add     hl, bc
-        ld      c, (hl)
         inc     hl
-        ld      b, (hl)
+        inc     hl                      ; HL → pipe_bitmap_b[phase*4 + 2]
+        ld      e, (hl)                 ; E = M2_B
         inc     hl
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        ld      (body_b_bc), bc
-        ld      (body_b_de), de
-        exx
-        ; (update_cap_imm_v2 moved to main_loop's CYAN region — pre-computes
-        ; cap byte imms for NEXT frame's PIPE_PROGRAM. Saves ~2 k T from
-        ; pre-PP block so PP starts BEFORE raster reaches pixel area.)
+        ld      d, (hl)                 ; D = R_B
+        ld      (body_b_de), de         ; cap handler restores HL from here
+        pop     bc                      ; BC = shared L/M1 again
+        ld      h, d
+        ld      l, e                    ; HL = R_B<<8 | M2_B (B-row push pair)
+        ld      de, (body_a_de)         ; restore DE = R_A<<8 | M2_A (A-row push pair clobbered above)
 
+        ; --- Enter PIPE_PROGRAM ---
+        ; No EXX, no per-row dither setup. BC/DE/HL hold the three push pairs;
+        ; A-rows execute `push de + push bc`, B-rows execute `push hl + push bc`.
         ld      a, 3                    ; MAGENTA = PIPE_PROGRAM
         out     ($fe), a
-        ; PIPE_PROGRAM has a leading EXX at every row to alternate A/B variants.
-        ; Enter with main = B-pattern, shadow = A-pattern; row 0's EXX swaps to A.
-        ld      bc, (body_a_bc)
-        ld      de, (body_a_de)
-        exx                                   ; A → shadow
-        ld      bc, (body_b_bc)
-        ld      de, (body_b_de)               ; B → main
-        ; Save SP for the slot grid's epilogue (ld sp,(saved_sp); ret) to restore.
-        ld      hl, 0                   ; Phase 1: trailing-zero pair — main bank HL = 0
-        exx
-        ld      hl, 0                   ; Phase 1: trailing-zero pair — shadow bank HL = 0
-        exx                             ; back to main (B-pattern active)
         ld      (saved_sp), sp
         call    PIPE_PROGRAM
         ret
