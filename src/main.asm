@@ -2089,15 +2089,23 @@ prep_step:
         ; phase 7 = done
         ret
 
-; ─── Phase 0: body rows [0 .. cap_top_row-1], 10 rows/call ───────────────────
+; ─── Phase 0: body rows [0 .. 8*K_top - 1], 10 rows/call ────────────────────
 ; Target = line_table[row]+34 (= byte_x=29 buffer col, invisible writes).
 ; After swap, active pipe's body slots already point at byte_x=29 → no
 ; body-target-write needed in do_swap.
+;
+; Stage 4 cleanup: stamp ONLY the pure-body bands above K_top (bands 0..K_top-1
+; = 8*K_top rows). The 7 cap-edge body rows in K_top (band-rows 0..6) are
+; emitted later by ps_phase6's cps_emit_body_bands → emit_capedge_band — no
+; need to stamp them here just to be overwritten.
+;
+; Since gap_y is always a multiple of 8, cap_top_row = gap_y - 1 = 8*K_top + 7,
+; so 8*K_top = gap_y - 8. When gap_y = 8 the count is 0 and we advance.
 ps_phase0:
-        ; cap_top_row = prep_gap_y - 1
+        ; 8 * K_top = prep_gap_y - 8
         ld      a, (prep_gap_y)
-        dec     a                               ; A = cap_top_row
-        ld      b, a                            ; B = cap_top_row
+        sub     8                               ; A = 8 * K_top (count)
+        ld      b, a                            ; B = total rows to stamp
         ld      a, (prep_row)
         ld      c, a                            ; C = current prep_row
         ld      a, b
@@ -2167,8 +2175,19 @@ ps_phase0:
         ld      (prep_phase), a
         ret
 
-; ─── Phase 1: NOP-fill cap range [cap_top_row..cap_bot_row], 10 rows/call ────
-; prep_row = 0..49 (offset within 50-row cap block)
+; ─── Phase 1: JR-skip stamp cap range [cap_top_row..cap_bot_row], 10 rows/call ─
+; prep_row = 0..49 (offset within 50-row cap block).
+;
+; Stage 4 cleanup: stamp `$18 $03 0 0 0` per row instead of 5 NOPs. The JR
+; stub costs 12T taken vs the 5-NOP fall-through at 20T (5*4); the bigger
+; win is that the band can race through its 8 row-slots as 8 × 12T = 96T
+; instead of NOP-sliding 68 zero bytes (~272T) before the trailer.
+;
+; The K_top and K_bot cap rows are stamped here too, but ps_phase6's
+; cps_emit_body_bands later overwrites those bands entirely (positions +0..
+; +48/+49) with the IX-walk cap-edge form, so the JR stubs at K_top's
+; band_row 7 (+35) and K_bot's band_row 0 (+0) are clobbered. Only the
+; 6 pure-skip bands (K_top+1..K_bot-1) keep the JR stubs into gameplay.
 ps_phase1:
         ld      a, (prep_row)
         ld      c, a                            ; C = prep_row (offset in cap block)
@@ -2192,17 +2211,18 @@ ps_phase1:
         ld      a, (ps_row_cursor)
         call    ps_slot_addr_for_row            ; HL = slot[row][pipe]
         pop     bc                              ; restore B
-        ; Stage 3: 5-byte slot, no leading EXX. NOP-fill all 5 bytes.
+        ; Stage 4 cleanup: stamp 5-byte JR-skip stub: $18 $03 0 0 0.
+        ; JR e=3 from PC+2 lands on the next slot's first byte.
+        ld      (hl), $18                       ; opcode: JR e
+        inc     hl
+        ld      (hl), $03                       ; displacement: +3 → next slot
+        inc     hl
         xor     a
-        ld      (hl), a                         ; NOP byte 0
+        ld      (hl), a                         ; pad byte 2
         inc     hl
-        ld      (hl), a                         ; NOP byte 1
+        ld      (hl), a                         ; pad byte 3
         inc     hl
-        ld      (hl), a                         ; NOP byte 2
-        inc     hl
-        ld      (hl), a                         ; NOP byte 3
-        inc     hl
-        ld      (hl), a                         ; NOP byte 4
+        ld      (hl), a                         ; pad byte 4
         ld      a, (ps_row_cursor)
         inc     a
         ld      (ps_row_cursor), a
@@ -2220,15 +2240,20 @@ ps_phase1:
         ld      (prep_phase), a
         ret
 
-; ─── Phase 2: body rows [cap_bot_row+1..159], 10 rows/call ───────────────────
-; prep_row = 0..M-1 where M = 111 - prep_gap_y
+; ─── Phase 2: body rows [cap_bot_row+8..159], 10 rows/call ───────────────────
+; prep_row = 0..M-1 where M = 104 - prep_gap_y
 ; Target = line_table[actual_row]+34 (= byte_x=29 buffer col, invisible).
+;
+; Stage 4 cleanup: skip K_bot's 7 cap-edge body rows (band-rows 1..7) — they
+; are emitted by ps_phase6's emit_capedge_band. Start at cap_bot_row + 8
+; = 8*(K_bot+1), which is the first pure-body band below the K_bot cap-edge.
+; New count = 152 - cap_bot_row = 104 - prep_gap_y (was 111 - prep_gap_y).
 ps_phase2:
-        ; total M = 111 - prep_gap_y
+        ; total M = 104 - prep_gap_y
         ld      a, (prep_gap_y)
         ld      c, a
-        ld      a, 111
-        sub     c                               ; A = M (total rows in band2)
+        ld      a, 104
+        sub     c                               ; A = M (total pure-body rows below K_bot)
         ld      b, a                            ; B = M
         ld      a, (prep_row)
         ld      c, a                            ; C = prep_row
@@ -2242,9 +2267,9 @@ ps_phase2:
 .p2_rows_set:
         ld      (ps_count), a
         ld      b, a                            ; B = loop counter
-        ; actual row = cap_bot_row + 1 + prep_row = (prep_gap_y + PIPE_GAP + 1) + C
+        ; actual row = cap_bot_row + 8 + prep_row = (prep_gap_y + PIPE_GAP + 8) + C
         ld      a, (prep_gap_y)
-        add     a, PIPE_GAP + 1                 ; A = cap_bot_row + 1
+        add     a, PIPE_GAP + 8                 ; A = cap_bot_row + 8 = 8*(K_bot+1)
         add     a, c                            ; A += prep_row; A = actual_row
         ld      (ps_row_cursor), a
 .p2_lp:
