@@ -147,6 +147,16 @@ main_loop:
         di
         ld      a, 2                    ; PROFILE: RED = top blanking
         out     ($fe), a
+        ; Deferred-from-last-frame: zero the columns each active pipe vacated.
+        ; Runs HERE (top blanking) so the writes complete before the raster
+        ; reaches row 0 — no beam race, no R-col flicker on wrap frames.
+        ld      a, (clear_pending)
+        or      a
+        jr      z, .no_clear_pending
+        xor     a
+        ld      (clear_pending), a
+        call    clear_vacated_columns
+.no_clear_pending:
         xor     a
         ld      (sound_heavy_frame), a
         ; Classify this frame → per-frame sound budget. Build frames
@@ -304,6 +314,7 @@ sfx_chime:
 
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
 wrap_pending:  db 0                      ; set when a wrap happened this frame
+clear_pending: db 0                      ; set when clear_vacated_columns must run in next frame's vblank
 ; Phase 5: pending_regen, recycled_pipe_idx and patch_pending removed.
 prep_pipe_idx:   db 3                  ; Phase 3: pipe 3 starts as the preparing column
 ; Phase 4: incremental-prepare state machine variables.
@@ -2989,11 +3000,12 @@ wrap_byte_x:
         inc     iy
         inc     iy
         djnz    .outer
-        ; Stage 3: zero the column each active pipe just vacated (replaces the
-        ; per-slot trailing-zero clear). Must run BEFORE patch_pipe_targets
-        ; (which only walks active sublists — independent ordering, but doing
-        ; the clear first keeps the wrap path's read of pipe_state consistent).
-        call    clear_vacated_columns
+        ; Defer the vacated-column clear to NEXT frame's vblank — running it
+        ; here (in the WHITE band) races the raster and would erase the OLD
+        ; pipe's R col on the rows the beam hasn't reached yet, flickering
+        ; the pipe's right edge every wrap frame. Just flag it.
+        ld      a, 1
+        ld      (clear_pending), a
         ; Run patch_pipe_targets so NEXT frame's PIPE_PROGRAM renders at NEW byte_x.
         call    patch_pipe_targets
         ret
