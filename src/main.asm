@@ -54,7 +54,7 @@ SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no 
 ; Each busy-wait iter is `dec de ; ld a,d ; or e ; jr nz` = 26 T taken.
 ; Tune empirically with tools/snadump.py border R-delta variance.
 WBX_PAD_ITERS     EQU 60                  ; ~1560 T pad — matches wrap_byte_x cost on wrap frame
-WRAP_PAD_ITERS    EQU 385                 ; ~10010 T pad — matches apply+restore+clear cost
+WRAP_PAD_ITERS    EQU 320                 ; ~8320 T pad — matches apply+restore+clear cost (after Stage 6 clear optimisation)
 ; Yellow-region constant-budget pads. Target total YELLOW work ≈ 3500 T
 ; (matches the rebuild_step finalize path which can't be made cheaper).
 REBUILD_IDLE_PAD_ITERS     EQU 130        ; ~3380 T — idle path (no rebuild)
@@ -259,6 +259,7 @@ main_loop:
         ; Constant-budget YELLOW: every frame pads to the same total cost
         ; (matching the worst-case finalize frame, ~3.4 k T) regardless of
         ; which rebuild_step path runs. Three converge points, three pad sizes.
+        call    write_jrskip_step               ; amortised dep-column NOP-fill (no-op when idle)
         ld      a, (do_swap_fired)
         or      a
         jr      nz, .swap_frame_skip
@@ -308,24 +309,16 @@ main_loop:
         or      e
         jr      nz, .sfp
 .post_prep_step:
-        ; Wrap-frame screen/attr work — gated by wrap_pending. On non-wrap
-        ; frames, busy-wait the same T-states the wrap work would have cost,
-        ; so every frame spends identical time here and the BLACK PROFILE_OUT
-        ; lands at the same scanline → steady border (no flashing).
-        ld      a, (wrap_pending)
-        or      a
-        jr      nz, .ppw_do
-        ; Pad non-wrap frame: ~10k T busy-wait.
-        ld      de, WRAP_PAD_ITERS
-.ppw_pad:
-        dec     de
-        ld      a, d
-        or      e
-        jr      nz, .ppw_pad
-        jr      .no_wrap_pending
-.ppw_do:
+        ; Constant-budget tail: apply/restore/clear ALWAYS run, on wrap AND
+        ; non-wrap frames. On non-wrap, byte_x hasn't changed since the last
+        ; wrap, so:
+        ;   - apply paints ATTR_PIPE at the same cells (idempotent overwrite)
+        ;   - restore writes ATTR_SKY at byte_x+2 col (already sky, harmless)
+        ;   - clear writes 0 at byte_x+3 col (already sky, harmless)
+        ; Cost ~14 k T per frame regardless of wrap-pending state → constant
+        ; BLACK position → no visible border flashing.
         xor     a
-        ld      (wrap_pending), a
+        ld      (wrap_pending), a               ; consume flag (was set by advance_phase on wraps)
         call    apply_pipe_attrs_wrap
         call    restore_trailing_pipe_attrs
         call    clear_vacated_columns
@@ -1565,16 +1558,8 @@ cps_emit_capedge:
         ld      (de), a
         inc     de
 
-        ; --- entries 2..7: 6 × scroll_sink dummies ---
-        ld      b, 6
-.cec_dummy:
-        ld      a, low scroll_sink
-        ld      (de), a
-        inc     de
-        ld      a, high scroll_sink
-        ld      (de), a
-        inc     de
-        djnz    .cec_dummy
+        ; Dummies eliminated — patch_pipe_targets walks the list to a
+        ; $0000 sentinel emitted at the end by cps_build_active_list.
         ret
 
 ;----------------------------------------------------------------
@@ -1736,23 +1721,21 @@ cps_build_active_list:
         inc     hl
         ld      (hl), d
         inc     hl
-        ld      b, 7
-.cbal_dummy:
-        ld      (hl), low scroll_sink
-        inc     hl
-        ld      (hl), high scroll_sink
-        inc     hl
-        djnz    .cbal_dummy
         ex      de, hl                          ; DE = cursor advanced
         jr      .cbal_next
 .cbal_capedge:
-        call    cps_emit_capedge                ; 8 entries, advances DE
+        call    cps_emit_capedge                ; 2 real entries, advances DE
 .cbal_next:
         ld      a, (cps_k)
         inc     a
         ld      (cps_k), a
         cp      20
         jr      nz, .cbal_lp
+        ; Emit $0000 sentinel — patch_pipe_targets walks until pop hl yields 0.
+        xor     a
+        ld      (de), a
+        inc     de
+        ld      (de), a
         ret
 
 ;----------------------------------------------------------------
@@ -1782,10 +1765,12 @@ shift_pipe_targets:
         ld      d, (hl)
         push    de
         pop     ix                              ; IX = sublist cursor
-        ld      b, 112                          ; 112 entries per pipe
 .spt_lp:
         ld      l, (ix+0)
-        ld      h, (ix+1)                       ; HL = target imm addr
+        ld      h, (ix+1)                       ; HL = target imm addr (sentinel = $0000)
+        ld      a, h
+        or      l
+        ret     z                               ; reached sentinel
         ld      a, (hl)
         sub     c                               ; (HL) -= C
         ld      (hl), a
@@ -1795,8 +1780,7 @@ shift_pipe_targets:
 .spt_no_borrow:
         inc     ix
         inc     ix
-        djnz    .spt_lp
-        ret
+        jr      .spt_lp
 
 ; ── Scratch variables for configure_pipe_slots ───────────────────
 cps_pipe:               db 0
@@ -1826,6 +1810,7 @@ cps_sublist_base_table:
 ; targets[row] = line_table[row] + 34 (= byte_x=29 + 5). Populated at init.
 ; Used by configure_pipe_slots body emit to skip the line_table+byte_x add.
 screen_target_table_29: ds 320, 0       ; 160 entries × 2 bytes
+band_first_addr:        ds 40,  0       ; 20 entries × 2 bytes: line_table[8K] for K=0..19
 
 ;----------------------------------------------------------------
 ; init_background: zero bg_buffer (all-sky) then blit to screen pixels.
@@ -1863,6 +1848,30 @@ init_screen_target_table:
         inc     hl
         inc     de
         djnz    .istt_lp
+        ; Stage 6: populate band_first_addr[20] = line_table[8K] for K=0..19.
+        ; clear_vacated_columns walks this table — saves ~6 k T per wrap by
+        ; eliminating the per-band line_table recompute (~150 T → ~50 T).
+        ld      hl, line_table
+        ld      de, band_first_addr
+        ld      b, 20
+.bfa_lp:
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ; advance HL past 7 more line_table entries (= +14 bytes) to reach
+        ; line_table[8(K+1)] for next iteration.
+        ld      a, l
+        add     a, 14
+        ld      l, a
+        jr      nc, .bfa_nc
+        inc     h
+.bfa_nc:
+        djnz    .bfa_lp
         ret
 
 ;----------------------------------------------------------------
@@ -2029,7 +2038,14 @@ build_slot_templates:
 ; Clobbers: AF, BC, DE, HL.
 ;----------------------------------------------------------------
 write_jrskip_column:
-        ; HL = band base for (K=0, pipe) = SLOT_GRID_BASE + pipe*80.
+        ; Init-time path: do all 20 bands in one go. Used by init_pipes for
+        ; the parked prep pipe (init has plenty of time). do_swap takes the
+        ; amortised path via write_jrskip_arm + write_jrskip_step.
+        call    .jrskip_addr_for_pipe           ; HL = band base (K=0, pipe)
+        ld      b, 20
+        jr      .wjc_band
+.jrskip_addr_for_pipe:
+        ; In: A = pipe index. Out: HL = SLOT_GRID_BASE + pipe*80.
         ld      l, a
         ld      h, 0
         add     hl, hl                          ; pipe*2
@@ -2043,7 +2059,7 @@ write_jrskip_column:
         add     hl, de                          ; pipe*80
         ld      de, SLOT_GRID_BASE
         add     hl, de                          ; HL = band base (K=0, pipe)
-        ld      b, 20                           ; 20 bands
+        ret
 .wjc_band:
         push    bc
         push    hl                              ; save band base
@@ -2060,6 +2076,68 @@ write_jrskip_column:
         pop     bc
         djnz    .wjc_band
         ret
+
+;----------------------------------------------------------------
+; Amortised jrskip: do_swap can't pay ~15-30 k T to NOP-fill 20 bands
+; in one frame (pushes wrap+swap frame past 70 k → 25 Hz drop). Instead,
+; do_swap calls write_jrskip_arm to record (pipe, 20 bands remaining,
+; band base), and main_loop calls write_jrskip_step once per frame to
+; clear JRSKIP_BANDS_PER_FRAME bands until done. The dep column's stale
+; body slots execute during the transition, but they wrote to col 0
+; (buffer, invisible) just before the swap and stay safe until cleared.
+;
+; State:
+;   jrskip_pending      0 = idle; >0 = bands remaining (1..20)
+;   jrskip_band_base    band base HL of the NEXT band to NOP-fill
+;----------------------------------------------------------------
+JRSKIP_BANDS_PER_FRAME EQU 2    ; 2 bands × ~1.5 k T = ~3 k T per frame; 10 frames to finish
+
+write_jrskip_arm:
+        ; In: A = pipe index. Arms the amortised driver.
+        push    af
+        call    write_jrskip_column.jrskip_addr_for_pipe
+        ld      (jrskip_band_base), hl
+        ld      a, 20
+        ld      (jrskip_pending), a
+        pop     af
+        ret
+
+write_jrskip_step:
+        ld      a, (jrskip_pending)
+        or      a
+        ret     z
+        ; B = min(JRSKIP_BANDS_PER_FRAME, jrskip_pending)
+        cp      JRSKIP_BANDS_PER_FRAME
+        jr      nc, .step_full
+        ld      b, a
+        xor     a
+        ld      (jrskip_pending), a
+        jr      .step_run
+.step_full:
+        sub     JRSKIP_BANDS_PER_FRAME
+        ld      (jrskip_pending), a
+        ld      b, JRSKIP_BANDS_PER_FRAME
+.step_run:
+        ld      hl, (jrskip_band_base)
+.step_band:
+        push    bc
+        push    hl
+        ld      (hl), 0
+        ld      d, h
+        ld      e, l
+        inc     de
+        ld      bc, BAND_TRAILER_OFFSET - 1
+        ldir
+        pop     hl
+        ld      de, 4 * BAND_STRIDE
+        add     hl, de
+        pop     bc
+        djnz    .step_band
+        ld      (jrskip_band_base), hl
+        ret
+
+jrskip_pending:   db 0
+jrskip_band_base: dw 0
 
 ;----------------------------------------------------------------
 init_pipes:
@@ -3266,14 +3344,14 @@ draw_ground:
 
 ;----------------------------------------------------------------
 patch_pipe_targets:
-        ; SP-hijack 4-way unrolled walker. Reads entry addresses via pop hl
-        ; (10T) which is faster than ld e,(hl); inc hl; ld d,(hl); inc hl (26T).
-        ; Each entry's 16-bit target decrement uses the borrow-check fast path
-        ; (~33T avg per entry vs 88T basic version).
+        ; SP-hijack walker. Each entry's 16-bit target lo-byte is decremented;
+        ; on borrow, the hi-byte is also decremented. Iterates per pipe until
+        ; a $0000 sentinel terminates the pipe's sublist.
         ;
-        ; Phase 5: always uses the 4-pipe skip path (always skips prep_pipe_idx).
-        ; 4 pipes × 112 entries each. Active = 3 pipes × 112 = 336 entries total.
-        ; Each pipe block: 28 djnz iters × 4 entries = 112 entries.
+        ; Stage 6: dummy entries (7 per body band, 6 per cap-edge) eliminated.
+        ; Per pipe ~20 real entries; sentinel walk costs ~1 k T per pipe vs
+        ; the old 4.6 k T (112 entries, 4-way unrolled). Saves ~10 k T per
+        ; wrap frame — the dominant wrap-frame variance source.
         ld      (saved_sp_inner), sp
         ld      a, (prep_pipe_idx)              ; Phase 5: skip prep pipe, not recycled pipe
 
@@ -3284,176 +3362,84 @@ patch_pipe_targets:
         or      a                               ; activate_pipe_idx == 0?
         jr      z, .pt_done_p0
         ld      sp, ACTIVE_PIPE_0
-        ld      b, 28                           ; 112 / 4
 .pt_lp_p0:
         pop     hl
+        ld      a, h
+        or      l
+        jr      z, .pt_done_p0
         ld      a, (hl)
         sub     1
         ld      (hl), a
-        jr      nc, .pt_p0_nc1
+        jr      nc, .pt_lp_p0
         inc     hl
         dec     (hl)
-.pt_p0_nc1:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p0_nc2
-        inc     hl
-        dec     (hl)
-.pt_p0_nc2:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p0_nc3
-        inc     hl
-        dec     (hl)
-.pt_p0_nc3:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p0_nc4
-        inc     hl
-        dec     (hl)
-.pt_p0_nc4:
-        djnz    .pt_lp_p0
+        jr      .pt_lp_p0
 .pt_done_p0:
 
         ; Pipe 1
         ld      a, (prep_pipe_idx)
-        cp      1                               ; prep_pipe_idx == 1?
+        cp      1
         jr      z, .pt_done_p1
-        ld      a, (activate_pipe_idx)          ; freeze activating pipe (255 when idle)
-        cp      1                               ; activate_pipe_idx == 1?
+        ld      a, (activate_pipe_idx)
+        cp      1
         jr      z, .pt_done_p1
         ld      sp, ACTIVE_PIPE_1
-        ld      b, 28
 .pt_lp_p1:
         pop     hl
+        ld      a, h
+        or      l
+        jr      z, .pt_done_p1
         ld      a, (hl)
         sub     1
         ld      (hl), a
-        jr      nc, .pt_p1_nc1
+        jr      nc, .pt_lp_p1
         inc     hl
         dec     (hl)
-.pt_p1_nc1:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p1_nc2
-        inc     hl
-        dec     (hl)
-.pt_p1_nc2:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p1_nc3
-        inc     hl
-        dec     (hl)
-.pt_p1_nc3:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p1_nc4
-        inc     hl
-        dec     (hl)
-.pt_p1_nc4:
-        djnz    .pt_lp_p1
+        jr      .pt_lp_p1
 .pt_done_p1:
 
         ; Pipe 2
         ld      a, (prep_pipe_idx)
-        cp      2                               ; prep_pipe_idx == 2?
+        cp      2
         jr      z, .pt_done_p2
-        ld      a, (activate_pipe_idx)          ; freeze activating pipe (255 when idle)
-        cp      2                               ; activate_pipe_idx == 2?
+        ld      a, (activate_pipe_idx)
+        cp      2
         jr      z, .pt_done_p2
         ld      sp, ACTIVE_PIPE_2
-        ld      b, 28
 .pt_lp_p2:
         pop     hl
+        ld      a, h
+        or      l
+        jr      z, .pt_done_p2
         ld      a, (hl)
         sub     1
         ld      (hl), a
-        jr      nc, .pt_p2_nc1
+        jr      nc, .pt_lp_p2
         inc     hl
         dec     (hl)
-.pt_p2_nc1:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p2_nc2
-        inc     hl
-        dec     (hl)
-.pt_p2_nc2:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p2_nc3
-        inc     hl
-        dec     (hl)
-.pt_p2_nc3:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p2_nc4
-        inc     hl
-        dec     (hl)
-.pt_p2_nc4:
-        djnz    .pt_lp_p2
+        jr      .pt_lp_p2
 .pt_done_p2:
 
-        ; Pipe 3 (Phase 5: newly active after swap; skipped when prep_pipe_idx == 3)
+        ; Pipe 3
         ld      a, (prep_pipe_idx)
-        cp      3                               ; prep_pipe_idx == 3?
+        cp      3
         jr      z, .pt_done_p3
-        ld      a, (activate_pipe_idx)          ; freeze activating pipe (255 when idle)
-        cp      3                               ; activate_pipe_idx == 3?
+        ld      a, (activate_pipe_idx)
+        cp      3
         jr      z, .pt_done_p3
         ld      sp, ACTIVE_PIPE_3
-        ld      b, 28
 .pt_lp_p3:
         pop     hl
+        ld      a, h
+        or      l
+        jr      z, .pt_done_p3
         ld      a, (hl)
         sub     1
         ld      (hl), a
-        jr      nc, .pt_p3_nc1
+        jr      nc, .pt_lp_p3
         inc     hl
         dec     (hl)
-.pt_p3_nc1:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p3_nc2
-        inc     hl
-        dec     (hl)
-.pt_p3_nc2:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p3_nc3
-        inc     hl
-        dec     (hl)
-.pt_p3_nc3:
-        pop     hl
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_p3_nc4
-        inc     hl
-        dec     (hl)
-.pt_p3_nc4:
-        djnz    .pt_lp_p3
+        jr      .pt_lp_p3
 .pt_done_p3:
 
         ld      sp, (saved_sp_inner)
@@ -3560,52 +3546,35 @@ clear_vacated_columns:
         cp      4                               ; in buffer cols 0..3 — also harmless to skip
         jr      c, .cvc_skip
         ld      (cvc_col), a
-        ; Walk 20 bands × 8 rows of single-byte clears.
-        ; Each band: HL = line_table[8K] + col; then 8 × (ld (hl),0 ; inc h).
-        ld      a, 0                            ; A = K = band index
-        ld      (cvc_k), a
+        ; Stage 6: walk band_first_addr[] via IY (precomputed band base addrs)
+        ; instead of recomputing line_table[8K] per band. Per-band setup is now
+        ; ~50 T (table read + col add) vs ~150 T (line_table recompute), saving
+        ; ~6 k T per wrap frame across 3 pipes × 20 bands.
+        push    bc                              ; save outer NUM_PIPES counter
+        ld      iy, band_first_addr
+        ld      b, 20                           ; inner band counter
 .cvc_band:
-        ld      a, (cvc_k)
-        add     a, a                            ; K*2
-        add     a, a                            ; K*4
-        add     a, a                            ; K*8 = first screen row of band
-        ld      l, a
-        ld      h, 0
-        add     hl, hl                          ; row*2 (line_table is 2 B/entry)
-        ld      de, line_table
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = line_addr[8K]
+        ld      l, (iy+0)
+        ld      h, (iy+1)                       ; HL = line_table[8K]
         ld      a, (cvc_col)
-        add     a, e
+        add     a, l
         ld      l, a
-        ld      a, d
-        adc     a, 0
-        ld      h, a                            ; HL = screen byte at (8K, col)
+        jr      nc, .cvc_no_carry
+        inc     h
+.cvc_no_carry:
         xor     a
-        ; 8 single-byte clears, walking +256 (inc h) per pixel row in the cell.
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
         ld      (hl), a
-        inc     h
-        ld      (hl), a
-        inc     h
-        ld      (hl), a
-        inc     h
-        ld      (hl), a
-        inc     h
-        ld      (hl), a
-        inc     h
-        ld      (hl), a
-        inc     h
-        ld      (hl), a
-        inc     h
-        ld      (hl), a
-        ; Advance K
-        ld      a, (cvc_k)
-        inc     a
-        ld      (cvc_k), a
-        cp      20
-        jr      nz, .cvc_band
+        inc     iy
+        inc     iy
+        djnz    .cvc_band
+        pop     bc                              ; restore outer NUM_PIPES counter
 .cvc_skip:
         inc     iy
         inc     iy
@@ -3697,7 +3666,7 @@ do_swap:
         ;    live state in those registers at this point (ds_* scratch is in
         ;    memory; HL' is untouched). Nothing to preserve.
         ld      a, (ds_dep)
-        call    write_jrskip_column
+        call    write_jrskip_arm                ; amortised — main_loop drives the chunks
 
         ; 7. Update prep_pipe_idx, reset prep state, trigger post-swap build.
         ld      a, (ds_dep)
