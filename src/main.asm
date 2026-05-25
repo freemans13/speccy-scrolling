@@ -244,15 +244,6 @@ main_loop:
         ld      (wrap_pending), a
         call    apply_pipe_attrs_wrap
         call    restore_trailing_pipe_attrs
-        ; Deterministic ~6.5k T wait so clear_vacated_columns starts late
-        ; enough that it always writes each row AFTER the raster has
-        ; already read it — see [[wrap-clear-beam-race]].
-        ld      bc, 250                 ; 250 * 26T ≈ 6.5k T
-.cvc_wait:
-        dec     bc
-        ld      a, b
-        or      c
-        jr      nz, .cvc_wait
         call    clear_vacated_columns
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
