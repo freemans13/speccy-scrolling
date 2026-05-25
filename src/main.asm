@@ -192,36 +192,29 @@ main_loop:
         call    update_cap_imm_v2
         ld      a, 6                    ; PROFILE: YELLOW = column build
         out     ($fe), a
-        ; Amortized column build. do_swap sets activate_pipe_idx to the
-        ; just-activated pipe and do_swap_fired=1. The swap frame itself skips
-        ; the build (do_swap_fired); subsequent frames run up to 6 prep_step
-        ; chunks each, spreading the ~20k build over ~3 frames — small enough
-        ; per frame to stay under budget, short enough total (~3 frames <
-        ; one 4-frame wrap) that pipe spacing is not disturbed. ps_phase6
-        ; sets activate_pipe_idx=255 when the build completes.
+        ; Stage 5: band-granular amortised pipe-recycle driver.
+        ; do_swap sets activate_pipe_idx + resets rebuild_band_cursor=0; the
+        ; rebuild_step routine emits ONE band per call (~400 T) until cursor
+        ; reaches 20, then runs a one-shot finalize (active list + cap arm +
+        ; cap target/_next imms) and clears activate_pipe_idx back to 255.
+        ; do_swap_fired still suppresses the very first call so the swap
+        ; frame itself bears no extra rebuild cost.
         ld      a, (do_swap_fired)
         or      a
         jr      nz, .swap_frame_skip
-        ; Wrap frames carry ~10k T of apply_pipe_attrs_wrap +
-        ; restore_trailing_pipe_attrs + clear_vacated_columns in the tail
-        ; (post_prep_step). A build frame is already ~67k T, so adding
-        ; both = ~77k → halt missed → 25Hz drop. Yield prep_step budget on
-        ; wrap frames; the other 3 frames per cycle still do 6 iterations,
-        ; so total build throughput is unchanged.
-        ld      a, (wrap_pending)
-        or      a
-        jr      nz, .post_prep_step
-        ld      b, 6                            ; max prep_step chunks this frame
-.build_loop:
         ld      a, (activate_pipe_idx)
         cp      255
-        jr      z, .post_prep_step              ; idle, or build just finished
+        jr      z, .post_prep_step              ; idle
         ld      a, 1
         ld      (sound_heavy_frame), a
-        push    bc
-        call    prep_step
-        pop     bc
-        djnz    .build_loop
+        ; 2 bands per frame. Each band emit is ~400 T, finalize is ~3 k T.
+        ; Worst single-frame extra cost: 1 band (~400 T) + finalize (~3 k T).
+        ; Total rebuild fits in ~11 frames; parked window is ~112 frames.
+        call    rebuild_step
+        ld      a, (activate_pipe_idx)
+        cp      255
+        jr      z, .post_prep_step              ; just finalized
+        call    rebuild_step
         jr      .post_prep_step
 .swap_frame_skip:
         xor     a
@@ -351,6 +344,16 @@ prep_gap_y:      db 8
 ; Pipe whose column prep_step is currently building post-swap.
 ; 255 = no build in progress (prep_step is idle).
 activate_pipe_idx: db 255
+
+; Stage 5: band-granular amortised rebuild driver state.
+; rebuild_band_cursor — 0..20 = which band K to rebuild next; 20 = ready for finalize.
+;                       21 = finalize done (idle); also signified by activate_pipe_idx=255.
+; rebuild_k_top / rebuild_k_bot — K_top / K_bot for the pipe being rebuilt, captured at
+;                                 do_swap time so the per-frame driver can dispatch
+;                                 cheaply per band.
+rebuild_band_cursor: db 21
+rebuild_k_top:       db 0
+rebuild_k_bot:       db 0
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
@@ -2641,6 +2644,387 @@ ps_phase6:
 
 ps_p6_pipe6: db 0                              ; prep_pipe_idx * 6 scratch for phase 6
 
+;----------------------------------------------------------------
+; rebuild_step — Stage 5 band-granular amortised pipe-recycle driver.
+;
+; Called from main_loop in place of prep_step. Replaces the
+; ps_phase0..6 state machine with a per-band loop that emits one
+; band per call (~400 T) plus a one-shot finalize when all 20
+; bands are done. Eliminates the ~17 k T ps_phase6 spike.
+;
+; Invariant on entry:
+;   activate_pipe_idx ∈ {0..3}     ← pipe being rebuilt (parked at byte_x=29)
+;   prep_gap_y                     ← target gap_y for this pipe
+;   rebuild_band_cursor ∈ {0..21}  ← which band K next; 20 = run finalize; 21 = done
+;   rebuild_k_top, rebuild_k_bot   ← K bounds captured at do_swap
+;   All 20 bands of the column start as NOPs (do_swap calls write_jrskip_column).
+;
+; Per-call work:
+;   K  < K_top  or  K > K_bot   → emit pure-body band (~400 T)
+;   K == K_top  or  K == K_bot  → DEFERRED to finalize (see note below)
+;   K_top < K < K_bot           → skip band; column is already NOPed → no work.
+;   K == 20                     → finalize: emit the two cap-edge bands, build
+;                                 active list, arm cap-slot handler addrs,
+;                                 patch cap target/_next imms; set
+;                                 prep_phase=7 and activate_pipe_idx=255.
+;
+; Cap-edge bands MUST be deferred to finalize because emit_capedge_band stamps
+; `$C3 $00 $00` for the cap slot — JP to $0000 — until the handler address is
+; armed. If we stamped the cap-edge band early and PIPE_PROGRAM ran before
+; finalize, the cap slot would JP into ROM every frame: nondeterministic
+; clobber. Finalize emits both cap-edge bands AND arms their handler addresses
+; in the same call, so the $C3 is never live with a stale operand.
+;
+; Gating chain preserved unchanged:
+;   wrap_byte_x.swap_with_prep      guards on prep_phase == 7
+;   patch_pipe_targets              guards on activate_pipe_idx
+;   apply_pipe_attrs etc.           guards on prep_pipe_idx
+;
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+rebuild_step:
+        ld      a, (activate_pipe_idx)
+        inc     a                               ; 255 → 0
+        ret     z                               ; idle
+        ld      a, (rebuild_band_cursor)
+        cp      20
+        jr      z, .rs_finalize
+        jr      nc, .rs_done                    ; >20 = already finalized
+        ; ── Emit one band ────────────────────────────────────────
+        ; Publish cps_pipe + cps_k so cps_band_base works.
+        ld      b, a                            ; B = K (preserve across stores)
+        ld      a, (activate_pipe_idx)
+        ld      (cps_pipe), a
+        ld      a, b
+        ld      (cps_k), a
+        ; Dispatch on K vs rebuild_k_top / rebuild_k_bot.
+        ; Cap-edge bands (K==K_top, K==K_bot) are deferred to finalize so
+        ; their $C3 cap slot never executes a stale $0000 handler operand.
+        ld      hl, rebuild_k_top
+        cp      (hl)
+        jr      c, .rs_body                     ; K < K_top → body
+        jr      z, .rs_advance                  ; K == K_top → deferred
+        ld      hl, rebuild_k_bot
+        cp      (hl)
+        jr      z, .rs_advance                  ; K == K_bot → deferred
+        jr      c, .rs_advance                  ; K_top < K < K_bot → skip (NOPs)
+        ; K > K_bot → body
+.rs_body:
+        call    cps_band_base                   ; HL = grid band base
+        push    hl
+        ; DE = screen_target_table_29[8K] (entry 8K → byte offset 16K)
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K*16
+        ld      de, screen_target_table_29
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = screen base (byte_x=29)
+        pop     hl                              ; HL = grid band base
+        call    emit_body_band
+        jr      .rs_advance
+.rs_capedge_top:
+        call    cps_band_base
+        push    hl
+        ; DE = screen_target_table_29[8*K_top]
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K*16
+        ld      de, screen_target_table_29
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        pop     hl
+        xor     a                               ; flag = 0 → K_top
+        call    emit_capedge_band
+        jr      .rs_advance
+.rs_capedge_bot:
+        call    cps_band_base
+        push    hl
+        ; DE = screen_target_table_29[8*K_bot + 1] (band-row 1's address)
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K*16
+        ld      de, screen_target_table_29 + 2
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        pop     hl
+        ld      a, 1                            ; flag = 1 → K_bot
+        call    emit_capedge_band
+.rs_advance:
+        ld      a, (rebuild_band_cursor)
+        inc     a
+        ld      (rebuild_band_cursor), a
+        ret
+.rs_done:
+        ret
+
+; ── Finalize: arm caps, build active list, mark rebuild complete ──
+; Mirrors ps_phase6's tail, but does NOT call cps_emit_body_bands
+; (the per-frame loop above has already emitted every band).
+.rs_finalize:
+        ; Self-repair cap_*_target_imm_addrs (defensive — matches ps_phase6).
+        ld      hl, cap_top_handler_pipe_0_target
+        ld      (cap_top_target_imm_addrs), hl
+        ld      hl, cap_top_handler_pipe_1_target
+        ld      (cap_top_target_imm_addrs + 2), hl
+        ld      hl, cap_top_handler_pipe_2_target
+        ld      (cap_top_target_imm_addrs + 4), hl
+        ld      hl, cap_top_handler_pipe_3_target
+        ld      (cap_top_target_imm_addrs + 6), hl
+        ld      hl, cap_bot_handler_pipe_0_target
+        ld      (cap_bot_target_imm_addrs), hl
+        ld      hl, cap_bot_handler_pipe_1_target
+        ld      (cap_bot_target_imm_addrs + 2), hl
+        ld      hl, cap_bot_handler_pipe_2_target
+        ld      (cap_bot_target_imm_addrs + 4), hl
+        ld      hl, cap_bot_handler_pipe_3_target
+        ld      (cap_bot_target_imm_addrs + 6), hl
+
+        ; Publish cps_* state for the helpers below (cps_pipe, cps_cap_top_row,
+        ; cps_cap_bot_row, cps_k_top, cps_k_bot).
+        ld      a, (activate_pipe_idx)
+        ld      (cps_pipe), a
+        ld      a, (prep_gap_y)
+        dec     a
+        ld      (cps_cap_top_row), a
+        ld      a, (prep_gap_y)
+        add     a, PIPE_GAP
+        ld      (cps_cap_bot_row), a
+        ld      a, (rebuild_k_top)
+        ld      (cps_k_top), a
+        ld      a, (rebuild_k_bot)
+        ld      (cps_k_bot), a
+
+        ; Emit the two cap-edge bands here (deferred from rs_advance dispatch
+        ; — see header). The cap slot $C3 + $00 $00 operand they stamp is
+        ; immediately patched with the real handler address further down,
+        ; so the cap slot never executes a stale operand.
+        ; --- K_top cap-edge band ---
+        ld      a, (rebuild_k_top)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_top band base
+        push    hl
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K_top*16
+        ld      de, screen_target_table_29
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = screen base
+        pop     hl                              ; HL = K_top grid band base
+        xor     a                               ; flag = 0 → K_top
+        call    emit_capedge_band
+        ; --- K_bot cap-edge band ---
+        ld      a, (rebuild_k_bot)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_bot band base
+        push    hl
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K_bot*16
+        ld      de, screen_target_table_29 + 2  ; band-row 1 address
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = screen base for band-row 1
+        pop     hl                              ; HL = K_bot grid band base
+        ld      a, 1                            ; flag = 1 → K_bot
+        call    emit_capedge_band
+
+        ; Build active list (cps_build_active_list uses cps_pipe/k_top/k_bot).
+        call    cps_build_active_list
+
+        ; Patch cap target imms from CAP_TARGET_TABLE.
+        ld      a, (prep_gap_y)
+        rrca
+        rrca
+        rrca                                    ; A = prep_gap_y / 8
+        and     $0F
+        dec     a                               ; A = index (0..11)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl                          ; index * 4
+        ld      de, CAP_TARGET_TABLE
+        add     hl, de                          ; HL → entry
+        ; Read cap_top_target → ps_cap_top_target scratch
+        ld      a, (hl)
+        ld      (ps_cap_top_target), a
+        inc     hl
+        ld      a, (hl)
+        ld      (ps_cap_top_target + 1), a
+        inc     hl
+        ld      a, (hl)
+        ld      (ps_cap_bot_target), a
+        inc     hl
+        ld      a, (hl)
+        ld      (ps_cap_bot_target + 1), a
+
+        ; Compute cap _next addresses via compute_next_slot.
+        ld      a, (cps_cap_top_row)
+        call    compute_next_slot               ; HL = next slot addr
+        ld      a, l
+        ld      (ps_cap_top_next), a
+        ld      a, h
+        ld      (ps_cap_top_next + 1), a
+        ld      a, (cps_cap_bot_row)
+        call    compute_next_slot
+        ld      a, l
+        ld      (ps_cap_bot_next), a
+        ld      a, h
+        ld      (ps_cap_bot_next + 1), a
+
+        ; Arm cap slots in PIPE_PROGRAM (cap-handler addresses).
+        ;   K_top cap slot: band_base + 46 ($C3 already stamped by emit_capedge_band)
+        ;   K_bot cap slot: band_base + 4
+        ; Write handler addr at +47 (K_top) and +5 (K_bot).
+        ld      a, (cps_k_top)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_top band base
+        ld      de, 47
+        add     hl, de
+        ld      a, (activate_pipe_idx)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        push    hl
+        ld      hl, cap_top_handler_addrs
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        pop     hl
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ld      a, (cps_k_bot)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_bot band base
+        ld      de, 5
+        add     hl, de
+        ld      a, (activate_pipe_idx)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        push    hl
+        ld      hl, cap_bot_handler_addrs
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        pop     hl
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; Write ps_cap_top_target into cap_top_handler_pipe_<inc>_target imm.
+        ld      a, (activate_pipe_idx)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_top_target_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        ld      hl, ps_cap_top_target
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
+        ld      a, (activate_pipe_idx)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_bot_target_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        ld      hl, ps_cap_bot_target
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
+        ; Write ps_cap_top_next / ps_cap_bot_next into cap_*_next imms.
+        ld      a, (activate_pipe_idx)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_top_next_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        ld      hl, ps_cap_top_next
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
+        ld      a, (activate_pipe_idx)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_bot_next_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        ld      hl, ps_cap_bot_next
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
+        ; Mark rebuild done. prep_phase=7 unblocks do_swap's swap_with_prep.
+        ; activate_pipe_idx=255 unfreezes patch_pipe_targets for this pipe.
+        ld      a, 7
+        ld      (prep_phase), a
+        ld      a, 255
+        ld      (activate_pipe_idx), a
+        ld      a, 21
+        ld      (rebuild_band_cursor), a
+        ret
+
+
 ; ── Scratch for prep_step ────────────────────────────────────────
 ps_cap_top_row:    db 0
 ps_cap_bot_row:    db 0
@@ -3250,12 +3634,33 @@ do_swap:
         add     hl, de                          ; HL = &pipe_state[ds_dep].gap_y
         ld      (hl), c                          ; store fresh random gap_y
 
-        ; ps_cap_top_row/ps_cap_bot_row will be reset by prep_step phase 3.
+        ; Stage 5: arm the band-granular rebuild driver.
+        ;   rebuild_band_cursor = 0 → next call emits band 0
+        ;   rebuild_k_top, rebuild_k_bot = K bounds for the new gap_y
+        ;   prep_phase = 0 → not-done (do_swap.swap_with_prep blocks until 7)
+        ; ps_cap_top_row/ps_cap_bot_row no longer needed at this point —
+        ; rebuild_step's finalize derives them from prep_gap_y.
         xor     a
-        ld      (prep_phase), a                 ; reset to phase 0 (start fresh)
+        ld      (prep_phase), a                 ; not-done; finalize sets to 7
         ld      (prep_row), a
+        ld      (rebuild_band_cursor), a        ; cursor = 0 (band 0 next)
+        ; K_top = (prep_gap_y - 1) >> 3 ; K_bot = (prep_gap_y + PIPE_GAP) >> 3.
+        ld      a, (prep_gap_y)
+        dec     a
+        rrca
+        rrca
+        rrca
+        and     $1F
+        ld      (rebuild_k_top), a
+        ld      a, (prep_gap_y)
+        add     a, PIPE_GAP
+        rrca
+        rrca
+        rrca
+        and     $1F
+        ld      (rebuild_k_bot), a
         ld      a, 1
-        ld      (do_swap_fired), a              ; tell main_loop to skip prep_step this frame
+        ld      (do_swap_fired), a              ; tell main_loop to skip rebuild this frame
         ret
 
 ; ── Scratch variables for do_swap ────────────────────────────────
