@@ -26,17 +26,34 @@ import argparse
 import sys
 from pathlib import Path
 
-# ─── Hard-coded symbol addresses (verify against build/main.lst) ──────────
+# ─── Symbol addresses — loaded from build/main.lst at startup ─────────────
 SYM = {
-    "diag_frame_counter":  0x8179,
-    "diag_border_log_ptr": 0x817A,
-    "DIAG_BORDER_LOG":     0xFE00,
+    "DIAG_BORDER_LOG":     0xFE00,     # EQU — fixed
     "DIAG_BORDER_LOG_LEN": 512,        # 128 entries × 4 bytes (color, frame_lo, R, pad)
     "PIPE_PROGRAM":        0xDB00,
     "SLOT_GRID_END":       0xF400,
     "BAND_STRIDE":         80,
     "NUM_BANDS":           80,
 }
+
+def _load_lst_symbols():
+    """Read build/main.lst and override moving label addresses in SYM."""
+    import re
+    repo_root = Path(__file__).resolve().parent.parent
+    lst_path = repo_root / "build" / "main.lst"
+    if not lst_path.exists():
+        return
+    pat = re.compile(r"^\s*\d+\s+([0-9A-F]{4})\s+[0-9A-F\s]*\s+(\w+):", re.IGNORECASE)
+    wanted = {"diag_frame_counter", "diag_border_log_ptr"}
+    try:
+        for line in lst_path.read_text(errors="ignore").splitlines():
+            m = pat.match(line)
+            if m and m.group(2) in wanted:
+                SYM[m.group(2)] = int(m.group(1), 16)
+    except OSError:
+        pass
+
+_load_lst_symbols()
 
 # Color → name (Spectrum border port lower 3 bits)
 COLOR_NAMES = {
@@ -363,6 +380,9 @@ def main(argv: list[str]) -> int:
     s_grid = sub.add_parser("grid", help="dump PIPE_PROGRAM band shapes")
     s_grid.add_argument("sna", type=Path)
 
+    s_tflog = sub.add_parser("tflog", help="analyze runsim OUT($FE) T-state log")
+    s_tflog.add_argument("log", type=Path)
+
     args = p.parse_args(argv)
     if args.cmd == "screen":
         cmd_screen(args.sna, args.out)
@@ -372,10 +392,62 @@ def main(argv: list[str]) -> int:
         cmd_mem(args.sna, args.address, args.count)
     elif args.cmd == "grid":
         cmd_grid(args.sna)
+    elif args.cmd == "tflog":
+        cmd_tflog(args.log)
     else:
         p.print_help()
         return 2
     return 0
+
+
+def cmd_tflog(log_path: Path) -> None:
+    """Parse runsim OUT($FE) log → per-frame T-state offsets of each colour OUT.
+
+    Log lines: `<frame_idx> <T_state> <hex_byte>`.
+
+    Reports:
+     - per-frame sequence of (colour, T_offset_from_first_OUT_in_frame)
+     - per-region (colour) min/max/spread across frames
+    """
+    FRAME_T = 69888
+    events = []
+    for line in log_path.read_text().splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        fr, t, hexb = int(parts[0]), int(parts[1]), int(parts[2], 16)
+        events.append((fr, t, hexb))
+    if not events:
+        print("no events")
+        return
+    # Group by frame.
+    frames = {}
+    for fr, t, b in events:
+        frames.setdefault(fr, []).append((t, b))
+    # Show last 20 complete frames.
+    keys = sorted(frames.keys())
+    show = keys[-20:]
+    print(f"{'frame':>5}  T-offsets from frame-start (T-states; 1 line ≈ 224 T)")
+    region_offs: dict[int, list[int]] = {}
+    for fr in show:
+        ev = frames[fr]
+        base = ev[0][0]
+        parts = []
+        for t, b in ev:
+            color = b & 0x07
+            off = t - base
+            name = COLOR_NAMES.get(color, f"?{color}")
+            parts.append(f"{name}@{off}")
+            if fr != show[0] and fr != show[-1]:
+                region_offs.setdefault(color, []).append(off)
+        print(f"{fr:5d}  {' '.join(parts)}")
+    print()
+    print("Per-region T-offset (min..max across frames):")
+    for color, vals in region_offs.items():
+        if not vals: continue
+        lo, hi = min(vals), max(vals)
+        name = COLOR_NAMES.get(color, f"?{color}")
+        print(f"  {name:<8}  min={lo:>6}  max={hi:>6}  spread={hi-lo:>6}  ({len(vals)} samples)")
 
 
 if __name__ == "__main__":

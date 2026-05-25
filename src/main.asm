@@ -41,9 +41,25 @@ EDGE_FIXED_ITERS  EQU 14                 ; per-edge non-delay overhead in delay-
 ; Per-frame sound budget (delay-iters). One slice per frame, in the idle tail.
 ; Classified per frame type: build frames (~67k) and wrap/swap frames are
 ; heavier, so they get less sound budget to stay under the 70k T ceiling.
-SND_SLICE_NORMAL  EQU 1100               ; budget on normal frames (CALIBRATE)
+SND_SLICE_NORMAL  EQU 0                  ; TEMP: zero to remove sound variance while flattening borders
 SND_SLICE_WRAP    EQU 0                  ; wrap/swap frames already at ~70k — no room for sound
 SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no room for sound
+
+; ─── Constant-budget padding (Joffa-style) ───────────────────────────
+; Non-wrap frames pad with a deterministic busy-wait so every frame
+; spends identical T-states in WHITE (do_white_work) and YELLOW→BLACK
+; (.post_prep_step) regions. Without padding, the wrap-frame extras
+; (wrap_byte_x ~1.5k T, apply+restore+clear ~10k T) make the colour
+; OUTs land at different scanlines per frame → visibly flashing borders.
+; Each busy-wait iter is `dec de ; ld a,d ; or e ; jr nz` = 26 T taken.
+; Tune empirically with tools/snadump.py border R-delta variance.
+WBX_PAD_ITERS     EQU 60                  ; ~1560 T pad — matches wrap_byte_x cost on wrap frame
+WRAP_PAD_ITERS    EQU 385                 ; ~10010 T pad — matches apply+restore+clear cost
+; Yellow-region constant-budget pads. Target total YELLOW work ≈ 3500 T
+; (matches the rebuild_step finalize path which can't be made cheaper).
+REBUILD_IDLE_PAD_ITERS     EQU 130        ; ~3380 T — idle path (no rebuild)
+REBUILD_FINALIZE_PAD_ITERS EQU 20         ; ~520 T  — after finalize (~3 k T)
+REBUILD_2BAND_PAD_ITERS    EQU 105        ; ~2730 T — after 2× band emit (~800 T)
 
 ; ─── Slot grid layout — Stage 3: EXX-free 2-push slots ────────────
 ; The grid is 80 pipe-bands, band-interleaved:
@@ -240,40 +256,74 @@ main_loop:
         ; cap target/_next imms) and clears activate_pipe_idx back to 255.
         ; do_swap_fired still suppresses the very first call so the swap
         ; frame itself bears no extra rebuild cost.
+        ; Constant-budget YELLOW: every frame pads to the same total cost
+        ; (matching the worst-case finalize frame, ~3.4 k T) regardless of
+        ; which rebuild_step path runs. Three converge points, three pad sizes.
         ld      a, (do_swap_fired)
         or      a
         jr      nz, .swap_frame_skip
         ld      a, (activate_pipe_idx)
         cp      255
-        jr      z, .post_prep_step              ; idle
+        jr      z, .yellow_idle_pad             ; no rebuild this frame
         ld      a, 1
         ld      (sound_heavy_frame), a
-        ; 2 bands per frame. Each band emit is ~400 T, finalize is ~3 k T.
-        ; Worst single-frame extra cost: 1 band (~400 T) + finalize (~3 k T).
-        ; Total rebuild fits in ~11 frames; parked window is ~112 frames.
         call    rebuild_step
         ld      a, (activate_pipe_idx)
         cp      255
-        jr      z, .post_prep_step              ; just finalized
-        call    rebuild_step
+        jr      z, .yellow_post_finalize_pad    ; 1st call finalized → small pad
+        call    rebuild_step                    ; 2nd band emit → medium pad
+.yellow_post_2band_pad:
+        ld      de, REBUILD_2BAND_PAD_ITERS
+.y2bp:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .y2bp
+        jr      .post_prep_step
+.yellow_post_finalize_pad:
+        ld      de, REBUILD_FINALIZE_PAD_ITERS
+.yfpp:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .yfpp
+        jr      .post_prep_step
+.yellow_idle_pad:
+        ld      de, REBUILD_IDLE_PAD_ITERS
+.yip:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .yip
         jr      .post_prep_step
 .swap_frame_skip:
         xor     a
         ld      (do_swap_fired), a
         ld      a, 1
         ld      (sound_heavy_frame), a
+        ld      de, REBUILD_IDLE_PAD_ITERS
+.sfp:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .sfp
 .post_prep_step:
-        ; Wrap-frame screen/attr work — gated by wrap_pending. The clear
-        ; must start at T ≥ 47.3k frame-time so it writes row 159 AFTER
-        ; the raster reads it (raster at row 159 = T=49.6k; clear writes
-        ; row 159 at T_clear + 14.75*159). apply + restore are CHEAP
-        ; (~3k T total) so they run first, then a deterministic busy wait
-        ; brings us to the safe window, then clear runs. Total tail work
-        ; on a wrap frame: 3k apply/restore + 6.5k wait + 7k clear + sfx
-        ; ≈ 18k T; plus base ~50k = ~68k, under 70k.
+        ; Wrap-frame screen/attr work — gated by wrap_pending. On non-wrap
+        ; frames, busy-wait the same T-states the wrap work would have cost,
+        ; so every frame spends identical time here and the BLACK PROFILE_OUT
+        ; lands at the same scanline → steady border (no flashing).
         ld      a, (wrap_pending)
         or      a
-        jr      z, .no_wrap_pending
+        jr      nz, .ppw_do
+        ; Pad non-wrap frame: ~10k T busy-wait.
+        ld      de, WRAP_PAD_ITERS
+.ppw_pad:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .ppw_pad
+        jr      .no_wrap_pending
+.ppw_do:
         xor     a
         ld      (wrap_pending), a
         call    apply_pipe_attrs_wrap
@@ -298,6 +348,18 @@ do_white_work:
         ; half old, on the wrap frame's display. They are deferred to next
         ; frame's vblank (gated by wrap_pending) where the beam is in top
         ; blank and the writes are invisible until the new frame begins.
+        ; Constant-budget: pad non-wrap frames to match the wrap_byte_x +
+        ; patch_pipe_targets cost so the CYAN PROFILE_OUT lands at the
+        ; same scanline every frame.
+        ld      a, (wrap_pending)
+        or      a
+        ret     nz
+        ld      de, WBX_PAD_ITERS
+.wbx_pad:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .wbx_pad
         ret
 
 ;----------------------------------------------------------------

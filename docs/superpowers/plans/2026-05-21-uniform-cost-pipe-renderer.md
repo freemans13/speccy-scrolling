@@ -185,18 +185,35 @@ operand still says `PIPE_PROGRAM`). The "live grid pointer" is simply the
 - Cap slot emission in three places that must all change: init cap config (`configure_pipe_slots` via `CAP_BLOCK`), `rebuild_column`'s `rc_stamp_cap_slot`, and the active-list build (`configure_pipe_slots` Step 6, lines ~1226–1256).
 - `patch_shadow_step` (`pss_*`) — confirms it needs no cap special-casing once entries are all grid addresses.
 
-**Design (confirm against the study):** Redefine the 6-byte cap slot to carry a per-grid target as the operand of a `ld sp, cap_target` (`$31 lo hi`) followed by a 3-byte `jp cap_handler` (`$C3 hh hl`). `patch_shadow_step` decrements the `lo,hi` like a body target; the active-list cap entry becomes `slot+1` (a grid address). The handler reads `SP` for the cap position and `jp`-continues to `slot+6`. **Open question to resolve in study:** how the handler reaches `slot+6` without a grid-specific `_next` imm — `slot+6` is grid+row+pipe specific. If a grid-independent continuation cannot be encoded in 6 bytes, fall back to **two cap-handler instances** (one per grid, each with its own `_next` imms maintained for that grid). Pick the encoding the study supports and record the decision in the commit message.
+**Design (converged after the study — supersedes the fold-into-slot sketch):**
+The cap slot is 6 bytes and cannot hold target + next + routing, so the
+fold-into-slot idea is dropped. Instead: the 8 per-pipe cap handlers
+(`cap_{top,bot}_handler_pipe_N`) are **kept and stay shared between both
+grids**. Only the *live* grid is ever executed, so a handler only needs to be
+correct for the live grid each frame. `update_cap_imm_v2` (already runs every
+frame, pre-computing next frame's cap imms) is extended to ALSO compute and
+patch each handler's `_target` (screen address = `line_table[cap_row] +
+byte_x + 5`) and `_next` (= `live_grid_base + cap_row*32 + 1 + (pipe+1)*6`),
+for the **live grid** — live grid base read from `grid_call+1`, geometry from
+`pipe_state`. The shadow grid's cap rows `jp` the same handlers harmlessly
+(shadow not rendered); on swap, the next `update_cap_imm_v2` repoints to the
+new live grid. The cap `_target` therefore no longer scrolls via the active
+list, so the **2 cap entries are removed from `ACTIVE_PIPE_N`** (→ 110
+body-only entries) — every active-list entry is now a grid address and
+`patch_shadow_step`'s blanket offset-add is uniformly correct.
 
-**Files:** Modify `src/main.asm` — cap slot format; cap handler(s); `configure_pipe_slots` (cap stamping + Step 6 active-list cap entries); `rc_stamp_cap_slot`; `update_cap_imm_v2`; remove any cap-entry special handling in `patch_shadow_step`.
+**Files:** Modify `src/main.asm` — `update_cap_imm_v2` (add `_target`/`_next`); `configure_pipe_slots` Step 6 (110-entry active list); `patch_shadow_step` (walk 110).
 
-- [ ] **Step 1:** From the study, decide and write down (as a comment block near the cap handler) the new 6-byte cap slot format and the handler-continuation mechanism.
-- [ ] **Step 2:** Update the cap handler(s) to take the cap screen target from the slot; keep the phase-bitmap imms refreshed by `update_cap_imm_v2`.
-- [ ] **Step 3:** Update every cap-slot emitter — init/`configure_pipe_slots` cap stamping, `rc_stamp_cap_slot` — to emit the new format into the target grid.
-- [ ] **Step 4:** Update the active-list build (`configure_pipe_slots` Step 6) so the cap_top/cap_bot entries are the cap slot's target-imm addresses (grid addresses), not handler-imm addresses.
-- [ ] **Step 5:** Confirm `patch_shadow_step` is now correct with all entries as grid addresses; remove any cap-entry workaround.
-- [ ] **Step 6: Build check** — `make` → `Errors: 0, warnings: 0`, ASSERT passes.
-- [ ] **Step 7: Commit** — `git commit -m "feat: per-grid caps — cap screen target folded into the grid slot"`.
-- [ ] **Step 8: CHECKPOINT** — Human `make run`: caps render correctly with the live grid swapping between GRID_A/GRID_B every byte boundary — no cap tear, no stale cap position after a swap. (Recycle is still the old path; run up to just before the first recycle, ~30 frames.)
+- [ ] **Step 1:** Extend `update_cap_imm_v2`: for all 8 cap handlers, compute and write `_target` and `_next` for the live grid (`grid_call+1` base, `pipe_state` geometry), alongside the existing `_de`/`_bc` bitmap writes.
+- [ ] **Step 2:** `configure_pipe_slots` Step 6 — build a **110-entry** body-only active list (drop the cap_top/cap_bot pushes; adjust the SP-hijack start offset from `+224` to `+220`).
+- [ ] **Step 3:** `patch_shadow_step` — walk 110 entries (27×4 + 2 unrolled) instead of 112.
+- [ ] **Step 4: Build check** — `make` → `Errors: 0, warnings: 0`, ASSERT passes.
+- [ ] **Step 5: Commit** — `git commit -m "feat: per-grid caps — update_cap_imm_v2 repoints live-grid cap target/next; caps out of active list"`.
+- [ ] **Step 6: CHECKPOINT** — Human `make run`: caps render correctly with the live grid swapping between GRID_A/GRID_B every byte boundary — no cap tear, no stale cap position after a swap. (Recycle is still the old path; run up to just before the first recycle, ~30 frames.)
+
+> Note: `configure_pipe_slots` / `rebuild_column` may keep stamping cap
+> `_target`/`_next` — harmless (overwritten by `update_cap_imm_v2` next frame),
+> needed only for the very first frame; the dead writes are removed in Stage 9.
 
 ---
 

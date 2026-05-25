@@ -66,18 +66,32 @@ def make_register_dict(pc, sp, s):
     }
 
 
-def run_frames(sim, n_frames):
+def run_frames(sim, n_frames, out_log=None):
+    """Run n_frames worth of T-states. If out_log is given, every
+    `OUT (FE), A` instruction appends (T_before, A_value, frame_index)."""
     opcodes = sim.opcodes
     memory = sim.memory
     regs = sim.registers
     frame_dur = sim.frame_duration
     int_active = sim.int_active
+    A_idx = REGISTERS['A']
+    PC_idx = REGISTERS['PC']
     target = regs[T] + n_frames * frame_dur
+    frame_idx = [0]
+    if out_log is not None:
+        orig_out = opcodes[0xD3]
+        def wrapped_out():
+            if memory[regs[PC_idx] + 1] == 0xFE:
+                out_log.append((regs[T], regs[A_idx], frame_idx[0]))
+            orig_out()
+        opcodes[0xD3] = wrapped_out
     while regs[T] < target:
-        pc_before = regs[REGISTERS['PC']]
+        pc_before = regs[PC_idx]
         opcodes[memory[pc_before]]()
         if regs[IFF] and regs[T] % frame_dur < int_active:
             sim.accept_interrupt(regs, memory, pc_before)
+            if out_log is not None:
+                frame_idx[0] += 1
 
 
 def save_sna(path, mem, regs):
@@ -125,11 +139,12 @@ def save_sna(path, mem, regs):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
     path = sys.argv[1]
     n_frames = int(sys.argv[2])
+    out_log_path = sys.argv[3] if len(sys.argv) > 3 else None
 
     mem, pc, sp, s = load_sna(path)
     reg_dict = make_register_dict(pc, sp, s)
@@ -138,12 +153,19 @@ def main():
 
     print(f'Loaded {path}: PC=${pc:04X}, SP=${sp:04X}, IFF={s.iff1}, IM={s.im}')
     print(f'Running {n_frames} frames ({n_frames * FRAME_TSTATES} T-states)...')
-    run_frames(sim, n_frames)
+    out_log = [] if out_log_path else None
+    run_frames(sim, n_frames, out_log)
     final_pc = sim.registers[REGISTERS['PC']]
     print(f'Done. PC=${final_pc:04X}, T-states elapsed={sim.registers[T]}')
 
     save_sna(path, mem, sim.registers)
     print(f'Saved back to {path}')
+
+    if out_log is not None:
+        with open(out_log_path, 'w') as f:
+            for t, a, fr in out_log:
+                f.write(f'{fr} {t} {a:02x}\n')
+        print(f'Wrote {len(out_log)} OUT($FE) events to {out_log_path}')
 
 
 if __name__ == '__main__':
