@@ -229,11 +229,14 @@ main_loop:
         ld      a, 1
         ld      (sound_heavy_frame), a
 .post_prep_step:
-        ; Wrap-frame screen/attr work — gated by wrap_pending. Runs HERE
-        ; (bottom blanking, beam past playfield) so the writes can't tear
-        ; the visible scan. Touching ATTRS or playfield bytes in the WHITE
-        ; band raced the raster; doing it in TOP vblank ate the grid's
-        ; head start. Bottom blank is safe AND off the grid's critical path.
+        ; Wrap-frame screen/attr work — gated by wrap_pending. The clear
+        ; must start at T ≥ 47.3k frame-time so it writes row 159 AFTER
+        ; the raster reads it (raster at row 159 = T=49.6k; clear writes
+        ; row 159 at T_clear + 14.75*159). apply + restore are CHEAP
+        ; (~3k T total) so they run first, then a deterministic busy wait
+        ; brings us to the safe window, then clear runs. Total tail work
+        ; on a wrap frame: 3k apply/restore + 6.5k wait + 7k clear + sfx
+        ; ≈ 18k T; plus base ~50k = ~68k, under 70k.
         ld      a, (wrap_pending)
         or      a
         jr      z, .no_wrap_pending
@@ -241,6 +244,15 @@ main_loop:
         ld      (wrap_pending), a
         call    apply_pipe_attrs_wrap
         call    restore_trailing_pipe_attrs
+        ; Deterministic ~6.5k T wait so clear_vacated_columns starts late
+        ; enough that it always writes each row AFTER the raster has
+        ; already read it — see [[wrap-clear-beam-race]].
+        ld      bc, 250                 ; 250 * 26T ≈ 6.5k T
+.cvc_wait:
+        dec     bc
+        ld      a, b
+        or      c
+        jr      nz, .cvc_wait
         call    clear_vacated_columns
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
