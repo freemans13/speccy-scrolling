@@ -202,6 +202,15 @@ main_loop:
         ld      a, (do_swap_fired)
         or      a
         jr      nz, .swap_frame_skip
+        ; Wrap frames carry ~10k T of apply_pipe_attrs_wrap +
+        ; restore_trailing_pipe_attrs + clear_vacated_columns in the tail
+        ; (post_prep_step). A build frame is already ~67k T, so adding
+        ; both = ~77k → halt missed → 25Hz drop. Yield prep_step budget on
+        ; wrap frames; the other 3 frames per cycle still do 6 iterations,
+        ; so total build throughput is unchanged.
+        ld      a, (wrap_pending)
+        or      a
+        jr      nz, .post_prep_step
         ld      b, 6                            ; max prep_step chunks this frame
 .build_loop:
         ld      a, (activate_pipe_idx)
