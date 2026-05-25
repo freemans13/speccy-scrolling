@@ -28,10 +28,10 @@ from pathlib import Path
 
 # ─── Hard-coded symbol addresses (verify against build/main.lst) ──────────
 SYM = {
-    "diag_frame_counter":  0x815B,
-    "diag_border_log_ptr": 0x815C,
+    "diag_frame_counter":  0x8179,
+    "diag_border_log_ptr": 0x817A,
     "DIAG_BORDER_LOG":     0xFE00,
-    "DIAG_BORDER_LOG_LEN": 512,        # 256 entries × 2 bytes
+    "DIAG_BORDER_LOG_LEN": 512,        # 128 entries × 4 bytes (color, frame_lo, R, pad)
     "PIPE_PROGRAM":        0xDB00,
     "SLOT_GRID_END":       0xF400,
     "BAND_STRIDE":         80,
@@ -181,23 +181,21 @@ def cmd_border(sna_path: Path) -> None:
         print("(ring buffer empty — game has not completed a halt yet)")
         return
 
-    # Walk in chronological order: oldest first. The head points to the NEXT
-    # write slot. In the wrapped-around case the oldest entry is at head; in
-    # the never-wrapped case the entries from log_base up to head are valid
-    # and everything from head onward is uninitialised zeros.
+    # Each entry is 4 bytes: color, frame_lo, R, pad. Ring = 128 entries.
+    ENTRY = 4
+    n_entries = SYM["DIAG_BORDER_LOG_LEN"] // ENTRY
     raw = []
-    for i in range(256):
-        idx = (head_off + i * 2) % SYM["DIAG_BORDER_LOG_LEN"]
+    for i in range(n_entries):
+        idx = (head_off + i * ENTRY) % SYM["DIAG_BORDER_LOG_LEN"]
         color = ring[idx]
         frame_lo = ring[idx + 1]
-        raw.append((color, frame_lo))
+        r_reg = ring[idx + 2]
+        raw.append((color, frame_lo, r_reg))
 
-    # Drop the leading unwritten run (color=0 AND frame_lo=0). This handles
-    # the never-wrapped case where the tail is still zero, and is also
-    # harmless in the wrapped case where the first real entry is non-zero.
+    # Drop the leading unwritten run (color=0 AND frame_lo=0 AND R=0).
     trim = 0
-    for color, fr in raw:
-        if color == 0 and fr == 0:
+    for color, fr, r in raw:
+        if color == 0 and fr == 0 and r == 0:
             trim += 1
         else:
             break
@@ -208,31 +206,72 @@ def cmd_border(sna_path: Path) -> None:
         return
 
     # Group entries by frame.
-    frames: list[tuple[int, list[tuple[int, int]]]] = []
+    frames: list[tuple[int, list[tuple[int, int, int]]]] = []
     cur_frame_idx = None
-    cur_list: list[tuple[int, int]] = []
-    for color, fr in entries:
+    cur_list: list[tuple[int, int, int]] = []
+    for color, fr, r in entries:
         if cur_frame_idx is None or fr != cur_frame_idx:
             if cur_frame_idx is not None:
                 frames.append((cur_frame_idx, cur_list))
             cur_frame_idx = fr
             cur_list = []
-        cur_list.append((color, fr))
+        cur_list.append((color, fr, r))
     if cur_frame_idx is not None:
         frames.append((cur_frame_idx, cur_list))
 
+    def r_delta(prev: int, cur: int) -> int:
+        """Bits 0-6 of R are the auto-incrementing fetch counter (bit 7 is
+        user-controllable). Compute the shortest forward distance in the
+        128-step cycle."""
+        d = (cur - prev) & 0x7F
+        return d
+
+    # Per-region cumulative R-delta from frame's RED (first OUT).
     overrun_count = 0
+    print(f"{'frame':>5}  {'sequence and R-delta from RED (each tick ≈ ~14 T)':<60}")
     for fr_id, ev in frames:
-        names = [COLOR_NAMES.get(c, f"?{c}") for c, _ in ev]
+        names = []
+        base_r = ev[0][2] if ev else 0
+        # Cumulative delta from RED across (possibly) multiple wraps.
+        cum = 0
+        last_r = base_r
+        for i, (c, _, r) in enumerate(ev):
+            d = r_delta(last_r, r)
+            cum += d
+            last_r = r
+            label = COLOR_NAMES.get(c, f"?{c}")
+            names.append(f"{label}@{cum}")
         ends_in_black = ev and ev[-1][0] == 0
-        # Edge frames (first/last) may legitimately be partial — flag mid-run only.
         tag = ""
         if not ends_in_black and fr_id != frames[0][0] and fr_id != frames[-1][0]:
             tag = "  [OVERRUN — no BLACK]"
             overrun_count += 1
         elif not ends_in_black:
             tag = "  [partial (edge)]"
-        print(f"Frame {fr_id:3d}: {' '.join(names)}{tag}")
+        print(f"{fr_id:5d}  {' '.join(names)}{tag}")
+
+    # Per-region variance summary across frames (skipping partial edges).
+    print()
+    print("Per-region R-delta from RED (min..max across frames):")
+    regions: dict[int, list[int]] = {}     # color → list of cumulative deltas across frames
+    for fr_id, ev in frames:
+        if not (ev and ev[-1][0] == 0):
+            continue                        # skip partial/overrun frames for variance
+        base_r = ev[0][2]
+        cum = 0
+        last_r = base_r
+        for c, _, r in ev:
+            d = r_delta(last_r, r)
+            cum += d
+            last_r = r
+            regions.setdefault(c, []).append(cum)
+    for color, vals in regions.items():
+        name = COLOR_NAMES.get(color, f"?{color}")
+        if not vals:
+            continue
+        lo, hi = min(vals), max(vals)
+        print(f"  {name:<8}  min={lo:4d}  max={hi:4d}  spread={hi - lo:4d}   "
+              f"({len(vals)} samples)")
 
     print()
     print(f"total frames logged: {len(frames)}")

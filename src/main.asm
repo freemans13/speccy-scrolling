@@ -138,6 +138,11 @@ DIAG_BORDER_LOG        EQU $FE00         ; 256 entries × 2 B → $FE00..$FFFF i
 ; at the end of the buffer. ~50 T per call; budget into hot paths.
 ; The sound emitter at sfx_tick.emit does NOT use this — its `out`
 ; is a speaker pulse, not a profile marker.
+; Entry: 4 bytes — (color, frame_lo, R, pad). Ring = 128 × 4 = 512 B.
+; R is the Z80 instruction-fetch counter; deltas between consecutive
+; entries' R values are a T-state proxy that lets snadump spot per-frame
+; work-duration variance (= visible flashing borders) even when the
+; sequence itself is clean.
 PROFILE_OUT     MACRO color
         push    af
         push    hl
@@ -149,6 +154,10 @@ PROFILE_OUT     MACRO color
         ld      a, (diag_frame_counter)
         ld      (hl), a
         inc     hl
+        ld      a, r                    ; R = instruction-fetch counter (7-bit, wraps)
+        ld      (hl), a
+        inc     hl
+        inc     hl                      ; pad byte (entry is 4 B for alignment)
         ld      a, h
         or      a                       ; H==0 ⇒ HL just wrapped past $FFFF
         jr      nz, $+5                 ; skip the wrap-load if H != 0
