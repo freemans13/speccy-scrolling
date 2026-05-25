@@ -147,9 +147,18 @@ main_loop:
         di
         ld      a, 2                    ; PROFILE: RED = top blanking
         out     ($fe), a
-        ; Deferred-from-last-frame: zero the columns each active pipe vacated.
-        ; Runs HERE (top blanking) so the writes complete before the raster
-        ; reaches row 0 — no beam race, no R-col flicker on wrap frames.
+        ; Deferred-from-last-wrap-frame: apply NEW pipe attrs, restore OLD
+        ; trailing attrs, and zero the vacated columns. All race the raster
+        ; if run in the WHITE band — defer them to vblank where the beam
+        ; sits in top blanking and the writes are invisible until next frame.
+        ld      a, (wrap_pending)
+        or      a
+        jr      z, .no_wrap_pending
+        xor     a
+        ld      (wrap_pending), a
+        call    apply_pipe_attrs_wrap
+        call    restore_trailing_pipe_attrs
+.no_wrap_pending:
         ld      a, (clear_pending)
         or      a
         jr      z, .no_clear_pending
@@ -237,12 +246,13 @@ main_loop:
 do_white_work:
         call    advance_phase
         call    advance_phase
-        ld      a, (wrap_pending)
-        or      a
-        ret     z
-        xor     a
-        ld      (wrap_pending), a
-        jp      restore_trailing_pipe_attrs
+        ; apply_pipe_attrs_wrap and restore_trailing_pipe_attrs both write
+        ; to the ATTRS area for the pipe char rows. Running them here (WHITE
+        ; band) races the raster — half the char-rows would see new attrs,
+        ; half old, on the wrap frame's display. They are deferred to next
+        ; frame's vblank (gated by wrap_pending) where the beam is in top
+        ; blank and the writes are invisible until the new frame begins.
+        ret
 
 ;----------------------------------------------------------------
 phase:      db 0
@@ -2674,7 +2684,9 @@ advance_phase:
         ret     nz
 .wrap:
         call    wrap_byte_x
-        call    apply_pipe_attrs_wrap   ; paints only NEW M1 (NEW M2 = OLD M1, already pipe-attr)
+        ; Defer apply_pipe_attrs_wrap to next frame's vblank — running it
+        ; here (WHITE band, T~30k) races the raster and leaves the pipe's
+        ; attr block half-old / half-new on the wrap frame's display.
         ld      a, 1
         ld      (wrap_pending), a
         ret
