@@ -54,7 +54,7 @@ SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no 
 ; Each busy-wait iter is `dec de ; ld a,d ; or e ; jr nz` = 26 T taken.
 ; Tune empirically with tools/snadump.py border R-delta variance.
 WBX_PAD_ITERS     EQU 60                  ; ~1560 T pad — matches wrap_byte_x cost on wrap frame
-WRAP_PAD_ITERS    EQU 670                 ; ~17420 T pad — matches apply+restore+clear cost (clear has per-pipe pad → constant ~16 k T; apply+restore ~3 k T combined)
+WRAP_PAD_ITERS    EQU 590                 ; ~15340 T pad — matches apply+restore+clear cost (CVC pad ~13.5 k T, apply+restore ~2 k T)
 ; Yellow-region constant-budget pads. Target total YELLOW work ≈ 3500 T
 ; (matches the rebuild_step finalize path which can't be made cheaper).
 REBUILD_IDLE_PAD_ITERS     EQU 130        ; ~3380 T — idle path (no rebuild)
@@ -64,7 +64,11 @@ REBUILD_2BAND_PAD_ITERS    EQU 105        ; ~2730 T — after 2× band emit (~80
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
 ; eligible or skipped (~3920 T per active pipe).
-CVC_PIPE_PAD_ITERS         EQU 150        ; ~3900 T
+CVC_PIPE_PAD_ITERS         EQU 130        ; ~3380 T
+; render_score (4-digit ROM-font draw) costs ~1500 T per call. Pad
+; non-render frames to match so score-change frames don't shift the
+; BLACK PROFILE_OUT later by ~1.5 k T (visible band-height variance).
+RENDER_SCORE_PAD_ITERS     EQU 55         ; ~1430 T
 
 ; ─── Slot grid layout — Stage 3: EXX-free 2-push slots ────────────
 ; The grid is 80 pipe-bands, band-interleaved:
@@ -3249,12 +3253,22 @@ frame_update:
         ; State prep (advance_phase × 2 with wrap-byte_x, restore_trailing)
         ; was here in the WHITE band. Moved to main_loop's CYAN region.
 .no_regen:
-        ; Skip render_score if score unchanged — saves ~1.5k T-states most frames.
+        ; Constant-budget: pad non-render frames so BLUE→GREEN gap doesn't
+        ; jump 1.5 k T on score-change frames (which otherwise causes a
+        ; visible flash in the BLACK band position).
         ld      hl, (score)
         ld      de, (score_last)
         or      a
         sbc     hl, de
-        ret     z
+        jr      nz, .do_render
+        ld      de, RENDER_SCORE_PAD_ITERS
+.rsp_lp:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .rsp_lp
+        ret
+.do_render:
         ld      hl, (score)
         ld      (score_last), hl
         jp      render_score
