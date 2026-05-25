@@ -70,10 +70,24 @@ SNA_SIZE = 49179
 # ─── helpers ─────────────────────────────────────────────────────────────
 
 def load_sna(path: Path) -> bytes:
-    data = path.read_bytes()
-    if len(data) != SNA_SIZE:
-        sys.exit(f"error: {path} is {len(data)} bytes, expected {SNA_SIZE}")
-    return data
+    """Load .sna or .szx and return a 49179-byte SNA-style buffer (27-byte
+    header + 48K RAM). For .szx we synthesise a zero header — only RAM is
+    used downstream."""
+    raw = path.read_bytes()
+    # .sna 48K is exactly 49179 bytes — direct.
+    if len(raw) == SNA_SIZE and path.suffix.lower() == ".sna":
+        return raw
+    # Otherwise try skoolkit (handles .sna, .szx, .z80 transparently).
+    try:
+        from skoolkit.snapshot import Snapshot
+    except ImportError:
+        sys.exit(f"error: {path} is not a 48K .sna and skoolkit not installed. "
+                 "Run: /tmp/emuvenv/bin/pip install skoolkit")
+    s = Snapshot.get(str(path))
+    ram = bytes(s.ram())
+    if len(ram) != 49152:
+        sys.exit(f"error: {path}: snapshot RAM is {len(ram)} bytes (expected 49152, 48K only)")
+    return bytes(27) + ram
 
 
 def addr(data: bytes, a: int) -> int:
