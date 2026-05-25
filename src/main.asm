@@ -54,12 +54,17 @@ SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no 
 ; Each busy-wait iter is `dec de ; ld a,d ; or e ; jr nz` = 26 T taken.
 ; Tune empirically with tools/snadump.py border R-delta variance.
 WBX_PAD_ITERS     EQU 60                  ; ~1560 T pad — matches wrap_byte_x cost on wrap frame
-WRAP_PAD_ITERS    EQU 320                 ; ~8320 T pad — matches apply+restore+clear cost (after Stage 6 clear optimisation)
+WRAP_PAD_ITERS    EQU 670                 ; ~17420 T pad — matches apply+restore+clear cost (clear has per-pipe pad → constant ~16 k T; apply+restore ~3 k T combined)
 ; Yellow-region constant-budget pads. Target total YELLOW work ≈ 3500 T
 ; (matches the rebuild_step finalize path which can't be made cheaper).
 REBUILD_IDLE_PAD_ITERS     EQU 130        ; ~3380 T — idle path (no rebuild)
 REBUILD_FINALIZE_PAD_ITERS EQU 20         ; ~520 T  — after finalize (~3 k T)
 REBUILD_2BAND_PAD_ITERS    EQU 105        ; ~2730 T — after 2× band emit (~800 T)
+
+; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
+; 20-band clear loop so all 4 pipes contribute identical T-states whether
+; eligible or skipped (~3920 T per active pipe).
+CVC_PIPE_PAD_ITERS         EQU 150        ; ~3900 T
 
 ; ─── Slot grid layout — Stage 3: EXX-free 2-push slots ────────────
 ; The grid is 80 pipe-bands, band-interleaved:
@@ -309,16 +314,22 @@ main_loop:
         or      e
         jr      nz, .sfp
 .post_prep_step:
-        ; Constant-budget tail: apply/restore/clear ALWAYS run, on wrap AND
-        ; non-wrap frames. On non-wrap, byte_x hasn't changed since the last
-        ; wrap, so:
-        ;   - apply paints ATTR_PIPE at the same cells (idempotent overwrite)
-        ;   - restore writes ATTR_SKY at byte_x+2 col (already sky, harmless)
-        ;   - clear writes 0 at byte_x+3 col (already sky, harmless)
-        ; Cost ~14 k T per frame regardless of wrap-pending state → constant
-        ; BLACK position → no visible border flashing.
+        ; Wrap-frame screen/attr work gated on wrap_pending. Clear has
+        ; per-pipe pad inside, so its cost is constant ~16 k T per call.
+        ; Non-wrap pads with WRAP_PAD_ITERS to match → flat BLACK position.
+        ld      a, (wrap_pending)
+        or      a
+        jr      nz, .ppw_do
+        ld      de, WRAP_PAD_ITERS
+.ppw_pad:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .ppw_pad
+        jr      .no_wrap_pending
+.ppw_do:
         xor     a
-        ld      (wrap_pending), a               ; consume flag (was set by advance_phase on wraps)
+        ld      (wrap_pending), a
         call    apply_pipe_attrs_wrap
         call    restore_trailing_pipe_attrs
         call    clear_vacated_columns
@@ -3534,18 +3545,30 @@ clear_vacated_columns:
         ld      c, a                            ; C = pipe index 0..3
         ld      a, (prep_pipe_idx)
         cp      c
-        jr      z, .cvc_skip                    ; skip preparing pipe
+        jr      z, .cvc_skip                    ; prep pipe ALWAYS skipped — cheap skip (no pad)
         ld      a, (activate_pipe_idx)
         cp      c
-        jr      z, .cvc_skip                    ; skip activating pipe (build in progress)
+        jr      z, .cvc_pad_skip                ; occasionally skipped → pad to keep T constant
         ; vacated_col = byte_x + 3
         ld      a, (iy+0)
         add     a, 3
-        cp      32                              ; off-screen (col 32+) — skip
-        jr      nc, .cvc_skip
-        cp      4                               ; in buffer cols 0..3 — also harmless to skip
-        jr      c, .cvc_skip
+        cp      32                              ; off-screen (col 32+) — pad to keep T constant
+        jr      nc, .cvc_pad_skip
+        cp      4                               ; in buffer cols 0..3 — pad to keep T constant
+        jr      c, .cvc_pad_skip
         ld      (cvc_col), a
+        jr      .cvc_do_work
+.cvc_pad_skip:
+        ; Pipe not eligible for clear; busy-wait the equivalent T-states so
+        ; every frame's per-pipe slot costs the same → constant BLACK position.
+        ld      de, CVC_PIPE_PAD_ITERS
+.cvc_pad_lp:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .cvc_pad_lp
+        jr      .cvc_skip
+.cvc_do_work:
         ; Stage 6: walk band_first_addr[] via IY (precomputed band base addrs)
         ; instead of recomputing line_table[8K] per band. Per-band setup is now
         ; ~50 T (table read + col add) vs ~150 T (line_table recompute), saving
