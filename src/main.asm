@@ -147,25 +147,12 @@ main_loop:
         di
         ld      a, 2                    ; PROFILE: RED = top blanking
         out     ($fe), a
-        ; Deferred-from-last-wrap-frame: apply NEW pipe attrs, restore OLD
-        ; trailing attrs, and zero the vacated columns. All race the raster
-        ; if run in the WHITE band — defer them to vblank where the beam
-        ; sits in top blanking and the writes are invisible until next frame.
-        ld      a, (wrap_pending)
-        or      a
-        jr      z, .no_wrap_pending
-        xor     a
-        ld      (wrap_pending), a
-        call    apply_pipe_attrs_wrap
-        call    restore_trailing_pipe_attrs
-.no_wrap_pending:
-        ld      a, (clear_pending)
-        or      a
-        jr      z, .no_clear_pending
-        xor     a
-        ld      (clear_pending), a
-        call    clear_vacated_columns
-.no_clear_pending:
+        ; Wrap-frame screen/attr work (apply_pipe_attrs_wrap +
+        ; restore_trailing_pipe_attrs + clear_vacated_columns) runs at the
+        ; END of the wrap frame (after prep_step, in bottom blanking) — see
+        ; that block below. Doing it in vblank ate too much top-blank budget,
+        ; pushing the grid past row 0 and producing top-row pixel/attr
+        ; misalignment on the wrap-pending frame.
         xor     a
         ld      (sound_heavy_frame), a
         ; Classify this frame → per-frame sound budget. Build frames
@@ -233,6 +220,20 @@ main_loop:
         ld      a, 1
         ld      (sound_heavy_frame), a
 .post_prep_step:
+        ; Wrap-frame screen/attr work — gated by wrap_pending. Runs HERE
+        ; (bottom blanking, beam past playfield) so the writes can't tear
+        ; the visible scan. Touching ATTRS or playfield bytes in the WHITE
+        ; band raced the raster; doing it in TOP vblank ate the grid's
+        ; head start. Bottom blank is safe AND off the grid's critical path.
+        ld      a, (wrap_pending)
+        or      a
+        jr      z, .no_wrap_pending
+        xor     a
+        ld      (wrap_pending), a
+        call    apply_pipe_attrs_wrap
+        call    restore_trailing_pipe_attrs
+        call    clear_vacated_columns
+.no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
         ld      a, 0                    ; PROFILE: BLACK = idle before halt
         out     ($fe), a
@@ -3012,12 +3013,10 @@ wrap_byte_x:
         inc     iy
         inc     iy
         djnz    .outer
-        ; Defer the vacated-column clear to NEXT frame's vblank — running it
-        ; here (in the WHITE band) races the raster and would erase the OLD
-        ; pipe's R col on the rows the beam hasn't reached yet, flickering
-        ; the pipe's right edge every wrap frame. Just flag it.
-        ld      a, 1
-        ld      (clear_pending), a
+        ; Vacated-column clear is deferred to this frame's bottom blanking
+        ; (after prep_step), gated by wrap_pending. Running it here (WHITE
+        ; band, mid-beam) used to erase the OLD pipe's R col on rows the
+        ; beam hadn't reached yet → right-edge flicker every wrap.
         ; Run patch_pipe_targets so NEXT frame's PIPE_PROGRAM renders at NEW byte_x.
         call    patch_pipe_targets
         ret
