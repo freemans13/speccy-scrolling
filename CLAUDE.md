@@ -225,3 +225,26 @@ grep -E 'diag_frame_counter|diag_border_log_ptr|DIAG_BORDER_LOG' build/main.lst
 - Read `git log` for what's been tried and reverted.
 - Check the auto-memory at `~/.claude-personal/projects/-Users-freemans-github-freemans13-speccy-scrolling/memory/` for prior pitfalls (SLOT_GRID_END NOP-slide trap, split-configure cap-handler race, etc.).
 - If the analysis says "this should cost 80 T/row" and the implementation costs 200 T/row, **the implementation is wrong**. Fix the implementation; do not commit a slower version with the same commit message.
+
+## Autonomous diagnostic workflow
+
+I (Claude) can now run the game headlessly via:
+
+```
+cp build/main.sna /tmp/test.sna
+/tmp/emuvenv/bin/python tools/runsim.py /tmp/test.sna <N_FRAMES>
+/tmp/emuvenv/bin/python tools/snadump.py border /tmp/test.sna
+/tmp/emuvenv/bin/python tools/snadump.py screen /tmp/test.sna /tmp/out.png
+/tmp/emuvenv/bin/python tools/snadump.py grid /tmp/test.sna
+```
+
+`runsim.py` uses skoolkit's Simulator with the actual 48K ROM (loaded from
+`/Applications/Fuse.app/Contents/Resources/48.rom`) so interrupts work
+correctly. Without the ROM the IM 1 vector at `$0038` is NOP-slide and the
+game never re-enters main_loop after the first IRQ.
+
+**Use this loop on every diagnostic.** Don't ask the user to run the game
+unless verifying a fix needs human eyes (e.g., visual artefact that the
+snapshot screen-grab doesn't make obvious). For 99% of "did this change the
+border timeline / overrun count / grid contents?" questions, the headless
+loop answers in seconds without the user.
