@@ -248,3 +248,5 @@ unless verifying a fix needs human eyes (e.g., visual artefact that the
 snapshot screen-grab doesn't make obvious). For 99% of "did this change the
 border timeline / overrun count / grid contents?" questions, the headless
 loop answers in seconds without the user.
+
+Setup (once): `python3 -m venv /tmp/emuvenv && /tmp/emuvenv/bin/pip install skoolkit pillow`
