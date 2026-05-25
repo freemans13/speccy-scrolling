@@ -124,6 +124,40 @@ ACTIVE_COUNT           EQU 448         ; 4 × 112
 ACTIVE_LIST_NEW        EQU ACTIVE_PIPE_0
 ACTIVE_COUNT_NEW       EQU $FCC0       ; 2 B counter (moved with ACTIVE_LIST_END)
 
+; ─── Diagnostics ring buffer (border-profiler trace) ─────────────
+; 256 entries × (color, frame_lo) = 512 bytes at $FE00..$FFFF.
+; Lives in high RAM above all game data; stack at $8000 grows down,
+; nowhere near. Read with tools/snadump.py border build/main.sna.
+DIAG_BORDER_LOG        EQU $FE00         ; 256 entries × 2 B → $FE00..$FFFF inclusive
+                                         ; After writing entry at $FFFE/$FFFF, the
+                                         ; two `inc hl` push HL to $0000 → wrap.
+
+; ─── PROFILE_OUT — border write + ring-buffer trace ──────────────
+; Replaces every `ld a, color : out ($fe), a` profile marker. Writes
+; (color, frame_counter_lo) to DIAG_BORDER_LOG, wraps the head pointer
+; at the end of the buffer. ~50 T per call; budget into hot paths.
+; The sound emitter at sfx_tick.emit does NOT use this — its `out`
+; is a speaker pulse, not a profile marker.
+PROFILE_OUT     MACRO color
+        push    af
+        push    hl
+        ld      a, color
+        out     ($fe), a
+        ld      hl, (diag_border_log_ptr)
+        ld      (hl), a
+        inc     hl
+        ld      a, (diag_frame_counter)
+        ld      (hl), a
+        inc     hl
+        ld      a, h
+        or      a                       ; H==0 ⇒ HL just wrapped past $FFFF
+        jr      nz, $+5                 ; skip the wrap-load if H != 0
+        ld      hl, DIAG_BORDER_LOG
+        ld      (diag_border_log_ptr), hl
+        pop     hl
+        pop     af
+        ENDM
+
         ORG $8000
 
 start:
@@ -144,9 +178,11 @@ start:
 
 main_loop:
         halt
+        ld      a, (diag_frame_counter)
+        inc     a
+        ld      (diag_frame_counter), a
         di
-        ld      a, 2                    ; PROFILE: RED = top blanking
-        out     ($fe), a
+        PROFILE_OUT 2                   ; RED = top blanking
         ; Wrap-frame screen/attr work (apply_pipe_attrs_wrap +
         ; restore_trailing_pipe_attrs + clear_vacated_columns) runs at the
         ; END of the wrap frame (after prep_step, in bottom blanking) — see
@@ -181,17 +217,13 @@ main_loop:
         call    advance_bird_anim
         call    draw_bird
         call    paint_bird_attrs
-        ld      a, 3                    ; PROFILE: MAGENTA = PIPE_PROGRAM
-        out     ($fe), a
+        PROFILE_OUT 3                   ; MAGENTA = PIPE_PROGRAM
         call    frame_update
-        ld      a, 7                    ; PROFILE: WHITE = state prep
-        out     ($fe), a
+        PROFILE_OUT 7                   ; WHITE = state prep
         call    do_white_work
-        ld      a, 5                    ; PROFILE: CYAN = update_cap_imm_v2
-        out     ($fe), a
+        PROFILE_OUT 5                   ; CYAN = update_cap_imm_v2
         call    update_cap_imm_v2
-        ld      a, 6                    ; PROFILE: YELLOW = column build
-        out     ($fe), a
+        PROFILE_OUT 6                   ; YELLOW = column build
         ; Stage 5: band-granular amortised pipe-recycle driver.
         ; do_swap sets activate_pipe_idx + resets rebuild_band_cursor=0; the
         ; rebuild_step routine emits ONE band per call (~400 T) until cursor
@@ -240,8 +272,7 @@ main_loop:
         call    clear_vacated_columns
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
-        ld      a, 0                    ; PROFILE: BLACK = idle before halt
-        out     ($fe), a
+        PROFILE_OUT 0                   ; BLACK = idle before halt
         ei
         jp      main_loop
 
@@ -262,6 +293,11 @@ do_white_work:
 
 ;----------------------------------------------------------------
 phase:      db 0
+; ─── Diagnostics: border-profiler ring head + frame counter ──────
+; Both consumed by tools/snadump.py (see CLAUDE.md Diagnostics
+; workflow). The ring buffer itself lives at DIAG_BORDER_LOG ($FE00).
+diag_frame_counter:  db 0                ; ++ each completed halt; 8-bit wrap is fine
+diag_border_log_ptr: dw DIAG_BORDER_LOG  ; head pointer, advances by 2 per PROFILE_OUT
 saved_sp:   dw 0
 saved_sp_inner: dw 0                    ; second save slot — inner CALL inside
                                         ; the SP-hijacked line loop swaps SP
@@ -3046,11 +3082,9 @@ frame_update:
         ; reached row 0 → uniform 0-frame lag at every bird Y, no flicker.
         ; PIPE_PROGRAM starts at T~5.6k with ~8k T head start over the raster.
         call    redraw_pipes_v2
-        ld      a, 1                    ; PROFILE: BLUE = ground/score region
-        out     ($fe), a
+        PROFILE_OUT 1                   ; BLUE = ground/score region
         call    update_score
-        ld      a, 4                    ; PROFILE: GREEN = ground
-        out     ($fe), a
+        PROFILE_OUT 4                   ; GREEN = ground
         call    draw_ground
         ; State prep (advance_phase × 2 with wrap-byte_x, restore_trailing)
         ; was here in the WHITE band. Moved to main_loop's CYAN region.
@@ -3909,8 +3943,7 @@ redraw_pipes_v2:
         ; --- Enter PIPE_PROGRAM ---
         ; No EXX, no per-row dither setup. BC/DE/HL hold the three push pairs;
         ; A-rows execute `push de + push bc`, B-rows execute `push hl + push bc`.
-        ld      a, 3                    ; MAGENTA = PIPE_PROGRAM
-        out     ($fe), a
+        PROFILE_OUT 3                   ; MAGENTA = PIPE_PROGRAM
         ld      (saved_sp), sp
         call    PIPE_PROGRAM
         ret
@@ -5185,5 +5218,13 @@ Y = 0
         dw $4000 + ((Y & 7) << 8) + ((Y & $38) << 2) + ((Y & $C0) << 5)
 Y = Y + 1
         EDUP
+
+        ; ─── Zero the diagnostics ring at build time ────────────
+        ; sjasmplus' ZXSPECTRUM48 device leaves some pages with non-zero
+        ; "random" bytes (e.g. font data near $FF59). Force the ring to
+        ; zero so a fresh snapshot has a clean baseline; tools/snadump.py
+        ; relies on "(0,0) = unwritten" to distinguish real entries.
+        ORG     DIAG_BORDER_LOG
+        DS      512, 0
 
         SAVESNA "build/main.sna", start

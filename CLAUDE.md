@@ -143,6 +143,82 @@ frame_update:
 - **`CAP_TARGET_TABLE`** at `$C41A` — per-gap_y cap handler target imms.
 - **`ACTIVE_PIPE_0..2`** at `$FA40..$FCDF` — per-pipe active sublist, 112 entries × 2 bytes. Each entry is the address of a target imm byte that `patch_pipe_targets` decrements per wrap.
 
+## Diagnostics workflow
+
+This project has self-serve snapshot diagnostics. The agent (Claude) is expected
+to USE these — every claim of "I fixed it" must be backed by a snapshot reading.
+
+### Snapshot convention
+
+- The snapshot file is **always `build/main.sna`**. Stop renaming it, copying it
+  to `~/Downloads/`, or asking for it to be re-saved with a new name.
+- Workflow: agent edits → agent builds → user runs `make run` and plays for a
+  few seconds → user takes a snapshot (Fuse: File → Save Snapshot) which
+  overwrites `build/main.sna` → agent reads `build/main.sna` with the tools
+  below.
+- The agent **cannot** see the emulator window. Visual analysis comes from
+  `tools/snadump.py screen build/main.sna out.png` and reading the PNG.
+
+### In-RAM border profiler ring
+
+- A 256-entry × 2-byte ring buffer at `$FE00..$FFFF` records every
+  `PROFILE_OUT color` (the macro that replaces the old `ld a,c : out ($fe),a`
+  profile markers). Each entry is `(color, frame_counter_lo)`.
+- `diag_frame_counter` (1 byte) increments per completed `halt` (just before
+  `di`) — 8-bit, wraps at 256.
+- `diag_border_log_ptr` (2 bytes) is the head pointer, advances by 2 per
+  marker, wraps at `$FFFF → $FE00`.
+- The macro cost is ~50 T per call. Budget that into hot paths; the macro
+  preserves AF, HL and writes only to `(diag_border_log_ptr)` /
+  `diag_frame_counter` and the ring itself.
+- The sound emitter at `sfx_tick.emit` does **not** use the macro — its
+  `out ($fe), a` is a speaker pulse, not a profile marker, and a ring write
+  inside the sound inner loop would destroy the timing.
+
+### tools/snadump.py
+
+```
+python3 tools/snadump.py screen build/main.sna out.png  # decode screen → PNG
+python3 tools/snadump.py border build/main.sna          # per-frame timeline
+python3 tools/snadump.py mem    build/main.sna $ADDR N  # hex dump
+python3 tools/snadump.py grid   build/main.sna          # PIPE_PROGRAM band shapes
+```
+
+`border` reconstructs each frame's marker sequence in chronological order and
+prints e.g.:
+
+```
+Frame  47: RED MAGENTA BLUE GREEN WHITE CYAN YELLOW BLACK
+Frame  48: RED MAGENTA BLUE GREEN WHITE CYAN YELLOW BLACK
+Frame  49: RED MAGENTA BLUE GREEN WHITE CYAN YELLOW             [OVERRUN — no BLACK]
+```
+
+**Overrun detection rule**: a frame must end with `BLACK` (the idle marker
+before `halt`). A frame whose log ends with anything else missed its `halt`
+and the game ran at 25 Hz on that frame. If `snadump.py border` reports
+`overruns: 0` across all logged frames, the timing is clean. **Any non-zero
+overrun count is a bug, regardless of how rare.** The fresh-build snapshot
+has zero entries (no halt has fired) — that's expected.
+
+Symbol addresses are hard-coded near the top of `snadump.py`. After any
+memory-map change, regenerate `build/main.lst` and update the `SYM` dict:
+
+```
+tools/sjasmplus/sjasmplus --fullpath --lst=build/main.lst src/main.asm
+grep -E 'diag_frame_counter|diag_border_log_ptr|DIAG_BORDER_LOG' build/main.lst
+```
+
+### "Before claiming a fix" checklist
+
+1. Predict what the border timeline **should** look like with the fix
+   (which frames change colour count? which had overruns and now don't?).
+2. After build, ask the user for a fresh `build/main.sna`, then run
+   `python3 tools/snadump.py border build/main.sna`.
+3. Compare measured vs predicted. Only claim "fixed" if they match.
+4. Every per-frame change still requires a written T-state estimate
+   **before** the code change. The border timeline verifies the estimate
+   after the fact.
+
 ## When in doubt
 
 - Read `docs/superpowers/specs/` for design intent.
