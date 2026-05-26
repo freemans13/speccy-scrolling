@@ -53,21 +53,21 @@ SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no 
 ; OUTs land at different scanlines per frame → visibly flashing borders.
 ; Each busy-wait iter is `dec de ; ld a,d ; or e ; jr nz` = 26 T taken.
 ; Tune empirically with tools/snadump.py border R-delta variance.
-WBX_PAD_ITERS     EQU 60                  ; ~1560 T pad — matches wrap_byte_x cost on wrap frame
-WRAP_PAD_ITERS    EQU 380                 ; ~9880 T pad — reduced so non-wrap frames have headroom, accepting some wrap-vs-non-wrap variance to guarantee no overruns
+WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYAN wrap-vs-non-wrap variance for budget headroom
+WRAP_PAD_ITERS    EQU 1                   ; effectively 0 — dead since post_prep_step uses always-run; kept for symbol resolution
 ; Yellow-region constant-budget pads. Target total YELLOW work ≈ 3500 T
 ; (matches the rebuild_step finalize path which can't be made cheaper).
-REBUILD_IDLE_PAD_ITERS     EQU 130        ; ~3380 T — idle path (no rebuild)
-REBUILD_FINALIZE_PAD_ITERS EQU 20         ; ~520 T  — after finalize (~3 k T)
-REBUILD_2BAND_PAD_ITERS    EQU 105        ; ~2730 T — after 2× band emit (~800 T)
+REBUILD_IDLE_PAD_ITERS     EQU 1          ; effectively 0
+REBUILD_FINALIZE_PAD_ITERS EQU 1          ; effectively 0
+REBUILD_2BAND_PAD_ITERS    EQU 1          ; effectively 0
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
 ; eligible or skipped (~3920 T per active pipe).
-CVC_PIPE_PAD_ITERS         EQU 130        ; ~3380 T — flattens per-pipe skip variance in clear_vacated_columns
+CVC_PIPE_PAD_ITERS         EQU 1          ; effectively 0 — accept skip variance to free wrap-frame budget for contention
 ; write_jrskip_step idle pad — matches 2-band work cost (~3 k T) so the
 ; YELLOW→BLACK gap doesn't elevate for the 10 frames after each swap.
-JRSKIP_IDLE_PAD_ITERS      EQU 58         ; ~1508 T — matches 1-band work cost
+JRSKIP_IDLE_PAD_ITERS      EQU 1          ; effectively 0
 ; apply_pipe_attrs_wrap + restore_trailing_pipe_attrs edge-skip pads —
 ; match the paint cost (~500 T) so per-pipe edge skips (byte_x near 0
 ; or 28) don't shift BLACK position. Prep pipe still uses cheap skip.
@@ -76,7 +76,7 @@ RESTORE_PIPE_PAD_ITERS     EQU 19         ; ~494 T
 ; render_score (4-digit ROM-font draw) costs ~1500 T per call. Pad
 ; non-render frames to match so score-change frames don't shift the
 ; BLACK PROFILE_OUT later by ~1.5 k T (visible band-height variance).
-RENDER_SCORE_PAD_ITERS     EQU 27         ; ~702 T — matches render_score cost (~150 T × 4 digits + minimal get_digit)
+RENDER_SCORE_PAD_ITERS     EQU 1          ; effectively 0 — accept score-frame variance
 
 ; ─── Slot grid layout — Stage 3: EXX-free 2-push slots ────────────
 ; The grid is 80 pipe-bands, band-interleaved:
@@ -326,9 +326,13 @@ main_loop:
         or      e
         jr      nz, .sfp
 .post_prep_step:
-        ; Constant-budget: always run apply/restore/clear (idempotent on
-        ; non-wrap frames). Clear has per-pipe pad (constant cost). Removes
-        ; the wrap-vs-non-wrap T-state mismatch → flat BLACK position.
+        ; Wrap_pending gated: ULA contention makes always-run too costly to
+        ; fit in budget. Non-wrap frames skip the ~14k T apply/restore/clear
+        ; work. Borders show some flicker between wrap/non-wrap frames but
+        ; the alternative is 25 Hz drops on wrap frames.
+        ld      a, (wrap_pending)
+        or      a
+        jr      z, .no_wrap_pending
         xor     a
         ld      (wrap_pending), a
         call    apply_pipe_attrs_wrap

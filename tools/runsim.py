@@ -11,7 +11,7 @@ Args: SNA_FILE FRAMES
 import sys
 
 from skoolkit.snapshot import SNA
-from skoolkit.simulator import Simulator
+from skoolkit.cmiosimulator import CMIOSimulator as Simulator
 from skoolkit.simutils import REGISTERS, T, IFF, IM
 
 FRAME_TSTATES = 69888   # 48K Spectrum: T-states per 50Hz frame
