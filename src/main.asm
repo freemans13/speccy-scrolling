@@ -300,13 +300,14 @@ main_loop:
         jr      z, .no_wrap_pending
         xor     a
         ld      (wrap_pending), a
-        call    apply_pipe_attrs_wrap
-        call    restore_trailing_pipe_attrs
-        ; Replaces clear_vacated_columns (~14 k T) with attr mask
-        ; (~1-2 k T). Sets attr=$2D (paper cyan ink cyan = invisible)
-        ; at col byte_x+3 (the OLD R col from last wrap) so stale
-        ; R-col pipe pixels render as cyan. No need to zero pixel data.
-        call    mask_vacated_pipe_attrs
+        ; Order matters: pipes can be ~9-10 cols apart, so pipe A's
+        ; mask col (byte_x_A+3) can coincide with pipe B's M1 col
+        ; (byte_x_B). Run mask FIRST, then restore, then apply LAST so
+        ; apply's GREEN wins over any spurious attr set by another
+        ; pipe's mask/restore for the same col.
+        call    mask_vacated_pipe_attrs         ; first: $2D at byte_x+3 (OLD R)
+        call    restore_trailing_pipe_attrs     ; then:  sky $28 at byte_x+2 (NEW R)
+        call    apply_pipe_attrs_wrap           ; last:  GREEN at byte_x (NEW M1)
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
         PROFILE_OUT 0                   ; BLACK = idle before halt
@@ -3917,6 +3918,17 @@ mask_vacated_pipe_attrs:
         jr      c, .skip
         cp      28
         jr      nc, .skip
+        ; Skip cols 7, 8, 9 — bird occupies these. The bird sprite has
+        ; black-ink wings in cols 7/9 (relying on sky $28 ink black)
+        ; and its centre cell at col 8 carries ATTR_BIRD set by
+        ; paint_bird_attrs each frame. Masking to $2D would hide the
+        ; wings (invisible cyan ink) and require bird code to also
+        ; restore cols 7/9, which it doesn't today.
+        cp      7
+        jr      c, .do_mask                     ; col < 7 → mask
+        cp      10
+        jr      c, .skip                        ; col in [7..9] → bird, skip
+.do_mask:
         ld      c, a
         ld      a, (iy+1)
         ld      e, a
