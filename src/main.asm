@@ -2353,10 +2353,23 @@ init_pipes:
         ld      (init_pipe_bx_tmp), a        ; save byte_x for shift step
         pop     af
         push    af
-        ld      b, 0                         ; row_start = 0
-        ld      c, GROUND_TOP                ; row_end = 160 (full pass)
-        call    configure_pipe_slots
+        ; Patch-only renderer init: emit Stage 6 directly into PIPE_PROGRAM
+        ; via cps_emit_body_bands + finalize_pipe_init. Replaces the old
+        ; configure_pipe_slots (Stage 2 per-row 5-byte slots).
+        ld      (cps_pipe), a                ; A = pipe idx
+        ld      a, e                         ; E = gap_y
+        ld      (cps_gap_y), a
+        dec     a
+        ld      (cps_cap_top_row), a         ; gap_y - 1
+        ld      a, e
+        add     a, PIPE_GAP
+        ld      (cps_cap_bot_row), a         ; gap_y + PIPE_GAP
+        call    cps_emit_body_bands          ; sets cps_k_top/k_bot, emits body + capedge bands
+        call    finalize_pipe_init           ; cap arming + active list + cap target imms
         ; If byte_x < 29, shift this pipe's slot targets by (29 - byte_x).
+        ; shift_pipe_targets walks the active sublist (Stage-6-format from
+        ; cps_build_active_list) and decrements lo-bytes, shifting both IX
+        ; targets and cap handler target imms.
         ld      a, (init_pipe_bx_tmp)
         cp      29
         jr      z, .init_no_shift
@@ -2370,7 +2383,7 @@ init_pipes:
 .init_no_shift:
         pop     af
         inc     a
-        cp      3                            ; Phase 3: configure only pipes 0..2 (not pipe 3)
+        cp      3                            ; configure only pipes 0..2 (not pipe 3)
         jr      nz, .init_cps_lp
 
         ; Refactor: pipe 3 is the "prep" pipe. Its column is held as a
