@@ -3961,12 +3961,7 @@ do_swap:
 ; Clobbers: AF, BC, DE, HL, IX.
 ;----------------------------------------------------------------
 do_swap_part_b:
-        ld      a, (activate_pipe_idx)
-        call    un_jrskip_column                ; DD 21 at band+0..+1
-        ld      a, (activate_pipe_idx)
-        call    reset_ix_targets_to_29          ; band+2..+3 = byte_x=29 target for K
-
-        ; Publish cps_* for finalize_pipe_init.
+        ; Publish cps_* state for the emitters.
         ld      a, (activate_pipe_idx)
         ld      (cps_pipe), a
         add     a, a                            ; inc*2
@@ -3981,8 +3976,23 @@ do_swap_part_b:
         ld      a, (cps_gap_y)
         add     a, PIPE_GAP
         ld      (cps_cap_bot_row), a            ; gap_y + PIPE_GAP
-        call    cps_set_k_bounds                ; sets cps_k_top, cps_k_bot
-        call    finalize_pipe_init              ; emit capedge bands + arm caps + active list + cap target imms
+
+        ; cps_emit_body_bands handles body/capedge/skip dispatch per K. For
+        ; non-gap K (K<K_top, K==K_top, K==K_bot, K>K_bot) it rewrites
+        ; band+0..+51 fully — overwriting the JR-skip stamped at +0..+1 by
+        ; the previous deactivation's write_jrskip_column AND any stale
+        ; body/capedge content from prior activations. For gap K
+        ; (K_top<K<K_bot) it leaves the band alone — and write_jrskip_column
+        ; from previous deactivation keeps it JR-skipped (transparent).
+        ;
+        ; Why we can't just un_jr + reset_ix targets: bands that move from
+        ; gap (previous activation) to non-gap (this activation) have stale
+        ; body bytes (NOP-fill from init, or capedge code from two
+        ; activations ago) that would render as missing 8-row blocks or
+        ; ghost cap pixels. Fully re-emitting via cps_emit_body_bands is
+        ; the simplest fix.
+        call    cps_emit_body_bands             ; emits body + capedge for non-gap K, sets cps_k_top/k_bot
+        call    finalize_pipe_init              ; arm caps + active list + cap target imms (double-emits capedge — harmless)
 
         ld      a, 255
         ld      (activate_pipe_idx), a          ; PART B complete
