@@ -3490,6 +3490,47 @@ wrap_byte_x:
 ; Cost (rough): ~118 T per band × 20 bands × 3 pipes ≈ 7.2 k T per wrap frame.
 ; Clobbers: AF, BC, DE, HL, IY.
 ;----------------------------------------------------------------
+;----------------------------------------------------------------
+; clear_old_cap_rows: at swap time, zero the dep pipe's OLD cap_top_row
+; and OLD cap_bot_row across all visible cols (4..27). These rows had
+; cap pixels written every frame while dep was active; when dep becomes
+; prep and later re-activates with a different gap_y, those rows
+; become BODY or SKIP rows in the new K layout and may never be
+; overwritten — leaving 1-byte cap-pattern specks on screen.
+;
+; In: ds_old_gap_y (memory) — dep's OLD gap_y captured by do_swap.
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+clear_old_cap_rows:
+        ld      a, (ds_old_gap_y)
+        dec     a                               ; cap_top_row = old_gap_y - 1
+        call    .clear_pixel_row
+        ld      a, (ds_old_gap_y)
+        add     a, PIPE_GAP                     ; cap_bot_row = old_gap_y + PIPE_GAP
+        call    .clear_pixel_row
+        ret
+.clear_pixel_row:
+        ; In: A = screen pixel row (0..159). Clears cols 4..27 (24 bytes) of that row.
+        add     a, a                            ; row*2
+        ld      l, a
+        ld      h, 0
+        ld      de, line_table
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = line_table[row]
+        ld      h, d
+        ld      a, e
+        add     a, 4                            ; first visible col
+        ld      l, a
+        xor     a
+        ld      b, 24                           ; 24 visible cols
+.cpr_lp:
+        ld      (hl), a
+        inc     hl
+        djnz    .cpr_lp
+        ret
+
 clear_vacated_columns:
         ld      iy, pipe_state
         ld      b, NUM_PIPES
@@ -3709,6 +3750,14 @@ do_swap:
         ;    memory; HL' is untouched). Nothing to preserve.
         ld      a, (ds_dep)
         call    write_jrskip_column             ; one-shot 2-byte stamp per band (~600 T total)
+
+        ; Clear stale cap pixels at the dep's OLD gap_y rows (cap_top_row =
+        ; old_gap_y - 1, cap_bot_row = old_gap_y + PIPE_GAP). When dep
+        ; becomes prep and later re-activates with a NEW random gap_y, the
+        ; OLD cap rows become BODY or SKIP rows for the new pipe. SKIP rows
+        ; never overwrite, so old cap pixels persist as visible artefacts
+        ; (the 1-byte specks we saw). Cost ~600 T per swap.
+        call    clear_old_cap_rows
 
         ; 7. Update prep_pipe_idx, reset prep state, trigger post-swap build.
         ld      a, (ds_dep)
