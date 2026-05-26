@@ -65,9 +65,8 @@ REBUILD_2BAND_PAD_ITERS    EQU 1          ; effectively 0
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
 ; eligible or skipped (~3920 T per active pipe).
 CVC_PIPE_PAD_ITERS         EQU 1          ; effectively 0 — accept skip variance to free wrap-frame budget for contention
-; write_jrskip_step idle pad — matches 2-band work cost (~3 k T) so the
-; YELLOW→BLACK gap doesn't elevate for the 10 frames after each swap.
-JRSKIP_IDLE_PAD_ITERS      EQU 1          ; effectively 0
+; (JRSKIP_IDLE_PAD_ITERS removed — write_jrskip_step is gone now that
+; JR-skip stamping is fast enough to do all 20 bands in do_swap.)
 ; apply_pipe_attrs_wrap + restore_trailing_pipe_attrs edge-skip pads —
 ; match the paint cost (~500 T) so per-pipe edge skips (byte_x near 0
 ; or 28) don't shift BLACK position. Prep pipe still uses cheap skip.
@@ -276,7 +275,8 @@ main_loop:
         ; Constant-budget YELLOW: every frame pads to the same total cost
         ; (matching the worst-case finalize frame, ~3.4 k T) regardless of
         ; which rebuild_step path runs. Three converge points, three pad sizes.
-        call    write_jrskip_step               ; amortised dep-column NOP-fill (no-op when idle)
+        ; (write_jrskip_step removed — JR-skip stamp is now cheap enough to
+        ; do all 20 bands one-shot in do_swap, no per-frame amortisation needed)
         ld      a, (do_swap_fired)
         or      a
         jr      nz, .swap_frame_skip
@@ -2038,28 +2038,46 @@ build_slot_templates:
 
 ;----------------------------------------------------------------
 ; write_jrskip_column — make one pipe's whole PIPE_PROGRAM column a
-; no-op skip. Used for the parked prep pipe and to disarm the
+; no-op skip. Used for the parked prep pipe (init) and to disarm the
 ; departing pipe in do_swap.
 ;
-; Stage 2b: NOP-fills the body region (+0..67) of all 20 of the pipe's
-; bands. A NOP-filled band falls through +0..67 to the +68 trailer —
-; a valid no-op. Critically, NOP-filling the WHOLE band (not just a
-; couple of bytes) is what makes prep_step's INCREMENTAL rebuild safe:
-; as prep_step re-stamps rows over several frames, every not-yet-
-; stamped byte is a NOP (falls through), so a half-built band never
-; executes stale departing-pipe content (IX-walk fragments etc.).
-; The +68 trailer is left intact (written once by init_pipe_program).
+; Stamps `JR +66` (opcode $18 displacement $42) at each band's +0 byte.
+; The displacement carries execution from +0 to +68, which is exactly
+; the band trailer (a JP to the next band's base). The remaining bytes
+; +2..+67 are left intact but never executed.
+;
+; Why JR-skip instead of NOP-fill:
+;   - Writes 2 bytes per band instead of 68 → ~30 T per band vs ~1400 T
+;     for LDIR. Cheap enough that do_swap can do the full 20 bands
+;     synchronously — no amortisation needed, frees the YELLOW band
+;     in main_loop from running write_jrskip_step every frame.
+;   - At RUNTIME, a JR-skipped band costs 12 T (JR taken) + 10 T
+;     (trailer JP) = 22 T instead of 68 NOPs × 4 T + JP = 282 T.
+;     Saves ~260 T per skipped band × ~5 skipped bands × 3 pipes
+;     = ~4 k T per frame of PIPE_PROGRAM render. Big.
+;
+; Note for prep_step: as it incrementally rebuilds a band's body, the
+; bytes at +2..+67 may be partially stale. The JR at +0 still jumps to
+; +68, so stale fragments are unreachable. When the rebuild stamps a
+; new `ld ix, nnnn` at +0..+3 (overwriting the JR), the band is live.
+; Therefore the rebuild ordering MUST stamp the body BEFORE replacing
+; the +0 JR opcode — keep `ld ix` write last (matches existing emit_*).
 ;
 ; In:  A = pipe index (0..3).
 ; Clobbers: AF, BC, DE, HL.
 ;----------------------------------------------------------------
 write_jrskip_column:
-        ; Init-time path: do all 20 bands in one go. Used by init_pipes for
-        ; the parked prep pipe (init has plenty of time). do_swap takes the
-        ; amortised path via write_jrskip_arm + write_jrskip_step.
         call    .jrskip_addr_for_pipe           ; HL = band base (K=0, pipe)
         ld      b, 20
-        jr      .wjc_band
+        ld      de, 4 * BAND_STRIDE             ; +320 → next K, same pipe
+.wjc_band:
+        ld      (hl), $18                       ; JR opcode
+        inc     hl
+        ld      (hl), BAND_TRAILER_OFFSET - 2   ; displacement: from PC+2 (= band+2) to band+68 → 66
+        dec     hl                              ; HL → band base again
+        add     hl, de                          ; HL → next band base
+        djnz    .wjc_band
+        ret
 .jrskip_addr_for_pipe:
         ; In: A = pipe index. Out: HL = SLOT_GRID_BASE + pipe*80.
         ld      l, a
@@ -2076,94 +2094,6 @@ write_jrskip_column:
         ld      de, SLOT_GRID_BASE
         add     hl, de                          ; HL = band base (K=0, pipe)
         ret
-.wjc_band:
-        push    bc
-        push    hl                              ; save band base
-        ; NOP-fill +0..67 (68 bytes) of this band
-        ld      (hl), 0
-        ld      d, h
-        ld      e, l
-        inc     de                              ; DE = band base + 1
-        ld      bc, BAND_TRAILER_OFFSET - 1     ; 67 → fills +0..67
-        ldir
-        pop     hl                              ; HL = band base
-        ld      de, 4 * BAND_STRIDE             ; +320 → next K, same pipe
-        add     hl, de                          ; HL = next band base
-        pop     bc
-        djnz    .wjc_band
-        ret
-
-;----------------------------------------------------------------
-; Amortised jrskip: do_swap can't pay ~15-30 k T to NOP-fill 20 bands
-; in one frame (pushes wrap+swap frame past 70 k → 25 Hz drop). Instead,
-; do_swap calls write_jrskip_arm to record (pipe, 20 bands remaining,
-; band base), and main_loop calls write_jrskip_step once per frame to
-; clear JRSKIP_BANDS_PER_FRAME bands until done. The dep column's stale
-; body slots execute during the transition, but they wrote to col 0
-; (buffer, invisible) just before the swap and stay safe until cleared.
-;
-; State:
-;   jrskip_pending      0 = idle; >0 = bands remaining (1..20)
-;   jrskip_band_base    band base HL of the NEXT band to NOP-fill
-;----------------------------------------------------------------
-JRSKIP_BANDS_PER_FRAME EQU 1    ; 1 band × ~1.5 k T = ~1.5 k T per frame; 20 frames to finish (still well before next swap)
-
-write_jrskip_arm:
-        ; In: A = pipe index. Arms the amortised driver.
-        push    af
-        call    write_jrskip_column.jrskip_addr_for_pipe
-        ld      (jrskip_band_base), hl
-        ld      a, 20
-        ld      (jrskip_pending), a
-        pop     af
-        ret
-
-write_jrskip_step:
-        ld      a, (jrskip_pending)
-        or      a
-        jr      nz, .step_start
-        ; Idle: pad to match the 2-band work cost (~3 k T) so YELLOW→BLACK
-        ; gap doesn't elevate by 3 k T for the 10-frame post-swap window.
-        ld      de, JRSKIP_IDLE_PAD_ITERS
-.idle_pad:
-        dec     de
-        ld      a, d
-        or      e
-        jr      nz, .idle_pad
-        ret
-.step_start:
-        ; B = min(JRSKIP_BANDS_PER_FRAME, jrskip_pending)
-        cp      JRSKIP_BANDS_PER_FRAME
-        jr      nc, .step_full
-        ld      b, a
-        xor     a
-        ld      (jrskip_pending), a
-        jr      .step_run
-.step_full:
-        sub     JRSKIP_BANDS_PER_FRAME
-        ld      (jrskip_pending), a
-        ld      b, JRSKIP_BANDS_PER_FRAME
-.step_run:
-        ld      hl, (jrskip_band_base)
-.step_band:
-        push    bc
-        push    hl
-        ld      (hl), 0
-        ld      d, h
-        ld      e, l
-        inc     de
-        ld      bc, BAND_TRAILER_OFFSET - 1
-        ldir
-        pop     hl
-        ld      de, 4 * BAND_STRIDE
-        add     hl, de
-        pop     bc
-        djnz    .step_band
-        ld      (jrskip_band_base), hl
-        ret
-
-jrskip_pending:   db 0
-jrskip_band_base: dw 0
 
 ;----------------------------------------------------------------
 init_pipes:
@@ -3778,7 +3708,7 @@ do_swap:
         ;    live state in those registers at this point (ds_* scratch is in
         ;    memory; HL' is untouched). Nothing to preserve.
         ld      a, (ds_dep)
-        call    write_jrskip_arm                ; amortised — main_loop drives the chunks
+        call    write_jrskip_column             ; one-shot 2-byte stamp per band (~600 T total)
 
         ; 7. Update prep_pipe_idx, reset prep state, trigger post-swap build.
         ld      a, (ds_dep)
