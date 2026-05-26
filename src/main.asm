@@ -3566,17 +3566,17 @@ clear_vacated_columns:
         ld      c, a                            ; C = pipe index 0..3
         ld      a, (prep_pipe_idx)
         cp      c
-        jr      z, .cvc_skip                    ; prep pipe ALWAYS skipped — cheap skip (no pad)
+        jp      z, .cvc_skip                    ; prep pipe ALWAYS skipped — cheap skip (no pad). jp because grew past jr range.
         ld      a, (activate_pipe_idx)
         cp      c
-        jr      z, .cvc_pad_skip                ; occasionally skipped → pad to keep T constant
+        jp      z, .cvc_pad_skip                ; occasionally skipped → pad to keep T constant
         ; vacated_col = byte_x + 3
         ld      a, (iy+0)
         add     a, 3
         cp      32                              ; off-screen (col 32+) — pad to keep T constant
-        jr      nc, .cvc_pad_skip
+        jp      nc, .cvc_pad_skip
         cp      4                               ; in buffer cols 0..3 — pad to keep T constant
-        jr      c, .cvc_pad_skip
+        jp      c, .cvc_pad_skip
         ld      (cvc_col), a
         jr      .cvc_do_work
 .cvc_pad_skip:
@@ -3588,25 +3588,43 @@ clear_vacated_columns:
         ld      a, d
         or      e
         jr      nz, .cvc_pad_lp
-        jr      .cvc_skip
+        jp      .cvc_skip
 .cvc_do_work:
-        ; Stage 6: walk band_first_addr[] via IY (precomputed band base addrs)
-        ; instead of recomputing line_table[8K] per band. Per-band setup is now
-        ; ~50 T (table read + col add) vs ~150 T (line_table recompute), saving
-        ; ~6 k T per wrap frame across 3 pipes × 20 bands.
+        ; Stage 6 (v2): skip the gap region (bands K_top+1..K_bot-1) entirely.
+        ; Those bands hold the pipe's central gap → all-sky pixels, so clearing
+        ; them is wasted work. For typical gap_y=48, K_top=5, K_bot=12, gap = 6
+        ; bands → saves ~1 k T per pipe × 3 = ~3 k T per wrap.
         push    bc                              ; save outer NUM_PIPES counter
         push    iy                              ; CRITICAL: save outer IY (= pipe_state cursor) so .cvc_skip's inc iy operates on the right register
+        ; Compute K_top, K_bot from this pipe's gap_y (= iy+1 at entry, still valid).
+        ld      a, (iy+1)
+        dec     a
+        rrca
+        rrca
+        rrca
+        and     $1F
+        ld      (cvc_k_top), a                  ; K_top = (gap_y - 1) >> 3
+        ld      a, (iy+1)
+        add     a, PIPE_GAP
+        rrca
+        rrca
+        rrca
+        and     $1F
+        ld      (cvc_k_bot), a                  ; K_bot = (gap_y + PIPE_GAP) >> 3
         ld      iy, band_first_addr
-        ld      b, 20                           ; inner band counter
-.cvc_band:
+        ; ── Top region: bands 0..K_top inclusive ─────────────────────────
+        ld      a, (cvc_k_top)
+        inc     a                               ; band count = K_top + 1
+        ld      b, a
+.cvc_top:
         ld      l, (iy+0)
-        ld      h, (iy+1)                       ; HL = line_table[8K]
+        ld      h, (iy+1)
         ld      a, (cvc_col)
         add     a, l
         ld      l, a
-        jr      nc, .cvc_no_carry
+        jr      nc, .cvc_top_nc
         inc     h
-.cvc_no_carry:
+.cvc_top_nc:
         xor     a
         ld      (hl), a : inc h
         ld      (hl), a : inc h
@@ -3618,18 +3636,62 @@ clear_vacated_columns:
         ld      (hl), a
         inc     iy
         inc     iy
-        djnz    .cvc_band
+        djnz    .cvc_top
+        ; ── Skip the gap: advance IY by (K_bot - K_top - 1) × 2 bytes ────
+        ld      a, (cvc_k_bot)
+        ld      hl, cvc_k_top
+        sub     (hl)
+        dec     a                               ; A = gap bands (e.g. K_bot=12, K_top=5 → 6)
+        add     a, a                            ; × 2 bytes per band entry
+        push    iy
+        pop     hl
+        add     a, l
+        ld      l, a
+        jr      nc, .cvc_gap_nc
+        inc     h
+.cvc_gap_nc:
+        push    hl
+        pop     iy
+        ; ── Bottom region: bands K_bot..19 inclusive ─────────────────────
+        ld      a, 20
+        ld      hl, cvc_k_bot
+        sub     (hl)                            ; band count = 20 - K_bot
+        ld      b, a
+.cvc_bot:
+        ld      l, (iy+0)
+        ld      h, (iy+1)
+        ld      a, (cvc_col)
+        add     a, l
+        ld      l, a
+        jr      nc, .cvc_bot_nc
+        inc     h
+.cvc_bot_nc:
+        xor     a
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a : inc h
+        ld      (hl), a
+        inc     iy
+        inc     iy
+        djnz    .cvc_bot
         pop     iy                              ; restore outer IY (pipe_state cursor)
         pop     bc                              ; restore outer NUM_PIPES counter
 .cvc_skip:
         inc     iy
         inc     iy
         pop     bc
-        djnz    .cvc_outer
+        dec     b
+        jp      nz, .cvc_outer                  ; jp because djnz out of range after gap-skip work expanded the loop body
         ret
 
 cvc_col:        db 0
 cvc_k:          db 0
+cvc_k_top:      db 0
+cvc_k_bot:      db 0
 
 ;----------------------------------------------------------------
 ; do_swap: called when pipe A (departing) has reached byte_x=1.
