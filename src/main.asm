@@ -495,7 +495,9 @@ bird_overlap:       ds BIRD_LINES, 0
 ; ink (sprite=1) inside the silhouette, masking the cyan paper.
 bird_attr_y:        db 0
 bird_attr_valid:    db 0
-bird_attr_save:     db 0                ; single yellow cell (col 8)
+bird_attr_save:     db 0, 0, 0          ; saved attrs at cols 7, 8, 9 of bird_attr_y row
+                                        ; (bird now owns 3 cols so the mask_vacated_pipe_attrs
+                                        ; pass can't strip the wings' ink-black sky attr)
 
 ; Bird wing animation — 4 frames cycling 0→1→2→3→0, one phase step every
 ; BIRD_ANIM_RATE frames. bird_sprite_ptr always points at the current
@@ -3477,20 +3479,48 @@ paint_bird_attrs:
         ld      a, 1
         ld      (bird_attr_valid), a
         ld      a, (bird_attr_y)
-        call    bird_attr_addr
+        call    bird_attr_addr          ; HL = ATTRS[bird_attr_y, col 8]
+        ; Save existing attrs at cols 7, 8, 9 (so we can restore whatever
+        ; pipe / mask state was there). 3 bytes saved.
+        dec     hl                      ; HL = col 7
         ld      a, (hl)
         ld      (bird_attr_save), a
+        inc     hl                      ; HL = col 8
+        ld      a, (hl)
+        ld      (bird_attr_save + 1), a
+        inc     hl                      ; HL = col 9
+        ld      a, (hl)
+        ld      (bird_attr_save + 2), a
+        ; Write bird-visible attrs: col 7/9 = ATTR_SKY (paper cyan, ink
+        ; black — wings show as black silhouette); col 8 = ATTR_BIRD
+        ; (paper yellow, ink black — body fill + black detail).
+        ; Without this, mask_vacated_pipe_attrs could leave cols 7/9
+        ; at ATTR_BUFFER ($2D = paper=ink=cyan) so wing pixels become
+        ; invisible.
+        dec     hl
+        dec     hl                      ; HL = col 7
+        ld      (hl), ATTR_SKY
+        inc     hl
         ld      (hl), ATTR_BIRD
+        inc     hl
+        ld      (hl), ATTR_SKY
         ret
 
-; restore_bird_attrs: write saved attr byte back at bird_attr_y's row.
+; restore_bird_attrs: write saved 3 attr bytes back at bird_attr_y's row.
 restore_bird_attrs:
         ld      a, (bird_attr_valid)
         or      a
         ret     z
         ld      a, (bird_attr_y)
-        call    bird_attr_addr
+        call    bird_attr_addr          ; HL = col 8
+        dec     hl                      ; col 7
         ld      a, (bird_attr_save)
+        ld      (hl), a
+        inc     hl                      ; col 8
+        ld      a, (bird_attr_save + 1)
+        ld      (hl), a
+        inc     hl                      ; col 9
+        ld      a, (bird_attr_save + 2)
         ld      (hl), a
         ret
 
@@ -3918,17 +3948,6 @@ mask_vacated_pipe_attrs:
         jr      c, .skip
         cp      28
         jr      nc, .skip
-        ; Skip cols 7, 8, 9 — bird occupies these. The bird sprite has
-        ; black-ink wings in cols 7/9 (relying on sky $28 ink black)
-        ; and its centre cell at col 8 carries ATTR_BIRD set by
-        ; paint_bird_attrs each frame. Masking to $2D would hide the
-        ; wings (invisible cyan ink) and require bird code to also
-        ; restore cols 7/9, which it doesn't today.
-        cp      7
-        jr      c, .do_mask                     ; col < 7 → mask
-        cp      10
-        jr      c, .skip                        ; col in [7..9] → bird, skip
-.do_mask:
         ld      c, a
         ld      a, (iy+1)
         ld      e, a
