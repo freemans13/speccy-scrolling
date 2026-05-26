@@ -3588,6 +3588,7 @@ clear_vacated_columns:
         ; ~50 T (table read + col add) vs ~150 T (line_table recompute), saving
         ; ~6 k T per wrap frame across 3 pipes × 20 bands.
         push    bc                              ; save outer NUM_PIPES counter
+        push    iy                              ; CRITICAL: save outer IY (= pipe_state cursor) so .cvc_skip's inc iy operates on the right register
         ld      iy, band_first_addr
         ld      b, 20                           ; inner band counter
 .cvc_band:
@@ -3611,6 +3612,7 @@ clear_vacated_columns:
         inc     iy
         inc     iy
         djnz    .cvc_band
+        pop     iy                              ; restore outer IY (pipe_state cursor)
         pop     bc                              ; restore outer NUM_PIPES counter
 .cvc_skip:
         inc     iy
