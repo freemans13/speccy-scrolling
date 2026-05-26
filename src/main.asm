@@ -2477,10 +2477,11 @@ un_jrskip_visible:
 .ujv_lp:
         ld      a, (cps_k_top)
         cp      b
-        jr      nc, .ujv_write                  ; K_top >= K → K <= K_top → un-JR
+        jr      nc, .ujv_write                  ; K_top >= K → K <= K_top → un-JR (body OR K_top)
         ld      a, (cps_k_bot)
         cp      b
-        jr      c, .ujv_write                   ; K_bot < K → K > K_bot → un-JR
+        jr      c, .ujv_write                   ; K_bot < K → K > K_bot → un-JR (body below gap)
+        jr      z, .ujv_write                   ; K_bot == K → un-JR (K_bot cap-edge band itself!)
         jr      .ujv_next                       ; K_top < K < K_bot → gap, leave JR-skipped
 .ujv_write:
         ld      (hl), $DD                       ; ld ix, nn opcode byte 1
