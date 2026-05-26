@@ -67,7 +67,7 @@ REBUILD_2BAND_PAD_ITERS    EQU 105        ; ~2730 T — after 2× band emit (~80
 CVC_PIPE_PAD_ITERS         EQU 130        ; ~3380 T — flattens per-pipe skip variance in clear_vacated_columns
 ; write_jrskip_step idle pad — matches 2-band work cost (~3 k T) so the
 ; YELLOW→BLACK gap doesn't elevate for the 10 frames after each swap.
-JRSKIP_IDLE_PAD_ITERS      EQU 115        ; ~2990 T
+JRSKIP_IDLE_PAD_ITERS      EQU 58         ; ~1508 T — matches 1-band work cost
 ; apply_pipe_attrs_wrap + restore_trailing_pipe_attrs edge-skip pads —
 ; match the paint cost (~500 T) so per-pipe edge skips (byte_x near 0
 ; or 28) don't shift BLACK position. Prep pipe still uses cheap skip.
@@ -76,7 +76,7 @@ RESTORE_PIPE_PAD_ITERS     EQU 19         ; ~494 T
 ; render_score (4-digit ROM-font draw) costs ~1500 T per call. Pad
 ; non-render frames to match so score-change frames don't shift the
 ; BLACK PROFILE_OUT later by ~1.5 k T (visible band-height variance).
-RENDER_SCORE_PAD_ITERS     EQU 55         ; ~1430 T
+RENDER_SCORE_PAD_ITERS     EQU 27         ; ~702 T — matches render_score cost (~150 T × 4 digits + minimal get_digit)
 
 ; ─── Slot grid layout — Stage 3: EXX-free 2-push slots ────────────
 ; The grid is 80 pipe-bands, band-interleaved:
@@ -2102,7 +2102,7 @@ write_jrskip_column:
 ;   jrskip_pending      0 = idle; >0 = bands remaining (1..20)
 ;   jrskip_band_base    band base HL of the NEXT band to NOP-fill
 ;----------------------------------------------------------------
-JRSKIP_BANDS_PER_FRAME EQU 2    ; 2 bands × ~1.5 k T = ~3 k T per frame; 10 frames to finish
+JRSKIP_BANDS_PER_FRAME EQU 1    ; 1 band × ~1.5 k T = ~1.5 k T per frame; 20 frames to finish (still well before next swap)
 
 write_jrskip_arm:
         ; In: A = pipe index. Arms the amortised driver.
