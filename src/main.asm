@@ -3803,8 +3803,6 @@ do_swap:
         ;   rebuild_band_cursor = 0 → next call emits band 0
         ;   rebuild_k_top, rebuild_k_bot = K bounds for the new gap_y
         ;   prep_phase = 0 → not-done (do_swap.swap_with_prep blocks until 7)
-        ; ps_cap_top_row/ps_cap_bot_row no longer needed at this point —
-        ; rebuild_step's finalize derives them from prep_gap_y.
         xor     a
         ld      (prep_phase), a                 ; not-done; finalize sets to 7
         ld      (prep_row), a
