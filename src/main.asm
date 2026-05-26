@@ -1693,6 +1693,239 @@ cps_emit_body_bands:
         ret
 
 ;----------------------------------------------------------------
+; finalize_pipe_init: emit cap-edge bands for cps_k_top / cps_k_bot, build
+; active sublist, patch cap target imms from CAP_TARGET_TABLE, arm cap
+; slots in PIPE_PROGRAM, and stamp ps_cap_*_target / ps_cap_*_next into
+; the cap handler imms for cps_pipe.
+;
+; Extracted from rebuild_step.rs_finalize so it can be called from
+; init_pipes too (Phase 2 of the patch-only renderer refactor).
+;
+; In: cps_pipe (0..3), cps_gap_y, cps_cap_top_row, cps_cap_bot_row,
+;     cps_k_top, cps_k_bot all published.
+; Clobbers: AF, BC, DE, HL, IYL.
+;----------------------------------------------------------------
+finalize_pipe_init:
+        ; Self-repair cap_*_target_imm_addrs (defensive — matches ps_phase6).
+        ld      hl, cap_top_handler_pipe_0_target
+        ld      (cap_top_target_imm_addrs), hl
+        ld      hl, cap_top_handler_pipe_1_target
+        ld      (cap_top_target_imm_addrs + 2), hl
+        ld      hl, cap_top_handler_pipe_2_target
+        ld      (cap_top_target_imm_addrs + 4), hl
+        ld      hl, cap_top_handler_pipe_3_target
+        ld      (cap_top_target_imm_addrs + 6), hl
+        ld      hl, cap_bot_handler_pipe_0_target
+        ld      (cap_bot_target_imm_addrs), hl
+        ld      hl, cap_bot_handler_pipe_1_target
+        ld      (cap_bot_target_imm_addrs + 2), hl
+        ld      hl, cap_bot_handler_pipe_2_target
+        ld      (cap_bot_target_imm_addrs + 4), hl
+        ld      hl, cap_bot_handler_pipe_3_target
+        ld      (cap_bot_target_imm_addrs + 6), hl
+
+        ; Emit the two cap-edge bands. The cap slot $C3 + $00 $00 operand
+        ; they stamp is immediately patched with the real handler address
+        ; further down, so the cap slot never executes a stale operand.
+        ; --- K_top cap-edge band ---
+        ld      a, (cps_k_top)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_top band base
+        push    hl
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K_top*16
+        ld      de, screen_target_table_29
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = screen base
+        pop     hl                              ; HL = K_top grid band base
+        xor     a                               ; flag = 0 → K_top
+        call    emit_capedge_band
+        ; --- K_bot cap-edge band ---
+        ld      a, (cps_k_bot)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_bot band base
+        push    hl
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K_bot*16
+        ld      de, screen_target_table_29 + 2  ; band-row 1 address
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = screen base for band-row 1
+        pop     hl                              ; HL = K_bot grid band base
+        ld      a, 1                            ; flag = 1 → K_bot
+        call    emit_capedge_band
+
+        ; Build active list (cps_build_active_list uses cps_pipe/k_top/k_bot).
+        call    cps_build_active_list
+
+        ; Patch cap target imms from CAP_TARGET_TABLE.
+        ld      a, (cps_gap_y)
+        rrca
+        rrca
+        rrca                                    ; A = gap_y / 8
+        and     $0F
+        dec     a                               ; A = index (0..11)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl                          ; index * 4
+        ld      de, CAP_TARGET_TABLE
+        add     hl, de                          ; HL → entry
+        ld      a, (hl)
+        ld      (ps_cap_top_target), a
+        inc     hl
+        ld      a, (hl)
+        ld      (ps_cap_top_target + 1), a
+        inc     hl
+        ld      a, (hl)
+        ld      (ps_cap_bot_target), a
+        inc     hl
+        ld      a, (hl)
+        ld      (ps_cap_bot_target + 1), a
+
+        ; Compute cap _next addresses via compute_next_slot.
+        ld      a, (cps_cap_top_row)
+        call    compute_next_slot               ; HL = next slot addr
+        ld      a, l
+        ld      (ps_cap_top_next), a
+        ld      a, h
+        ld      (ps_cap_top_next + 1), a
+        ld      a, (cps_cap_bot_row)
+        call    compute_next_slot
+        ld      a, l
+        ld      (ps_cap_bot_next), a
+        ld      a, h
+        ld      (ps_cap_bot_next + 1), a
+
+        ; Arm cap slots in PIPE_PROGRAM (cap-handler addresses).
+        ;   K_top cap slot: band_base + 46 ($C3 already stamped by emit_capedge_band)
+        ;   K_bot cap slot: band_base + 4
+        ; Write handler addr at +47 (K_top) and +5 (K_bot).
+        ld      a, (cps_k_top)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_top band base
+        ld      de, 47
+        add     hl, de
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        push    hl
+        ld      hl, cap_top_handler_addrs
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        pop     hl
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ld      a, (cps_k_bot)
+        ld      (cps_k), a
+        call    cps_band_base                   ; HL = K_bot band base
+        ld      de, 5
+        add     hl, de
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        push    hl
+        ld      hl, cap_bot_handler_addrs
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        pop     hl
+        ld      (hl), e
+        inc     hl
+        ld      (hl), d
+
+        ; Write ps_cap_top_target into cap_top_handler_pipe_<inc>_target imm.
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_top_target_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        ld      hl, ps_cap_top_target
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_bot_target_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        ld      hl, ps_cap_bot_target
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
+        ; Write ps_cap_top_next / ps_cap_bot_next into cap_*_next imms.
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_top_next_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        ld      hl, ps_cap_top_next
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+
+        ld      a, (cps_pipe)
+        add     a, a
+        ld      e, a
+        ld      d, 0
+        ld      hl, cap_bot_next_imm_addrs
+        add     hl, de
+        ld      c, (hl)
+        inc     hl
+        ld      b, (hl)
+        ld      hl, ps_cap_bot_next
+        ld      a, (hl)
+        ld      (bc), a
+        inc     bc
+        inc     hl
+        ld      a, (hl)
+        ld      (bc), a
+        ret
+
+;----------------------------------------------------------------
 ; cps_build_active_list: build pipe cps_pipe's 112-entry active sublist.
 ;   body band: ld ix operand (band_base+2) + 7 × scroll_sink.
 ;   cap-edge:  8 entries (cps_emit_capedge).
@@ -2920,29 +3153,11 @@ rebuild_step:
 ; Mirrors ps_phase6's tail, but does NOT call cps_emit_body_bands
 ; (the per-frame loop above has already emitted every band).
 .rs_finalize:
-        ; Self-repair cap_*_target_imm_addrs (defensive — matches ps_phase6).
-        ld      hl, cap_top_handler_pipe_0_target
-        ld      (cap_top_target_imm_addrs), hl
-        ld      hl, cap_top_handler_pipe_1_target
-        ld      (cap_top_target_imm_addrs + 2), hl
-        ld      hl, cap_top_handler_pipe_2_target
-        ld      (cap_top_target_imm_addrs + 4), hl
-        ld      hl, cap_top_handler_pipe_3_target
-        ld      (cap_top_target_imm_addrs + 6), hl
-        ld      hl, cap_bot_handler_pipe_0_target
-        ld      (cap_bot_target_imm_addrs), hl
-        ld      hl, cap_bot_handler_pipe_1_target
-        ld      (cap_bot_target_imm_addrs + 2), hl
-        ld      hl, cap_bot_handler_pipe_2_target
-        ld      (cap_bot_target_imm_addrs + 4), hl
-        ld      hl, cap_bot_handler_pipe_3_target
-        ld      (cap_bot_target_imm_addrs + 6), hl
-
-        ; Publish cps_* state for the helpers below (cps_pipe, cps_cap_top_row,
-        ; cps_cap_bot_row, cps_k_top, cps_k_bot).
+        ; Publish cps_* state for finalize_pipe_init.
         ld      a, (activate_pipe_idx)
         ld      (cps_pipe), a
         ld      a, (prep_gap_y)
+        ld      (cps_gap_y), a
         dec     a
         ld      (cps_cap_top_row), a
         ld      a, (prep_gap_y)
@@ -2953,207 +3168,7 @@ rebuild_step:
         ld      a, (rebuild_k_bot)
         ld      (cps_k_bot), a
 
-        ; Emit the two cap-edge bands here (deferred from rs_advance dispatch
-        ; — see header). The cap slot $C3 + $00 $00 operand they stamp is
-        ; immediately patched with the real handler address further down,
-        ; so the cap slot never executes a stale operand.
-        ; --- K_top cap-edge band ---
-        ld      a, (rebuild_k_top)
-        ld      (cps_k), a
-        call    cps_band_base                   ; HL = K_top band base
-        push    hl
-        ld      a, (cps_k)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; K_top*16
-        ld      de, screen_target_table_29
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = screen base
-        pop     hl                              ; HL = K_top grid band base
-        xor     a                               ; flag = 0 → K_top
-        call    emit_capedge_band
-        ; --- K_bot cap-edge band ---
-        ld      a, (rebuild_k_bot)
-        ld      (cps_k), a
-        call    cps_band_base                   ; HL = K_bot band base
-        push    hl
-        ld      a, (cps_k)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; K_bot*16
-        ld      de, screen_target_table_29 + 2  ; band-row 1 address
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = screen base for band-row 1
-        pop     hl                              ; HL = K_bot grid band base
-        ld      a, 1                            ; flag = 1 → K_bot
-        call    emit_capedge_band
-
-        ; Build active list (cps_build_active_list uses cps_pipe/k_top/k_bot).
-        call    cps_build_active_list
-
-        ; Patch cap target imms from CAP_TARGET_TABLE.
-        ld      a, (prep_gap_y)
-        rrca
-        rrca
-        rrca                                    ; A = prep_gap_y / 8
-        and     $0F
-        dec     a                               ; A = index (0..11)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl                          ; index * 4
-        ld      de, CAP_TARGET_TABLE
-        add     hl, de                          ; HL → entry
-        ; Read cap_top_target → ps_cap_top_target scratch
-        ld      a, (hl)
-        ld      (ps_cap_top_target), a
-        inc     hl
-        ld      a, (hl)
-        ld      (ps_cap_top_target + 1), a
-        inc     hl
-        ld      a, (hl)
-        ld      (ps_cap_bot_target), a
-        inc     hl
-        ld      a, (hl)
-        ld      (ps_cap_bot_target + 1), a
-
-        ; Compute cap _next addresses via compute_next_slot.
-        ld      a, (cps_cap_top_row)
-        call    compute_next_slot               ; HL = next slot addr
-        ld      a, l
-        ld      (ps_cap_top_next), a
-        ld      a, h
-        ld      (ps_cap_top_next + 1), a
-        ld      a, (cps_cap_bot_row)
-        call    compute_next_slot
-        ld      a, l
-        ld      (ps_cap_bot_next), a
-        ld      a, h
-        ld      (ps_cap_bot_next + 1), a
-
-        ; Arm cap slots in PIPE_PROGRAM (cap-handler addresses).
-        ;   K_top cap slot: band_base + 46 ($C3 already stamped by emit_capedge_band)
-        ;   K_bot cap slot: band_base + 4
-        ; Write handler addr at +47 (K_top) and +5 (K_bot).
-        ld      a, (cps_k_top)
-        ld      (cps_k), a
-        call    cps_band_base                   ; HL = K_top band base
-        ld      de, 47
-        add     hl, de
-        ld      a, (activate_pipe_idx)
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        push    hl
-        ld      hl, cap_top_handler_addrs
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        pop     hl
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-
-        ld      a, (cps_k_bot)
-        ld      (cps_k), a
-        call    cps_band_base                   ; HL = K_bot band base
-        ld      de, 5
-        add     hl, de
-        ld      a, (activate_pipe_idx)
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        push    hl
-        ld      hl, cap_bot_handler_addrs
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)
-        pop     hl
-        ld      (hl), e
-        inc     hl
-        ld      (hl), d
-
-        ; Write ps_cap_top_target into cap_top_handler_pipe_<inc>_target imm.
-        ld      a, (activate_pipe_idx)
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        ld      hl, cap_top_target_imm_addrs
-        add     hl, de
-        ld      c, (hl)
-        inc     hl
-        ld      b, (hl)
-        ld      hl, ps_cap_top_target
-        ld      a, (hl)
-        ld      (bc), a
-        inc     bc
-        inc     hl
-        ld      a, (hl)
-        ld      (bc), a
-
-        ld      a, (activate_pipe_idx)
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        ld      hl, cap_bot_target_imm_addrs
-        add     hl, de
-        ld      c, (hl)
-        inc     hl
-        ld      b, (hl)
-        ld      hl, ps_cap_bot_target
-        ld      a, (hl)
-        ld      (bc), a
-        inc     bc
-        inc     hl
-        ld      a, (hl)
-        ld      (bc), a
-
-        ; Write ps_cap_top_next / ps_cap_bot_next into cap_*_next imms.
-        ld      a, (activate_pipe_idx)
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        ld      hl, cap_top_next_imm_addrs
-        add     hl, de
-        ld      c, (hl)
-        inc     hl
-        ld      b, (hl)
-        ld      hl, ps_cap_top_next
-        ld      a, (hl)
-        ld      (bc), a
-        inc     bc
-        inc     hl
-        ld      a, (hl)
-        ld      (bc), a
-
-        ld      a, (activate_pipe_idx)
-        add     a, a
-        ld      e, a
-        ld      d, 0
-        ld      hl, cap_bot_next_imm_addrs
-        add     hl, de
-        ld      c, (hl)
-        inc     hl
-        ld      b, (hl)
-        ld      hl, ps_cap_bot_next
-        ld      a, (hl)
-        ld      (bc), a
-        inc     bc
-        inc     hl
-        ld      a, (hl)
-        ld      (bc), a
+        call    finalize_pipe_init
 
         ; Mark rebuild done. prep_phase=7 unblocks do_swap's swap_with_prep.
         ; activate_pipe_idx=255 unfreezes patch_pipe_targets for this pipe.
