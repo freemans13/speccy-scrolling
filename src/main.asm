@@ -284,6 +284,13 @@ main_loop:
         ld      (sound_heavy_frame), a
         call    do_swap_part_b                  ; clears activate_pipe_idx → 255
 .post_prep_step:
+        ; BLUE marker delimits the wrap post-prep work (apply attrs,
+        ; restore trailing, clear vacated columns — together ~14 k T on
+        ; wrap frames) from the YELLOW PART B work above. Without this
+        ; split the YELLOW border band visually conflated the two and
+        ; could reach ~21 k T on wrap+swap+1 frames; now YELLOW is
+        ; bounded by do_swap_part_b cost (≤ ~10 k T).
+        PROFILE_OUT 1                   ; BLUE = post_prep wrap work + sfx
         ; Wrap_pending gated: ULA contention makes always-run too costly to
         ; fit in budget. Non-wrap frames skip the ~14k T apply/restore/clear
         ; work. Borders show some flicker between wrap/non-wrap frames but
@@ -1231,8 +1238,85 @@ finalize_pipe_init:
         call    emit_capedge_band
 
         ; Build active list (cps_build_active_list uses cps_pipe/k_top/k_bot).
+        ; ONLY runs from the full finalize_pipe_init entry point — the
+        ; finalize_pipe_init_lite entry SKIPS this by jumping to finalize_pipe_init_post_list.
+        ; The list contents are invariant per pipe — body IX-operand entries
+        ; and cap-handler-target-imm entries reference fixed addresses
+        ; regardless of which K is K_top/K_bot. Built once at init;
+        ; rebuilding per activation wastes ~3-4 k T.
         call    cps_build_active_list
+        jp      finalize_pipe_init_post_list
 
+;----------------------------------------------------------------
+; finalize_pipe_init_lite — entry point for do_swap_part_b. Same body
+; as finalize_pipe_init (self-repair + cap-edge emit + cap arming +
+; cap target/_next imm patching) but SKIPS cps_build_active_list.
+; The active list is built once at init and never rebuilt.
+;
+; Saves ~3-4 k T per activation vs finalize_pipe_init.
+;----------------------------------------------------------------
+finalize_pipe_init_lite:
+        ; Self-repair cap_*_target_imm_addrs (defensive).
+        ld      hl, cap_top_handler_pipe_0_target
+        ld      (cap_top_target_imm_addrs), hl
+        ld      hl, cap_top_handler_pipe_1_target
+        ld      (cap_top_target_imm_addrs + 2), hl
+        ld      hl, cap_top_handler_pipe_2_target
+        ld      (cap_top_target_imm_addrs + 4), hl
+        ld      hl, cap_top_handler_pipe_3_target
+        ld      (cap_top_target_imm_addrs + 6), hl
+        ld      hl, cap_bot_handler_pipe_0_target
+        ld      (cap_bot_target_imm_addrs), hl
+        ld      hl, cap_bot_handler_pipe_1_target
+        ld      (cap_bot_target_imm_addrs + 2), hl
+        ld      hl, cap_bot_handler_pipe_2_target
+        ld      (cap_bot_target_imm_addrs + 4), hl
+        ld      hl, cap_bot_handler_pipe_3_target
+        ld      (cap_bot_target_imm_addrs + 6), hl
+
+        ; Emit K_top cap-edge band.
+        ld      a, (cps_k_top)
+        ld      (cps_k), a
+        call    cps_band_base
+        push    hl
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K_top * 16
+        ld      de, screen_target_table_29
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = byte_x=29 base for K_top row 0
+        pop     hl
+        xor     a                               ; flag = 0 → K_top
+        call    emit_capedge_band
+
+        ; Emit K_bot cap-edge band.
+        ld      a, (cps_k_bot)
+        ld      (cps_k), a
+        call    cps_band_base
+        push    hl
+        ld      a, (cps_k)
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K_bot * 16
+        ld      de, screen_target_table_29 + 2  ; band-row 1 address
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        pop     hl
+        ld      a, 1                            ; flag = 1 → K_bot
+        call    emit_capedge_band
+
+finalize_pipe_init_post_list:
         ; Patch cap target imms from CAP_TARGET_TABLE.
         ld      a, (cps_gap_y)
         rrca
@@ -2723,7 +2807,7 @@ do_swap_part_b:
         call    un_jrskip_visible               ; DD 21 at +0..+1 for non-gap K only
         ld      a, (activate_pipe_idx)
         call    reset_ix_targets_to_29          ; byte_x=29 IX target at +2..+3 (all K)
-        call    finalize_pipe_init              ; K_top/K_bot capedges + cap arming + active list + cap target imms
+        call    finalize_pipe_init_lite         ; K_top/K_bot capedges + cap arming + cap target imms (skips active list rebuild)
 
         ld      a, 255
         ld      (activate_pipe_idx), a          ; PART B complete
