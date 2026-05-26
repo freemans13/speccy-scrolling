@@ -1,0 +1,7 @@
+# Baseline: patch-only-renderer branch, before any refactor
+# Commit: c503b86
+# Sim: runsim.py 1000 frames (69888015 T-states)
+
+BLACK markers: 985
+BLACK->BLACK delta: min=42725 max=94606 avg=69878 spread=51881
+Overruns (d>100000): 0
