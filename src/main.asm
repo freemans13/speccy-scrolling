@@ -1528,6 +1528,11 @@ cps_sublist_base_table:
 ; Used by configure_pipe_slots body emit to skip the line_table+byte_x add.
 screen_target_table_29: ds 320, 0       ; 160 entries × 2 bytes
 band_first_addr:        ds 40,  0       ; 20 entries × 2 bytes: line_table[8K] for K=0..19
+; IX_TARGETS_29: 20 entries × 2 bytes = byte_x=29 row-0 screen address
+; for each K=0..19. Built at init by init_screen_target_table's tail.
+; Used by do_swap_part_b's reset_ix_targets_to_29 — sequential 40-byte
+; read replaces the slow 320-byte strided read from screen_target_table_29.
+IX_TARGETS_29:          ds 40,  0
 
 ;----------------------------------------------------------------
 ; init_background: zero bg_buffer (all-sky) then blit to screen pixels.
@@ -1589,6 +1594,30 @@ init_screen_target_table:
         inc     h
 .bfa_nc:
         djnz    .bfa_lp
+
+        ; Populate IX_TARGETS_29[20] = screen_target_table_29[8K] for
+        ; K=0..19 (byte_x=29 band-row-0 screen address per K). Used by
+        ; reset_ix_targets_to_29 in do_swap_part_b — sequential 40-byte
+        ; read instead of 320-byte strided read from screen_target_table_29.
+        ld      hl, screen_target_table_29
+        ld      de, IX_TARGETS_29
+        ld      b, 20
+.ixt_lp:
+        ld      a, (hl)
+        ld      (de), a
+        inc     hl
+        inc     de
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        ; HL: consumed 1 byte of K's 16-byte block; advance +15 to next K.
+        ld      a, l
+        add     a, 15
+        ld      l, a
+        jr      nc, .ixt_nc
+        inc     h
+.ixt_nc:
+        djnz    .ixt_lp
         ret
 
 ;----------------------------------------------------------------
@@ -2480,26 +2509,17 @@ reset_ix_targets_to_29:
         call    column_base_for_pipe            ; HL = band 0 base
         push    hl
         pop     ix                              ; IX = dest cursor (band base)
-        ld      hl, screen_target_table_29      ; HL = src (byte_x=29 base for K=0)
+        ld      hl, IX_TARGETS_29               ; HL = 40-byte sequential src
+        ld      de, 4 * BAND_STRIDE             ; DE = +320 stride between bands
         ld      b, 20
 .rixt_K:
-        ld      e, (hl)
+        ld      a, (hl)
+        ld      (ix+2), a
         inc     hl
-        ld      d, (hl)                         ; DE = screen_target_table_29[8K] (byte_x=29 row-0)
-        ld      (ix+2), e
-        ld      (ix+3), d
-        ; HL: consumed 1 byte of K's 16-byte block, advance +15 to next K.
-        ld      a, l
-        add     a, 15
-        ld      l, a
-        jr      nc, .rixt_hl_nc
-        inc     h
-.rixt_hl_nc:
-        ; IX: +320 to reach next band of same pipe.
-        push    de
-        ld      de, 4 * BAND_STRIDE
+        ld      a, (hl)
+        ld      (ix+3), a
+        inc     hl
         add     ix, de
-        pop     de
         djnz    .rixt_K
         ret
 
