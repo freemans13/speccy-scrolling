@@ -54,12 +54,6 @@ SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no 
 ; Each busy-wait iter is `dec de ; ld a,d ; or e ; jr nz` = 26 T taken.
 ; Tune empirically with tools/snadump.py border R-delta variance.
 WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYAN wrap-vs-non-wrap variance for budget headroom
-WRAP_PAD_ITERS    EQU 1                   ; effectively 0 — dead since post_prep_step uses always-run; kept for symbol resolution
-; Yellow-region constant-budget pads. Target total YELLOW work ≈ 3500 T
-; (matches the rebuild_step finalize path which can't be made cheaper).
-REBUILD_IDLE_PAD_ITERS     EQU 1          ; effectively 0
-REBUILD_FINALIZE_PAD_ITERS EQU 1          ; effectively 0
-REBUILD_2BAND_PAD_ITERS    EQU 1          ; effectively 0
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -3443,20 +3437,12 @@ wrap_byte_x:
         dec     a
         jr      .wbx_save
 .swap_with_prep:
-        ; Pipe reached byte_x=1. Only swap if prep is fully ready (phase 7).
-        ; Otherwise DEFER: leave byte_x=1 (no save), retry next wrap.
-        ; patch_pipe_targets keeps decrementing the deferred pipe's targets,
-        ; so it scrolls visibly off-screen left into buffer cols 0..3 then
-        ; into ROM (silent writes). Next wrap re-evaluates when prep may be
-        ; ready. Avoids fallback path's half-configured-OLD-prep corruption.
-        ld      a, (prep_phase)
-        cp      7
-        jr      nz, .wbx_skip                   ; defer — prep not ready
-        ; Phase 5: pipe reached byte_x=1. Swap with the prep pipe.
+        ; Pipe reached byte_x=1. Phase 3 patch-only renderer: do_swap is
+        ; synchronous and always ready — no defer-until-prep-ready guard.
         push    bc
         push    iy
         ld      a, c                            ; A = departing pipe index
-        call    do_swap                         ; O(1) swap — no configure spike
+        call    do_swap                         ; PART A + C in WHITE; PART B in YELLOW same frame
         pop     iy
         pop     bc
         jr      .wbx_skip                       ; do_swap wrote pipe_state directly; skip (iy+0) write
@@ -3937,19 +3923,10 @@ do_swap:
         ld      (hl), c                         ; pipe_state[dep].gap_y = fresh random
 
         ; Signal PART B pending: activate_pipe_idx = inc. main_loop's
-        ; YELLOW region (next frame) sees this and runs do_swap_part_b,
-        ; which clears it back to 255.
+        ; YELLOW region (same frame, later) runs do_swap_part_b, which
+        ; clears it back to 255.
         ld      a, (ds_inc)
         ld      (activate_pipe_idx), a
-        ; Quiesce the now-deprecated prep_phase / rebuild_band_cursor /
-        ; do_swap_fired state so the rest of main_loop sees a coherent
-        ; idle picture until Phase 4/5 deletes those checks.
-        ld      a, 7
-        ld      (prep_phase), a
-        ld      a, 21
-        ld      (rebuild_band_cursor), a
-        xor     a
-        ld      (do_swap_fired), a
         ret
 
 ;----------------------------------------------------------------
