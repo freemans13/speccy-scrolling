@@ -1,5 +1,6 @@
 build/
 tools/sjasmplus/
+tools/__pycache__/
 .DS_Store
 # z80dasm scratch dumps
 0x*
