@@ -302,7 +302,11 @@ main_loop:
         ld      (wrap_pending), a
         call    apply_pipe_attrs_wrap
         call    restore_trailing_pipe_attrs
-        call    clear_vacated_columns
+        ; Replaces clear_vacated_columns (~14 k T) with attr mask
+        ; (~1-2 k T). Sets attr=$2D (paper cyan ink cyan = invisible)
+        ; at col byte_x+3 (the OLD R col from last wrap) so stale
+        ; R-col pipe pixels render as cyan. No need to zero pixel data.
+        call    mask_vacated_pipe_attrs
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
         PROFILE_OUT 0                   ; BLACK = idle before halt
@@ -3880,6 +3884,121 @@ restore_trailing_pipe_attrs:
         inc     iy
         pop     bc
         djnz    .lp
+        ret
+
+;----------------------------------------------------------------
+; mask_vacated_pipe_attrs — for each active pipe, set the col one
+; beyond rightmost pipe cell (col byte_x+3, = the OLD R col from last
+; wrap) to ATTR_BUFFER ($2D = paper cyan ink cyan = invisible). The
+; pipe rendered R-col pixels there last wrap; with attr=$2D those
+; stale pixels are masked invisible.
+;
+; Replaces clear_vacated_columns: instead of zeroing the pixel data
+; (~14 k T per wrap), just flip the attribute so any pixels in the
+; cell render as cyan. Saves ~12 k T per wrap-frame BLUE band.
+;
+; Restricted to top + bottom char-rows like paint/restore — gap-region
+; cells are sky already and have no pipe pixels.
+;----------------------------------------------------------------
+mask_vacated_pipe_attrs:
+        ld      iy, pipe_state
+        ld      b, NUM_PIPES
+.lp:
+        push    bc
+        ld      a, NUM_PIPES
+        sub     b
+        ld      c, a                            ; C = current pipe index
+        ld      a, (prep_pipe_idx)
+        cp      c
+        jr      z, .skip
+        ld      a, (iy+0)
+        add     a, 3                            ; OLD R col = byte_x + 3
+        cp      4
+        jr      c, .skip
+        cp      28
+        jr      nc, .skip
+        ld      c, a
+        ld      a, (iy+1)
+        ld      e, a
+        call    mask_pipe_attrs_inner_1col
+.skip:
+        inc     iy
+        inc     iy
+        pop     bc
+        djnz    .lp
+        ret
+
+;----------------------------------------------------------------
+; mask_pipe_attrs_inner_1col — paint ATTR_BUFFER at single col C for
+; top + bottom char-row regions of pipe with gap_y in E. Mirrors
+; paint_pipe_attrs_inner_1col / restore_pipe_attrs_inner_1col but
+; writes ATTR_BUFFER (invisible) instead of ATTR_PIPE or BACKUP attrs.
+; In: C = col (4..27), E = gap_y.   Clobbers: AF, BC, HL.   Preserves: DE.
+;----------------------------------------------------------------
+mask_pipe_attrs_inner_1col:
+        ld      a, e
+        or      a
+        jr      z, .no_top
+        dec     a
+        srl     a
+        srl     a
+        srl     a
+        inc     a
+        ld      b, a
+        xor     a
+        call    mask_attr_rows_1col
+.no_top:
+        ld      a, e
+        add     a, PIPE_GAP
+        jr      c, .done
+        add     a, 7
+        jr      c, .done
+        srl     a
+        srl     a
+        srl     a
+        cp      20
+        jr      nc, .done
+        ld      d, a
+        ld      a, 20
+        sub     d
+        ld      b, a
+        ld      a, d
+        call    mask_attr_rows_1col
+.done:
+        ret
+
+;----------------------------------------------------------------
+; mask_attr_rows_1col — write ATTR_BUFFER at single col C for B
+; char-rows starting at row A.
+; In: A = start row (0..23), B = row count, C = col.
+; Clobbers: AF, B, HL.   Preserves: DE.
+;----------------------------------------------------------------
+mask_attr_rows_1col:
+        push    de
+        push    bc
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; HL = row*32
+        ld      de, ATTRS
+        add     hl, de
+        ld      d, 0
+        ld      e, c
+        add     hl, de                          ; HL = ATTRS[row*32 + col]
+        pop     bc
+.row_lp:
+        ld      (hl), ATTR_BUFFER
+        ld      a, l
+        add     a, 32
+        ld      l, a
+        jr      nc, .nc
+        inc     h
+.nc:
+        djnz    .row_lp
+        pop     de
         ret
 ;----------------------------------------------------------------
 ; paint_buffer_attrs: overlay invisible attr at buffer cols (0-3, 28-31)
