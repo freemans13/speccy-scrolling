@@ -2549,7 +2549,11 @@ restore_capedges_to_body:
         call    column_base_for_pipe            ; HL = column base (K=0)
         pop     bc
 
-        ; ── K_top band: write band+46..+51 with B-row pattern ──
+        ; ── K_top band: undo 3-byte cap stamp at band+46..+48 ──
+        ; Stamp was $C3 lo hi (jp cap_top_handler); body band's row 7
+        ; (B-row) first 3 bytes are $DD F9 E5 (ld sp, ix; push hl).
+        ; Body row 7 last 3 bytes at +49..+51 (C5 DD 24) were never
+        ; overwritten by the cap stamp — still present.
         push    hl
         push    bc
         ld      a, b                            ; A = K_top
@@ -2561,37 +2565,24 @@ restore_capedges_to_body:
         ld      (hl), $F9
         inc     hl
         ld      (hl), $E5                       ; push hl  (B-row variant)
-        inc     hl
-        ld      (hl), $C5                       ; push bc
-        inc     hl
-        ld      (hl), $DD
-        inc     hl
-        ld      (hl), $24                       ; inc ixh
         pop     bc
         pop     hl
 
-        ; ── K_bot band: re-emit as body via emit_body_band (52-byte write).
-        ; Body layout's rows 1..7 are at +10..+51, NOT +7..+48 like cap-edge
-        ; K_bot, so a 6-byte cap-slot patch would misalign every row that
-        ; follows. emit_body_band rewrites +0..+51 cleanly and sets the IX
-        ; target to byte_x=29's band-row-0 address (vs cap-edge's row-1).
+        ; ── K_bot band: undo 3-byte cap stamp at band+4..+6 ──
+        ; Stamp was $C3 lo hi (jp cap_bot_handler); body band's row 0
+        ; (A-row) first 3 bytes are $DD F9 D5 (ld sp, ix; push de).
+        ; Body row 0 last 3 bytes at +7..+9 (C5 DD 24) were never
+        ; overwritten — still present.
         ld      a, c                            ; A = K_bot
-        call    .rcb_add_k_bands                ; HL += K * 320 → K_bot band base
-        push    hl                              ; save band base
-        ld      a, c                            ; A = K_bot
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; K_bot * 16
-        ld      de, screen_target_table_29
-        add     hl, de
-        ld      e, (hl)
+        call    .rcb_add_k_bands                ; HL += K * (4 * BAND_STRIDE)
+        ld      de, 4
+        add     hl, de                          ; HL = K_bot band + 4
+        ld      (hl), $DD
         inc     hl
-        ld      d, (hl)                         ; DE = byte_x=29 row-0 base for K_bot
-        pop     hl                              ; HL = K_bot band base
-        jp      emit_body_band                  ; rewrites +0..+51 (tail-call)
+        ld      (hl), $F9
+        inc     hl
+        ld      (hl), $D5                       ; push de  (A-row variant)
+        ret
 
 .rcb_add_k_bands:
         ; HL += A * (4 * BAND_STRIDE).  A=0..19.
