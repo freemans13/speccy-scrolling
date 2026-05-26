@@ -54,7 +54,7 @@ SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no 
 ; Each busy-wait iter is `dec de ; ld a,d ; or e ; jr nz` = 26 T taken.
 ; Tune empirically with tools/snadump.py border R-delta variance.
 WBX_PAD_ITERS     EQU 60                  ; ~1560 T pad — matches wrap_byte_x cost on wrap frame
-WRAP_PAD_ITERS    EQU 590                 ; ~15340 T pad — matches apply+restore+clear cost (CVC pad ~13.5 k T, apply+restore ~2 k T)
+WRAP_PAD_ITERS    EQU 380                 ; ~9880 T pad — reduced so non-wrap frames have headroom, accepting some wrap-vs-non-wrap variance to guarantee no overruns
 ; Yellow-region constant-budget pads. Target total YELLOW work ≈ 3500 T
 ; (matches the rebuild_step finalize path which can't be made cheaper).
 REBUILD_IDLE_PAD_ITERS     EQU 130        ; ~3380 T — idle path (no rebuild)
@@ -64,10 +64,15 @@ REBUILD_2BAND_PAD_ITERS    EQU 105        ; ~2730 T — after 2× band emit (~80
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
 ; eligible or skipped (~3920 T per active pipe).
-CVC_PIPE_PAD_ITERS         EQU 130        ; ~3380 T
+CVC_PIPE_PAD_ITERS         EQU 130        ; ~3380 T — flattens per-pipe skip variance in clear_vacated_columns
 ; write_jrskip_step idle pad — matches 2-band work cost (~3 k T) so the
 ; YELLOW→BLACK gap doesn't elevate for the 10 frames after each swap.
 JRSKIP_IDLE_PAD_ITERS      EQU 115        ; ~2990 T
+; apply_pipe_attrs_wrap + restore_trailing_pipe_attrs edge-skip pads —
+; match the paint cost (~500 T) so per-pipe edge skips (byte_x near 0
+; or 28) don't shift BLACK position. Prep pipe still uses cheap skip.
+APPLY_PIPE_PAD_ITERS       EQU 19         ; ~494 T
+RESTORE_PIPE_PAD_ITERS     EQU 19         ; ~494 T
 ; render_score (4-digit ROM-font draw) costs ~1500 T per call. Pad
 ; non-render frames to match so score-change frames don't shift the
 ; BLACK PROFILE_OUT later by ~1.5 k T (visible band-height variance).
@@ -321,20 +326,9 @@ main_loop:
         or      e
         jr      nz, .sfp
 .post_prep_step:
-        ; Wrap-frame screen/attr work gated on wrap_pending. Clear has
-        ; per-pipe pad inside, so its cost is constant ~16 k T per call.
-        ; Non-wrap pads with WRAP_PAD_ITERS to match → flat BLACK position.
-        ld      a, (wrap_pending)
-        or      a
-        jr      nz, .ppw_do
-        ld      de, WRAP_PAD_ITERS
-.ppw_pad:
-        dec     de
-        ld      a, d
-        or      e
-        jr      nz, .ppw_pad
-        jr      .no_wrap_pending
-.ppw_do:
+        ; Constant-budget: always run apply/restore/clear (idempotent on
+        ; non-wrap frames). Clear has per-pipe pad (constant cost). Removes
+        ; the wrap-vs-non-wrap T-state mismatch → flat BLACK position.
         xor     a
         ld      (wrap_pending), a
         call    apply_pipe_attrs_wrap
