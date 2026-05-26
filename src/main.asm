@@ -65,6 +65,9 @@ REBUILD_2BAND_PAD_ITERS    EQU 105        ; ~2730 T — after 2× band emit (~80
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
 ; eligible or skipped (~3920 T per active pipe).
 CVC_PIPE_PAD_ITERS         EQU 130        ; ~3380 T
+; write_jrskip_step idle pad — matches 2-band work cost (~3 k T) so the
+; YELLOW→BLACK gap doesn't elevate for the 10 frames after each swap.
+JRSKIP_IDLE_PAD_ITERS      EQU 115        ; ~2990 T
 ; render_score (4-digit ROM-font draw) costs ~1500 T per call. Pad
 ; non-render frames to match so score-change frames don't shift the
 ; BLACK PROFILE_OUT later by ~1.5 k T (visible band-height variance).
@@ -2120,7 +2123,17 @@ write_jrskip_arm:
 write_jrskip_step:
         ld      a, (jrskip_pending)
         or      a
-        ret     z
+        jr      nz, .step_start
+        ; Idle: pad to match the 2-band work cost (~3 k T) so YELLOW→BLACK
+        ; gap doesn't elevate by 3 k T for the 10-frame post-swap window.
+        ld      de, JRSKIP_IDLE_PAD_ITERS
+.idle_pad:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .idle_pad
+        ret
+.step_start:
         ; B = min(JRSKIP_BANDS_PER_FRAME, jrskip_pending)
         cp      JRSKIP_BANDS_PER_FRAME
         jr      nc, .step_full
