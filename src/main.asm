@@ -1814,19 +1814,35 @@ init_pipes:
         ld      (init_pipe_bx_tmp), a        ; save byte_x for shift step
         pop     af
         push    af
-        ; Patch-only renderer init: emit Stage 6 directly into PIPE_PROGRAM
-        ; via cps_emit_body_bands + finalize_pipe_init. Replaces the old
-        ; configure_pipe_slots (Stage 2 per-row 5-byte slots).
+        ; Patch-only renderer init: TWO-PASS emit so EVERY K band carries
+        ; valid body code, including K positions that are gap for THIS
+        ; pipe's initial gap_y. This invariant lets do_swap_part_b at
+        ; activation skip the heavy cps_emit_body_bands call — it just
+        ; toggles +0..+1 (un-JR non-gap, leave gap as JR-skip) and resets
+        ; IX targets, while finalize_pipe_init handles K_top/K_bot.
+        ;
+        ;   Pass 1: cps_emit_body_bands with K_top=K_bot=21 (out-of-range)
+        ;           → every K K<21 → body branch → emit_body_band stamps
+        ;             all 20 bands as body.
+        ;   Pass 2: real cap_top_row/cap_bot_row + finalize_pipe_init
+        ;           → emit_capedge_band overwrites K_top, K_bot bands as
+        ;             cap-edge; cap arming, active list, cap target imms.
         ld      (cps_pipe), a                ; A = pipe idx
         ld      a, e                         ; E = gap_y
         ld      (cps_gap_y), a
+        ld      a, 168                       ; out-of-range cap rows → K=21
+        ld      (cps_cap_top_row), a
+        ld      (cps_cap_bot_row), a
+        call    cps_emit_body_bands          ; Pass 1: all-body for every K
+        ; Pass 2: real K bounds + finalize.
+        ld      a, (cps_gap_y)
         dec     a
         ld      (cps_cap_top_row), a         ; gap_y - 1
-        ld      a, e
+        ld      a, (cps_gap_y)
         add     a, PIPE_GAP
         ld      (cps_cap_bot_row), a         ; gap_y + PIPE_GAP
-        call    cps_emit_body_bands          ; sets cps_k_top/k_bot, emits body + capedge bands
-        call    finalize_pipe_init           ; cap arming + active list + cap target imms
+        call    cps_set_k_bounds             ; sets cps_k_top/k_bot from cap_*_row
+        call    finalize_pipe_init           ; K_top/K_bot capedges + cap arming + active list + cap target imms
         ; If byte_x < 29, shift this pipe's slot targets by (29 - byte_x).
         ; shift_pipe_targets walks the active sublist (Stage-6-format from
         ; cps_build_active_list) and decrements lo-bytes, shifting both IX
@@ -2406,6 +2422,82 @@ column_base_for_pipe:
         ret
 
 ;----------------------------------------------------------------
+; un_jrskip_visible — write `ld ix, nn` opcode (DD 21) at band+0..+1
+; of every NON-gap band of pipe A. Gap bands (K_top < K < K_bot) are
+; left JR-skipped from the previous write_jrskip_column.
+;
+; Pairs with write_jrskip_column. Used by do_swap_part_b when an
+; incoming pipe re-activates. Skipping gap K is essential — every
+; band carries valid body code (init invariant; restore_capedges_to_body
+; preserves it at deactivation), so un-JRing a gap band would render
+; pipe pixels in the visual gap.
+;
+; In: A = pipe (0..3); cps_k_top, cps_k_bot already published.
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+un_jrskip_visible:
+        call    column_base_for_pipe            ; HL = band 0 base
+        ld      de, 4 * BAND_STRIDE             ; +320 → next K, same pipe
+        ld      b, 0                            ; B = K counter (0..19)
+.ujv_lp:
+        ld      a, (cps_k_top)
+        cp      b
+        jr      nc, .ujv_write                  ; K_top >= K → K <= K_top → un-JR
+        ld      a, (cps_k_bot)
+        cp      b
+        jr      c, .ujv_write                   ; K_bot < K → K > K_bot → un-JR
+        jr      .ujv_next                       ; K_top < K < K_bot → gap, leave JR-skipped
+.ujv_write:
+        ld      (hl), $DD                       ; ld ix, nn opcode byte 1
+        inc     hl
+        ld      (hl), $21                       ; ld ix, nn opcode byte 2
+        dec     hl
+.ujv_next:
+        add     hl, de
+        inc     b
+        ld      a, b
+        cp      20
+        jr      nz, .ujv_lp
+        ret
+
+;----------------------------------------------------------------
+; reset_ix_targets_to_29 — set every band's IX-target operand at
+; band+2..+3 to screen_target_table_29[8K] (byte_x=29's band-row-0
+; address) for K=0..19. All 20 bands written; gap bands' targets are
+; harmless (band is JR-skipped). The K_bot band needs the [8K+2]
+; entry instead, but finalize_pipe_init's emit_capedge_band rewrites
+; that band's IX target afterwards.
+;
+; In: A = pipe (0..3).  Clobbers: AF, BC, DE, HL, IX.
+;----------------------------------------------------------------
+reset_ix_targets_to_29:
+        call    column_base_for_pipe            ; HL = band 0 base
+        push    hl
+        pop     ix                              ; IX = dest cursor (band base)
+        ld      hl, screen_target_table_29      ; HL = src (byte_x=29 base for K=0)
+        ld      b, 20
+.rixt_K:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = screen_target_table_29[8K] (byte_x=29 row-0)
+        ld      (ix+2), e
+        ld      (ix+3), d
+        ; HL: consumed 1 byte of K's 16-byte block, advance +15 to next K.
+        ld      a, l
+        add     a, 15
+        ld      l, a
+        jr      nc, .rixt_hl_nc
+        inc     h
+.rixt_hl_nc:
+        ; IX: +320 to reach next band of same pipe.
+        push    de
+        ld      de, 4 * BAND_STRIDE
+        add     ix, de
+        pop     de
+        djnz    .rixt_K
+        ret
+
+;----------------------------------------------------------------
 ; restore_capedges_to_body — at dep deactivation, overwrite the dep
 ; pipe's OLD K_top and K_bot cap-edge bands' cap-slot bytes with the
 ; corresponding body-row IX-walk bytes, so the column is in a clean
@@ -2605,7 +2697,7 @@ do_swap:
 ; Clobbers: AF, BC, DE, HL, IX.
 ;----------------------------------------------------------------
 do_swap_part_b:
-        ; Publish cps_* state for the emitters.
+        ; Publish cps_* state.
         ld      a, (activate_pipe_idx)
         ld      (cps_pipe), a
         add     a, a                            ; inc*2
@@ -2620,23 +2712,18 @@ do_swap_part_b:
         ld      a, (cps_gap_y)
         add     a, PIPE_GAP
         ld      (cps_cap_bot_row), a            ; gap_y + PIPE_GAP
+        call    cps_set_k_bounds                ; sets cps_k_top, cps_k_bot
 
-        ; cps_emit_body_bands handles body/capedge/skip dispatch per K. For
-        ; non-gap K (K<K_top, K==K_top, K==K_bot, K>K_bot) it rewrites
-        ; band+0..+51 fully — overwriting the JR-skip stamped at +0..+1 by
-        ; the previous deactivation's write_jrskip_column AND any stale
-        ; body/capedge content from prior activations. For gap K
-        ; (K_top<K<K_bot) it leaves the band alone — and write_jrskip_column
-        ; from previous deactivation keeps it JR-skipped (transparent).
-        ;
-        ; Why we can't just un_jr + reset_ix targets: bands that move from
-        ; gap (previous activation) to non-gap (this activation) have stale
-        ; body bytes (NOP-fill from init, or capedge code from two
-        ; activations ago) that would render as missing 8-row blocks or
-        ; ghost cap pixels. Fully re-emitting via cps_emit_body_bands is
-        ; the simplest fix.
-        call    cps_emit_body_bands             ; emits body + capedge for non-gap K, sets cps_k_top/k_bot
-        call    finalize_pipe_init              ; arm caps + active list + cap target imms (double-emits capedge — harmless)
+        ; Lightweight activation — relies on the "every band carries body
+        ; code" invariant (init_pipes Pass 1 + restore_capedges_to_body
+        ; at deactivation). PART B was 15 k T when it called
+        ; cps_emit_body_bands; this trio runs in ~3-4 k T and keeps the
+        ; YELLOW border band proportionally smaller.
+        ld      a, (activate_pipe_idx)
+        call    un_jrskip_visible               ; DD 21 at +0..+1 for non-gap K only
+        ld      a, (activate_pipe_idx)
+        call    reset_ix_targets_to_29          ; byte_x=29 IX target at +2..+3 (all K)
+        call    finalize_pipe_init              ; K_top/K_bot capedges + cap arming + active list + cap target imms
 
         ld      a, 255
         ld      (activate_pipe_idx), a          ; PART B complete
