@@ -952,9 +952,12 @@ compute_next_slot:
         and     7
         cp      7
         jr      z, .cns_band_last
-        ; cap_bot (band-row 0): next = band_base + 7
+        ; cap_bot (band-row 0): next = band_base + 10
+        ; (body-aligned K_bot — body band row 1 starts at +10, not +7 like
+        ;  the legacy K_bot capedge layout. cap_bot handler advances IX
+        ;  with inc ixh before jumping here, so IX = row-1 on entry.)
         call    cps_band_base           ; HL = K_bot band base (uses cps_k)
-        ld      de, 7
+        ld      de, 10
         add     hl, de
         ret
 .cns_band_last:
@@ -1067,34 +1070,25 @@ cps_set_k_bounds:
         ret
 
 ;----------------------------------------------------------------
-; cps_emit_body_bands: overwrite every IX-walk band of pipe cps_pipe with
-; its IX-walk form:
-;   K < K_top  or  K > K_bot   → pure body band (emit_body_band)
-;   K == K_top                 → K_top cap-edge band (emit_capedge_band, flag=0)
-;   K == K_bot                 → K_bot cap-edge band (emit_capedge_band, flag=1)
-;   K_top < K < K_bot          → skip band, left in per-row CAP_BLOCK form
-;                                (the 48 skip rows in between).
-; Sets cps_k_top / cps_k_bot first. The ld ix operand comes from
-; screen_target_table_29 — see emit_capedge_band's header for the K_bot
-; +1 entry subtlety. byte_x=29 baseline; shift_pipe_targets adjusts.
-; Clobbers: AF, BC, DE, HL.
+; cps_emit_body_bands: overwrite every band of pipe cps_pipe as a pure
+; body band. Establishes the "every K carries body code" invariant that
+; finalize_pipe_init relies on for its 3-byte cap-slot stamps.
+;
+; (Pre-refactor this routine dispatched on K to emit cap-edge bands at
+; K_top/K_bot. Now K_top/K_bot start as body and finalize_pipe_init
+; overlays the cap slot via a 3-byte $C3 stamp. K_bot uses the same
+; body-aligned layout — IX target = row-0 address — so the band code
+; from +10..+51 is body rows 1..7 in both states; the cap_bot handler
+; advances IX with inc ixh before jumping back to band+10.)
+;
+; Sets cps_k_top / cps_k_bot first (still needed by finalize_pipe_init
+; and downstream callers). Clobbers: AF, BC, DE, HL.
 ;----------------------------------------------------------------
 cps_emit_body_bands:
         call    cps_set_k_bounds
         xor     a
         ld      (cps_k), a
 .cebb_lp:
-        ld      a, (cps_k)
-        ld      hl, cps_k_top
-        cp      (hl)
-        jr      c, .cebb_body                   ; K < K_top → body
-        jr      z, .cebb_capedge_top            ; K == K_top → cap-edge top
-        ld      hl, cps_k_bot
-        cp      (hl)
-        jr      z, .cebb_capedge_bot            ; K == K_bot → cap-edge bot
-        jr      c, .cebb_next                   ; K_top < K < K_bot → skip
-        jr      .cebb_body                      ; K > K_bot → body
-.cebb_body:
         call    cps_band_base                   ; HL = grid band base
         push    hl
         ; DE = screen_target_table_29[8K]  (entry 8K → byte offset 16K)
@@ -1109,50 +1103,9 @@ cps_emit_body_bands:
         add     hl, de
         ld      e, (hl)
         inc     hl
-        ld      d, (hl)                         ; DE = screen base (byte_x=29)
+        ld      d, (hl)                         ; DE = screen base (byte_x=29 row-0)
         pop     hl                              ; HL = grid band base
         call    emit_body_band
-        jr      .cebb_next
-.cebb_capedge_top:
-        call    cps_band_base                   ; HL = grid band base
-        push    hl
-        ; DE = screen_target_table_29[8*K_top]  (band-row 0 of K_top band)
-        ld      a, (cps_k)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; K_top*16
-        ld      de, screen_target_table_29
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = screen base for band-row 0
-        pop     hl                              ; HL = grid band base
-        xor     a                               ; flag = 0 → K_top
-        call    emit_capedge_band
-        jr      .cebb_next
-.cebb_capedge_bot:
-        call    cps_band_base                   ; HL = grid band base
-        push    hl
-        ; DE = screen_target_table_29[8*K_bot + 1]  (band-row 1 of K_bot band!)
-        ; Byte offset = K_bot*16 + 2.
-        ld      a, (cps_k)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; K_bot*16
-        ld      de, screen_target_table_29 + 2
-        add     hl, de
-        ld      e, (hl)
-        inc     hl
-        ld      d, (hl)                         ; DE = screen base for band-row 1
-        pop     hl                              ; HL = grid band base
-        ld      a, 1                            ; flag = 1 → K_bot
-        call    emit_capedge_band
 .cebb_next:
         ld      a, (cps_k)
         inc     a
@@ -1193,49 +1146,34 @@ finalize_pipe_init:
         ld      hl, cap_bot_handler_pipe_3_target
         ld      (cap_bot_target_imm_addrs + 6), hl
 
-        ; Emit the two cap-edge bands. The cap slot $C3 + $00 $00 operand
-        ; they stamp is immediately patched with the real handler address
-        ; further down, so the cap slot never executes a stale operand.
-        ; --- K_top cap-edge band ---
+        ; Stamp 3-byte cap slots ($C3 lo hi at band+46..+48 for K_top, at
+        ; band+4..+6 for K_bot) on top of body bands. Body band layout
+        ; provides everything else — rows 0..6 for K_top, rows 1..7 for
+        ; K_bot via the cap_bot handler's `inc ixh ; jp band+10` trick.
+        ; The 2-byte handler operand is patched further down (cap arming
+        ; step), so the band never executes $C3 jp $0000.
+        ; --- K_top cap stamp at band+46..+48 ---
         ld      a, (cps_k_top)
         ld      (cps_k), a
         call    cps_band_base                   ; HL = K_top band base
-        push    hl
-        ld      a, (cps_k)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; K_top*16
-        ld      de, screen_target_table_29
+        ld      de, 46
         add     hl, de
-        ld      e, (hl)
+        ld      (hl), $C3                       ; jp opcode
         inc     hl
-        ld      d, (hl)                         ; DE = screen base
-        pop     hl                              ; HL = K_top grid band base
-        xor     a                               ; flag = 0 → K_top
-        call    emit_capedge_band
-        ; --- K_bot cap-edge band ---
+        ld      (hl), 0                         ; operand lo (patched in arming)
+        inc     hl
+        ld      (hl), 0                         ; operand hi (patched in arming)
+        ; --- K_bot cap stamp at band+4..+6 ---
         ld      a, (cps_k_bot)
         ld      (cps_k), a
         call    cps_band_base                   ; HL = K_bot band base
-        push    hl
-        ld      a, (cps_k)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; K_bot*16
-        ld      de, screen_target_table_29 + 2  ; band-row 1 address
+        ld      de, 4
         add     hl, de
-        ld      e, (hl)
+        ld      (hl), $C3                       ; jp opcode
         inc     hl
-        ld      d, (hl)                         ; DE = screen base for band-row 1
-        pop     hl                              ; HL = K_bot grid band base
-        ld      a, 1                            ; flag = 1 → K_bot
-        call    emit_capedge_band
+        ld      (hl), 0                         ; operand lo
+        inc     hl
+        ld      (hl), 0                         ; operand hi
 
         ; Build active list (cps_build_active_list uses cps_pipe/k_top/k_bot).
         ; ONLY runs from the full finalize_pipe_init entry point — the
@@ -1274,47 +1212,31 @@ finalize_pipe_init_lite:
         ld      hl, cap_bot_handler_pipe_3_target
         ld      (cap_bot_target_imm_addrs + 6), hl
 
-        ; Emit K_top cap-edge band.
+        ; Stamp 3-byte cap slots on body bands. Same as finalize_pipe_init
+        ; above — band already carries body code (init invariant +
+        ; restore_capedges_to_body symmetry), we just overlay the cap
+        ; slot.
         ld      a, (cps_k_top)
         ld      (cps_k), a
         call    cps_band_base
-        push    hl
-        ld      a, (cps_k)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; K_top * 16
-        ld      de, screen_target_table_29
+        ld      de, 46
         add     hl, de
-        ld      e, (hl)
+        ld      (hl), $C3
         inc     hl
-        ld      d, (hl)                         ; DE = byte_x=29 base for K_top row 0
-        pop     hl
-        xor     a                               ; flag = 0 → K_top
-        call    emit_capedge_band
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
 
-        ; Emit K_bot cap-edge band.
         ld      a, (cps_k_bot)
         ld      (cps_k), a
         call    cps_band_base
-        push    hl
-        ld      a, (cps_k)
-        ld      l, a
-        ld      h, 0
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; K_bot * 16
-        ld      de, screen_target_table_29 + 2  ; band-row 1 address
+        ld      de, 4
         add     hl, de
-        ld      e, (hl)
+        ld      (hl), $C3
         inc     hl
-        ld      d, (hl)
-        pop     hl
-        ld      a, 1                            ; flag = 1 → K_bot
-        call    emit_capedge_band
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
 
 finalize_pipe_init_post_list:
         ; Patch cap target imms from CAP_TARGET_TABLE.
@@ -2910,6 +2832,7 @@ cap_bot_handler_pipe_0_bc EQU $+1
         ld      hl, $0000
         push    hl
         ld      hl, (body_b_de)
+        inc     ixh                             ; advance IX from K_bot row-0 → row-1 so body band's row-1 code at +10 finds IX at row-1
 cap_bot_handler_pipe_0_next EQU $+1
         jp      $0000
 
@@ -2923,6 +2846,7 @@ cap_bot_handler_pipe_1_bc EQU $+1
         ld      hl, $0000
         push    hl
         ld      hl, (body_b_de)
+        inc     ixh                             ; advance IX from K_bot row-0 → row-1
 cap_bot_handler_pipe_1_next EQU $+1
         jp      $0000
 
@@ -2936,6 +2860,7 @@ cap_bot_handler_pipe_2_bc EQU $+1
         ld      hl, $0000
         push    hl
         ld      hl, (body_b_de)
+        inc     ixh                             ; advance IX from K_bot row-0 → row-1
 cap_bot_handler_pipe_2_next EQU $+1
         jp      $0000
 
@@ -2949,6 +2874,7 @@ cap_bot_handler_pipe_3_bc EQU $+1
         ld      hl, $0000
         push    hl
         ld      hl, (body_b_de)
+        inc     ixh                             ; advance IX from K_bot row-0 → row-1
 cap_bot_handler_pipe_3_next EQU $+1
         jp      $0000
 
