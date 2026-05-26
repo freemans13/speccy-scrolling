@@ -265,66 +265,22 @@ main_loop:
         PROFILE_OUT 5                   ; CYAN = update_cap_imm_v2
         call    update_cap_imm_v2
         PROFILE_OUT 6                   ; YELLOW = column build
-        ; Stage 5: band-granular amortised pipe-recycle driver.
-        ; do_swap sets activate_pipe_idx + resets rebuild_band_cursor=0; the
-        ; rebuild_step routine emits ONE band per call (~400 T) until cursor
-        ; reaches 20, then runs a one-shot finalize (active list + cap arm +
-        ; cap target/_next imms) and clears activate_pipe_idx back to 255.
-        ; do_swap_fired still suppresses the very first call so the swap
-        ; frame itself bears no extra rebuild cost.
-        ; Constant-budget YELLOW: every frame pads to the same total cost
-        ; (matching the worst-case finalize frame, ~3.4 k T) regardless of
-        ; which rebuild_step path runs. Three converge points, three pad sizes.
-        ; (write_jrskip_step removed — JR-skip stamp is now cheap enough to
-        ; do all 20 bands one-shot in do_swap, no per-frame amortisation needed)
-        ld      a, (do_swap_fired)
-        or      a
-        jr      nz, .swap_frame_skip
+        ; Patch-only renderer (Phase 3): the YELLOW region runs PART B
+        ; of a deferred do_swap. do_swap (called from wrap_byte_x on the
+        ; swap frame) does PART A + PART C, then sets activate_pipe_idx
+        ; = inc to signal "PART B pending". The next frame's YELLOW sees
+        ; activate_pipe_idx != 255 and runs do_swap_part_b, which clears
+        ; activate_pipe_idx back to 255.
+        ;
+        ; (Old rebuild_step amortised band-emit + REBUILD_*_PAD_ITERS
+        ; constant-budget pads removed — Phase 4. do_swap_fired suppressor
+        ; also no longer needed.)
         ld      a, (activate_pipe_idx)
         cp      255
-        jr      z, .yellow_idle_pad             ; no rebuild this frame
+        jr      z, .post_prep_step              ; idle frame, nothing to do
         ld      a, 1
         ld      (sound_heavy_frame), a
-        call    rebuild_step
-        ld      a, (activate_pipe_idx)
-        cp      255
-        jr      z, .yellow_post_finalize_pad    ; 1st call finalized → small pad
-        call    rebuild_step                    ; 2nd band emit → medium pad
-.yellow_post_2band_pad:
-        ld      de, REBUILD_2BAND_PAD_ITERS
-.y2bp:
-        dec     de
-        ld      a, d
-        or      e
-        jr      nz, .y2bp
-        jr      .post_prep_step
-.yellow_post_finalize_pad:
-        ld      de, REBUILD_FINALIZE_PAD_ITERS
-.yfpp:
-        dec     de
-        ld      a, d
-        or      e
-        jr      nz, .yfpp
-        jr      .post_prep_step
-.yellow_idle_pad:
-        ld      de, REBUILD_IDLE_PAD_ITERS
-.yip:
-        dec     de
-        ld      a, d
-        or      e
-        jr      nz, .yip
-        jr      .post_prep_step
-.swap_frame_skip:
-        xor     a
-        ld      (do_swap_fired), a
-        ld      a, 1
-        ld      (sound_heavy_frame), a
-        ld      de, REBUILD_IDLE_PAD_ITERS
-.sfp:
-        dec     de
-        ld      a, d
-        or      e
-        jr      nz, .sfp
+        call    do_swap_part_b                  ; clears activate_pipe_idx back to 255
 .post_prep_step:
         ; Wrap_pending gated: ULA contention makes always-run too costly to
         ; fit in budget. Non-wrap frames skip the ~14k T apply/restore/clear
@@ -2386,15 +2342,31 @@ init_pipes:
         cp      3                            ; configure only pipes 0..2 (not pipe 3)
         jr      nz, .init_cps_lp
 
-        ; Refactor: pipe 3 is the "prep" pipe. Its column is held as a
+        ; Pipe 3 is the "prep" pipe at startup. Its column is held as a
         ; JR-skip column (cheap no-op) until the first do_swap activates it.
         ; pipe_state[3].byte_x = 29 — parked off-screen right, invisible.
         ; pipe_state[3].gap_y is left at its data default (a valid 8..96
         ; value); do_swap reads it when pipe 3 first activates.
+        ;
+        ; Patch-only renderer (Phase 3): the body bytes at band+4..+51 of
+        ; every band must be valid IX-walk code BEFORE the first activation,
+        ; because do_swap's un_jrskip_column + reset_ix_targets_to_29 +
+        ; finalize_pipe_init patch only band+0..+3 (and the K_top/K_bot
+        ; bands' cap-slot regions). Emit pipe 3 as ALL-body (out-of-range
+        ; K_top/K_bot via cap_row=168 → K=21) so cps_emit_body_bands picks
+        ; .cebb_body for every K and never tries to emit a cap-edge band
+        ; (which would land outside the column).
+        ld      a, 3
+        ld      (cps_pipe), a
+        ld      a, 168
+        ld      (cps_cap_top_row), a         ; K_top = 21 (out-of-range)
+        ld      (cps_cap_bot_row), a         ; K_bot = 21 (out-of-range)
+        call    cps_emit_body_bands          ; emit body code for all 20 bands
+
         ld      a, 29
         ld      (pipe_state + 3*2), a        ; pipe 3 byte_x = 29
         ld      a, 3
-        call    write_jrskip_column          ; pipe 3 column = JR-skip
+        call    write_jrskip_column          ; pipe 3 column = JR-skip (body bytes preserved)
 
         ; Defensive: zero-fill ACTIVE_PIPE_3 (224 bytes) so that if do_swap's
         ; fallback path ever triggers patch_pipe_targets before phase 6 runs,
@@ -3697,161 +3669,323 @@ cvc_k_top:      db 0
 cvc_k_bot:      db 0
 
 ;----------------------------------------------------------------
-; do_swap: called when pipe A (departing) has reached byte_x=1.
-;
-; Only called from wrap_byte_x's .swap_with_prep, which is guarded by
-; prep_phase==7, so do_swap always performs a full swap (~14 k T total).
-;   - Set pipe_state[incoming].byte_x = 29 (gap_y left untouched — already correct).
-;   - Cap arming (incoming $C3 + handler addrs + target/_next imms) is NOT done
-;     here: it is relocated to ps_phase6's tail so it survives prep_step's
-;     post-swap column rebuild (ps_phase1 NOP-fills the cap range).
-;   - Dep column becomes JR-skip via write_jrskip_column (all 160 slots, full
-;     6-byte overwrite — disarms old cap $C3 opcodes, no partial-rewrite hazard).
-;   - Update prep_pipe_idx = dep. Set activate_pipe_idx = inc and reset prep
-;     state to phase 0 so prep_step rebuilds the incoming column.
-;   - Pick the departing pipe's next gap_y (random_gap_y) and store it into
-;     pipe_state[dep].gap_y; consumed when dep next activates.
-;   NOTE: incoming pipe's body slot targets are NOT written here. prep_step phases 0
-;   and 2 stamp body slots with target=line_addr+34 (byte_x=29 buffer col, invisible).
-;   After swap the newly-active pipe's body slots already point at byte_x=29.
-;   patch_pipe_targets walks the new active pipe each wrap → targets decrement and
-;   pipe scrolls leftward naturally.
-;
-; In:  A = departing pipe index (0..3; NOT prep_pipe_idx).
-; Clobbers: AF, BC, DE, HL, HL' (saved and restored).
+; column_base_for_pipe: HL = address of band 0 for pipe A in PIPE_PROGRAM.
+;   = SLOT_GRID_BASE + pipe * BAND_STRIDE.
+; In: A = pipe (0..3).  Clobbers: AF, DE, HL.
 ;----------------------------------------------------------------
-do_swap:
-        ld      (ds_dep), a                     ; save departing pipe index
-
-        ; ── Full swap ────────────────────────────────────────────────────
-        ; do_swap is only ever called from wrap_byte_x's .swap_with_prep,
-        ; which guards the call with prep_phase==7. The historical fallback
-        ; path (prep not ready) is therefore unreachable and was removed.
-.ds_full_swap:
-        ; Capture dep's OLD gap_y for later band-boundary computations.
-        ; Must happen BEFORE step 3 overwrites pipe_state[inc].
-        ld      a, (ds_dep)
-        add     a, a                            ; dep*2
+column_base_for_pipe:
         ld      l, a
         ld      h, 0
-        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
-        add     hl, de                          ; HL = &pipe_state[dep].gap_y
-        ld      a, (hl)                         ; A = OLD gap_y
-        ld      (ds_old_gap_y), a
+        add     hl, hl                          ; pipe*2
+        add     hl, hl                          ; pipe*4
+        add     hl, hl                          ; pipe*8
+        add     hl, hl                          ; pipe*16
+        ld      d, h
+        ld      e, l                            ; DE = pipe*16
+        add     hl, hl                          ; pipe*32
+        add     hl, hl                          ; pipe*64
+        add     hl, de                          ; pipe*80
+        ld      de, SLOT_GRID_BASE
+        add     hl, de
+        ret
 
-        ld      a, (prep_pipe_idx)
-        ld      (ds_inc), a                     ; incoming = old prep_pipe_idx
+;----------------------------------------------------------------
+; un_jrskip_column — undo a JR-skip column: write `ld ix, nn` opcode
+; ($DD $21) at band+0..+1 of all 20 of pipe A's bands.
+;
+; Pairs with write_jrskip_column. Used in do_swap when an incoming
+; pipe re-activates after being parked as the prep pipe.
+;
+; The IX-target operand at band+2..+3 is NOT touched here — caller
+; runs reset_ix_targets_to_29 and (for K_top/K_bot) finalize_pipe_init
+; to land the right values for the new gap_y.
+;
+; In: A = pipe (0..3).  Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+un_jrskip_column:
+        call    column_base_for_pipe            ; HL = band 0 base
+        ld      b, 20
+        ld      de, 4 * BAND_STRIDE             ; +320 → next K, same pipe
+.ujc_band:
+        ld      (hl), $DD                       ; ld ix, nn opcode byte 1
+        inc     hl
+        ld      (hl), $21                       ; ld ix, nn opcode byte 2
+        dec     hl                              ; HL → band base
+        add     hl, de                          ; → next band base
+        djnz    .ujc_band
+        ret
 
-        ; 1. Set incoming pipe's byte_x=29 in pipe_state.
-        ;    gap_y is NOT touched here — the incoming pipe's gap_y already holds
-        ;    the correct value (chosen when it departed). prep_gap_y at do_swap
-        ;    entry is a stale leftover; writing it would clobber the truth.
-        ld      a, (ds_inc)
-        add     a, a                            ; inc*2
+;----------------------------------------------------------------
+; reset_ix_targets_to_29 — set every band's IX-target operand
+; (band+2..+3) to screen_target_table_29[8K] (byte_x=29's band-row-0
+; address) for K=0..19.
+;
+; All 20 bands written unconditionally. The K_top band needs the same
+; entry, so no special case there. The K_bot band needs the [8K+2]
+; entry instead, but finalize_pipe_init's emit_capedge_band rewrites
+; that band's full IX target afterwards, so the body value we write
+; here is harmless.
+;
+; In: A = pipe (0..3).  Clobbers: AF, BC, DE, HL, IX.
+;----------------------------------------------------------------
+reset_ix_targets_to_29:
+        call    column_base_for_pipe            ; HL = band 0 base
+        push    hl
+        pop     ix                              ; IX = dest cursor (band base)
+        ld      hl, screen_target_table_29      ; HL = src (byte_x=29 base for K=0)
+        ld      b, 20
+.rixt_K:
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = screen_target_table_29[8K] (byte_x=29 row-0)
+        ld      (ix+2), e
+        ld      (ix+3), d
+        ; HL: consumed 1 byte of K's 16-byte block, advance +15 to next K.
+        ld      a, l
+        add     a, 15
         ld      l, a
-        ld      h, 0
-        ld      de, pipe_state
-        add     hl, de                          ; HL = &pipe_state[inc*2]
-        ld      (hl), 29                        ; byte_x = 29
+        jr      nc, .rixt_hl_nc
+        inc     h
+.rixt_hl_nc:
+        ; IX: +320 to reach next band of same pipe.
+        push    de
+        ld      de, 4 * BAND_STRIDE
+        add     ix, de
+        pop     de
+        djnz    .rixt_K
+        ret
 
-        ; 2. (REMOVED) Incoming cap-slot arming relocated to ps_phase6 tail.
-        ;    Arming at swap time was overwritten by prep_step's column rebuild
-        ;    (ps_phase1 NOP-fills the cap range). ps_phase6 now arms the caps at
-        ;    build completion, so the $C3 JP opcodes survive into gameplay.
-
-        ; 3. (REMOVED) Cap target/_next imm writes relocated to ps_phase6 tail.
-
-        ; 4. (REMOVED) Body-target-write for incoming pipe eliminated.
-        ;    prep_step phases 0 and 2 now stamp body slots with target=line_addr+34
-        ;    (= byte_x=29 buffer col) instead of $0000. After swap the incoming
-        ;    pipe's body slots already point at byte_x=29. No per-swap rewrite needed.
-
-        ; 5. Departing column becomes a no-op skip.
-        ;    Stage 2b: write_jrskip_column NOP-fills the body (+0..67) of
-        ;    all 20 of dep's bands. A NOP band falls through to the +68
-        ;    trailer. Filling the WHOLE band (not a couple of bytes) is
-        ;    essential: it erases the departing pipe's stale content so
-        ;    prep_step's later incremental rebuild never executes a
-        ;    half-stamped band's leftover IX-walk / per-row fragments.
-        ;    write_jrskip_column clobbers AF,BC,DE,HL — do_swap holds no
-        ;    live state in those registers at this point (ds_* scratch is in
-        ;    memory; HL' is untouched). Nothing to preserve.
-        ld      a, (ds_dep)
-        call    write_jrskip_column             ; one-shot 2-byte stamp per band (~600 T total)
-
-        ; Clear stale cap pixels at the dep's OLD gap_y rows (cap_top_row =
-        ; old_gap_y - 1, cap_bot_row = old_gap_y + PIPE_GAP). When dep
-        ; becomes prep and later re-activates with a NEW random gap_y, the
-        ; OLD cap rows become BODY or SKIP rows for the new pipe. SKIP rows
-        ; never overwrite, so old cap pixels persist as visible artefacts
-        ; (the 1-byte specks we saw). Cost ~600 T per swap.
-        call    clear_old_cap_rows
-
-        ; 7. Update prep_pipe_idx, reset prep state, trigger post-swap build.
-        ld      a, (ds_dep)
-        ld      (prep_pipe_idx), a              ; departing pipe is now the prep pipe
-
-        ; The incoming (just-activated) pipe's column is currently JR-skip
-        ; (it was the prep pipe). prep_step must FULLY rebuild it post-swap.
-        ; Trigger that build:
-        ;   activate_pipe_idx = ds_inc  → makes prep_step start building
-        ;   prep_phase = 0, prep_row = 0 → restart the build state machine
-        ;   prep_gap_y = incoming gap_y → prep_step builds the column to this
-        ;                                 gap_y. Step 1 stored prep_gap_y (as
-        ;                                 it was on entry) into
-        ;                                 pipe_state[ds_inc].gap_y, so re-read
-        ;                                 it from there to be unambiguous.
-        ld      a, (ds_inc)
-        ld      (activate_pipe_idx), a          ; the pipe prep_step now builds
-
-        ld      a, (ds_inc)
-        add     a, a                            ; inc*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
-        add     hl, de                          ; HL = &pipe_state[ds_inc].gap_y
-        ld      a, (hl)
-        ld      (prep_gap_y), a                 ; gap_y of the column to build
-
-        ; Pick the DEPARTING pipe's next gap_y now (it has just become the prep
-        ; pipe). Stored into pipe_state[ds_dep].gap_y; consumed ~one cycle later
-        ; when ds_dep next activates. random_gap_y clobbers AF and HL only —
-        ; store its A-result before anything else uses A.
-        call    random_gap_y                    ; A = fresh random gap_y for departing pipe
-        ld      c, a                            ; preserve gap_y across address calc
-        ld      a, (ds_dep)
-        add     a, a                            ; dep*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
-        add     hl, de                          ; HL = &pipe_state[ds_dep].gap_y
-        ld      (hl), c                          ; store fresh random gap_y
-
-        ; Stage 5: arm the band-granular rebuild driver.
-        ;   rebuild_band_cursor = 0 → next call emits band 0
-        ;   rebuild_k_top, rebuild_k_bot = K bounds for the new gap_y
-        ;   prep_phase = 0 → not-done (do_swap.swap_with_prep blocks until 7)
-        xor     a
-        ld      (prep_phase), a                 ; not-done; finalize sets to 7
-        ld      (prep_row), a
-        ld      (rebuild_band_cursor), a        ; cursor = 0 (band 0 next)
-        ; K_top = (prep_gap_y - 1) >> 3 ; K_bot = (prep_gap_y + PIPE_GAP) >> 3.
-        ld      a, (prep_gap_y)
+;----------------------------------------------------------------
+; restore_capedges_to_body — at dep deactivation, overwrite the dep
+; pipe's OLD K_top and K_bot cap-edge bands' cap-slot bytes with the
+; corresponding body-row IX-walk bytes, so the column is in a clean
+; all-body state by the time write_jrskip_column parks it.
+;
+; This is needed so that when this same pipe reactivates after ~20
+; frames, finalize_pipe_init only needs to install the NEW K_top/K_bot
+; cap-edges — not also remove stale OLD ones at different K positions.
+;
+;   K_top cap-edge band: cap slot at band+46..+48 ($C3 lo hi).
+;     Body row 7 of a body band is a B-row: DD F9 E5 C5 DD 24.
+;     Overwrite band+46..+51 with the B-row pattern.
+;
+;   K_bot cap-edge band: cap slot at band+4..+6 ($C3 lo hi).
+;     Body row 0 of a body band is an A-row: DD F9 D5 C5 DD 24.
+;     Overwrite band+4..+9 with the A-row pattern.
+;
+; Body bytes at band+2..+3 (IX target) and elsewhere are not touched
+; — write_jrskip_column then makes the whole column unreachable, and
+; reactivation's reset_ix_targets_to_29 sets fresh IX targets.
+;
+; In: ds_dep (the dep pipe), ds_old_gap_y (its OLD gap_y).
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+restore_capedges_to_body:
+        ld      a, (ds_old_gap_y)
         dec     a
         rrca
         rrca
         rrca
         and     $1F
-        ld      (rebuild_k_top), a
-        ld      a, (prep_gap_y)
+        ld      b, a                            ; B = OLD K_top
+        ld      a, (ds_old_gap_y)
         add     a, PIPE_GAP
         rrca
         rrca
         rrca
         and     $1F
-        ld      (rebuild_k_bot), a
-        ld      a, 1
-        ld      (do_swap_fired), a              ; tell main_loop to skip rebuild this frame
+        ld      c, a                            ; C = OLD K_bot
+
+        ld      a, (ds_dep)
+        push    bc
+        call    column_base_for_pipe            ; HL = column base (K=0)
+        pop     bc
+
+        ; ── K_top band: write band+46..+51 with B-row pattern ──
+        push    hl
+        push    bc
+        ld      a, b                            ; A = K_top
+        call    .rcb_add_k_bands                ; HL += K * (4 * BAND_STRIDE)
+        ld      de, 46
+        add     hl, de                          ; HL = K_top band + 46
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $F9
+        inc     hl
+        ld      (hl), $E5                       ; push hl  (B-row variant)
+        inc     hl
+        ld      (hl), $C5                       ; push bc
+        inc     hl
+        ld      (hl), $DD
+        inc     hl
+        ld      (hl), $24                       ; inc ixh
+        pop     bc
+        pop     hl
+
+        ; ── K_bot band: re-emit as body via emit_body_band (52-byte write).
+        ; Body layout's rows 1..7 are at +10..+51, NOT +7..+48 like cap-edge
+        ; K_bot, so a 6-byte cap-slot patch would misalign every row that
+        ; follows. emit_body_band rewrites +0..+51 cleanly and sets the IX
+        ; target to byte_x=29's band-row-0 address (vs cap-edge's row-1).
+        ld      a, c                            ; A = K_bot
+        call    .rcb_add_k_bands                ; HL += K * 320 → K_bot band base
+        push    hl                              ; save band base
+        ld      a, c                            ; A = K_bot
+        ld      l, a
+        ld      h, 0
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; K_bot * 16
+        ld      de, screen_target_table_29
+        add     hl, de
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                         ; DE = byte_x=29 row-0 base for K_bot
+        pop     hl                              ; HL = K_bot band base
+        jp      emit_body_band                  ; rewrites +0..+51 (tail-call)
+
+.rcb_add_k_bands:
+        ; HL += A * (4 * BAND_STRIDE).  A=0..19.
+        or      a
+        ret     z
+        push    de
+        ld      de, 4 * BAND_STRIDE
+.rcb_akb_lp:
+        add     hl, de
+        dec     a
+        jr      nz, .rcb_akb_lp
+        pop     de
+        ret
+
+;----------------------------------------------------------------
+; do_swap: called when pipe A (departing) has reached byte_x=1.
+;
+; Patch-only refactor (Phase 3): split across two frames to stay
+; inside the wrap-frame budget.
+;
+; Swap frame (this call, in WHITE phase):
+;   PART A — dep deactivation:
+;     restore_capedges_to_body — revert OLD K_top/K_bot bands to body form.
+;     write_jrskip_column      — JR-skip the whole dep column (2 B/band).
+;     clear_old_cap_rows       — pixel clear OLD cap rows.
+;   PART C — prep rotation:
+;     prep_pipe_idx = dep, pick fresh random gap_y for dep.
+;   activate_pipe_idx = inc → signal that PART B is pending.
+;
+; Next frame (main_loop YELLOW, via do_swap_part_b):
+;   PART B — inc activation:
+;     un_jrskip_column          — restore DD 21 at band+0..+1 (2 B/band).
+;     reset_ix_targets_to_29    — set IX target at band+2..+3 for byte_x=29.
+;     finalize_pipe_init        — emit K_top/K_bot cap-edge bands, arm caps,
+;                                 build active sublist, patch cap target imms.
+;   activate_pipe_idx = 255 → PART B done; back to idle.
+;
+; Why the split: the full do_swap costs ~12 k T (mostly finalize_pipe_init
+; at ~7 k T). Wrap frames already carry ~14 k T of apply/restore/clear
+; (post-prep_step), so adding 12 k T to the wrap frame overruns the 70 k T
+; per-frame budget. Frame swap+1 is non-wrap (~14 k T slack), absorbs PART B
+; cleanly. Inc pipe stays JR-skipped one extra frame — invisible since it
+; only just entered byte_x=29 (a buffer column) anyway.
+;
+; In:  A = departing pipe index (0..3; NOT prep_pipe_idx).
+; Clobbers: AF, BC, DE, HL.
+;----------------------------------------------------------------
+do_swap:
+        ld      (ds_dep), a                     ; save departing pipe index
+
+        ; Capture dep's OLD gap_y for restore_capedges_to_body + clear_old_cap_rows.
+        ld      a, (ds_dep)
+        add     a, a                            ; dep*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
+        add     hl, de
+        ld      a, (hl)
+        ld      (ds_old_gap_y), a
+
+        ld      a, (prep_pipe_idx)
+        ld      (ds_inc), a                     ; incoming = old prep_pipe_idx
+
+        ; Set incoming pipe's byte_x = 29 in pipe_state.
+        ; gap_y left untouched — it was set at the previous deactivation.
+        ld      a, (ds_inc)
+        add     a, a                            ; inc*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state
+        add     hl, de
+        ld      (hl), 29
+
+        ; ── PART A: dep deactivation ──────────────────────────────
+        call    restore_capedges_to_body        ; uses ds_dep, ds_old_gap_y
+        ld      a, (ds_dep)
+        call    write_jrskip_column             ; one-shot 2-byte stamp per band
+        call    clear_old_cap_rows              ; pixel clear OLD cap rows
+
+        ; ── PART C: prep rotation ─────────────────────────────────
+        ld      a, (ds_dep)
+        ld      (prep_pipe_idx), a              ; departing pipe is now the prep pipe
+        call    random_gap_y                    ; A = fresh random gap_y for dep
+        ld      c, a
+        ld      a, (ds_dep)
+        add     a, a                            ; dep*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state + 1
+        add     hl, de
+        ld      (hl), c                         ; pipe_state[dep].gap_y = fresh random
+
+        ; Signal PART B pending: activate_pipe_idx = inc. main_loop's
+        ; YELLOW region (next frame) sees this and runs do_swap_part_b,
+        ; which clears it back to 255.
+        ld      a, (ds_inc)
+        ld      (activate_pipe_idx), a
+        ; Quiesce the now-deprecated prep_phase / rebuild_band_cursor /
+        ; do_swap_fired state so the rest of main_loop sees a coherent
+        ; idle picture until Phase 4/5 deletes those checks.
+        ld      a, 7
+        ld      (prep_phase), a
+        ld      a, 21
+        ld      (rebuild_band_cursor), a
+        xor     a
+        ld      (do_swap_fired), a
+        ret
+
+;----------------------------------------------------------------
+; do_swap_part_b — finish the swap started by do_swap on the previous
+; frame: activate the inc pipe (un-JR-skip its column, reset IX targets
+; to byte_x=29, install new cap-edge bands and arm cap handlers).
+;
+; In:  activate_pipe_idx = inc pipe (must NOT be 255).
+; Clobbers: AF, BC, DE, HL, IX.
+;----------------------------------------------------------------
+do_swap_part_b:
+        ld      a, (activate_pipe_idx)
+        call    un_jrskip_column                ; DD 21 at band+0..+1
+        ld      a, (activate_pipe_idx)
+        call    reset_ix_targets_to_29          ; band+2..+3 = byte_x=29 target for K
+
+        ; Publish cps_* for finalize_pipe_init.
+        ld      a, (activate_pipe_idx)
+        ld      (cps_pipe), a
+        add     a, a                            ; inc*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
+        add     hl, de
+        ld      a, (hl)                         ; A = inc's gap_y
+        ld      (cps_gap_y), a
+        dec     a
+        ld      (cps_cap_top_row), a            ; gap_y - 1
+        ld      a, (cps_gap_y)
+        add     a, PIPE_GAP
+        ld      (cps_cap_bot_row), a            ; gap_y + PIPE_GAP
+        call    cps_set_k_bounds                ; sets cps_k_top, cps_k_bot
+        call    finalize_pipe_init              ; emit capedge bands + arm caps + active list + cap target imms
+
+        ld      a, 255
+        ld      (activate_pipe_idx), a          ; PART B complete
         ret
 
 ; ── Scratch variables for do_swap ────────────────────────────────
