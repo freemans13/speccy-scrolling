@@ -1885,6 +1885,13 @@ init_pipes:
         ld      (cps_cap_bot_row), a         ; gap_y + PIPE_GAP
         call    cps_set_k_bounds             ; sets cps_k_top/k_bot from cap_*_row
         call    finalize_pipe_init           ; K_top/K_bot capedges + cap arming + active list + cap target imms
+        ; un_jrskip_visible: un-JR non-gap K (DD 21) AND JR-skip gap K (18 42).
+        ; cps_emit_body_bands above wrote DD 21 + body code at every K, so
+        ; without this pass the gap-K bands would execute body code and
+        ; render pipe pixels inside the visual gap.
+        pop     af
+        push    af
+        call    un_jrskip_visible
         ; If byte_x < 29, shift this pipe's slot targets by (29 - byte_x).
         ; shift_pipe_targets walks the active sublist (Stage-6-format from
         ; cps_build_active_list) and decrements lo-bytes, shifting both IX
@@ -2484,13 +2491,20 @@ un_jrskip_visible:
 .ujv_lp:
         ld      a, (cps_k_top)
         cp      b
-        jr      nc, .ujv_write                  ; K_top >= K → K <= K_top → un-JR (body OR K_top)
+        jr      nc, .ujv_write_ld_ix            ; K_top >= K → K <= K_top → un-JR (body OR K_top)
         ld      a, (cps_k_bot)
         cp      b
-        jr      c, .ujv_write                   ; K_bot < K → K > K_bot → un-JR (body below gap)
-        jr      z, .ujv_write                   ; K_bot == K → un-JR (K_bot cap-edge band itself!)
-        jr      .ujv_next                       ; K_top < K < K_bot → gap, leave JR-skipped
-.ujv_write:
+        jr      c, .ujv_write_ld_ix             ; K_bot < K → K > K_bot → un-JR (body below gap)
+        jr      z, .ujv_write_ld_ix             ; K_bot == K → un-JR (K_bot cap-edge band itself!)
+        ; K_top < K < K_bot → gap. Actively JR-skip — cps_emit_body_bands
+        ; now emits body for every K, so without this stamp the gap bands
+        ; would execute body code and render pipe pixels INSIDE the gap.
+        ld      (hl), $18                       ; JR opcode
+        inc     hl
+        ld      (hl), BAND_TRAILER_OFFSET - 2   ; JR +66 → trailer
+        dec     hl
+        jr      .ujv_next
+.ujv_write_ld_ix:
         ld      (hl), $DD                       ; ld ix, nn opcode byte 1
         inc     hl
         ld      (hl), $21                       ; ld ix, nn opcode byte 2
