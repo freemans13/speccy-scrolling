@@ -308,6 +308,11 @@ main_loop:
         call    mask_vacated_pipe_attrs         ; first: $2D at byte_x+3 (OLD R)
         call    restore_trailing_pipe_attrs     ; then:  sky $28 at byte_x+2 (NEW R)
         call    apply_pipe_attrs_wrap           ; last:  GREEN at byte_x (NEW M1)
+        ; (restore_leading_pipe_attrs experiment reverted — was causing
+        ;  pipe_state memory corruption I can't yet isolate. L-col edge
+        ;  dither remains hidden whenever mask from a prior pipe set the
+        ;  col to $2D, making some pipes render as 3-cell strip instead
+        ;  of 4. Investigating separately.)
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
         PROFILE_OUT 0                   ; BLACK = idle before halt
@@ -3945,6 +3950,46 @@ restore_trailing_pipe_attrs:
 ; Restricted to top + bottom char-rows like paint/restore — gap-region
 ; cells are sky already and have no pipe pixels.
 ;----------------------------------------------------------------
+;----------------------------------------------------------------
+; restore_leading_pipe_attrs — for each active pipe, set the L col
+; (byte_x-1) to ATTR_SKY ($28 paper cyan ink black) so the left-edge
+; dither (pipe pixel '1' = black ink on cyan paper) shows. Without
+; this, mask_vacated_pipe_attrs from PRIOR scrolling pipes can leave
+; cells at ATTR_BUFFER ($2D paper=ink=cyan = invisible) when a new
+; pipe's L col arrives — making the 4-cell pipe body render as just
+; 3 visible cells (M1+M2 green + R dither, but L col silent).
+;
+; Mirrors mask/restore_trailing structure: top + bottom regions only,
+; cap and gap rows untouched.
+;----------------------------------------------------------------
+restore_leading_pipe_attrs:
+        ld      iy, pipe_state
+        ld      b, NUM_PIPES
+.rlpa_lp:
+        push    bc
+        ld      a, NUM_PIPES
+        sub     b
+        ld      c, a
+        ld      a, (prep_pipe_idx)
+        cp      c
+        jr      z, .rlpa_skip
+        ld      a, (iy+0)
+        sub     1                               ; L col = byte_x - 1
+        cp      4
+        jr      c, .rlpa_skip
+        cp      28
+        jr      nc, .rlpa_skip
+        ld      c, a
+        ld      a, (iy+1)
+        ld      e, a
+        call    restore_pipe_attrs_inner_1col
+.rlpa_skip:
+        inc     iy
+        inc     iy
+        pop     bc
+        djnz    .rlpa_lp
+        ret
+
 mask_vacated_pipe_attrs:
         ld      iy, pipe_state
         ld      b, NUM_PIPES
