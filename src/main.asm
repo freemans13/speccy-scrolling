@@ -259,22 +259,30 @@ main_loop:
         PROFILE_OUT 5                   ; CYAN = update_cap_imm_v2
         call    update_cap_imm_v2
         PROFILE_OUT 6                   ; YELLOW = column build
-        ; Patch-only renderer (Phase 3): the YELLOW region runs PART B
-        ; of a deferred do_swap. do_swap (called from wrap_byte_x on the
-        ; swap frame) does PART A + PART C, then sets activate_pipe_idx
-        ; = inc to signal "PART B pending". The next frame's YELLOW sees
-        ; activate_pipe_idx != 255 and runs do_swap_part_b, which clears
-        ; activate_pipe_idx back to 255.
-        ;
-        ; (Old rebuild_step amortised band-emit + REBUILD_*_PAD_ITERS
-        ; constant-budget pads removed — Phase 4. do_swap_fired suppressor
-        ; also no longer needed.)
+        ; Patch-only renderer YELLOW dispatch — defers PART B to the
+        ; frame AFTER the swap frame:
+        ;   swap frame    : do_swap (in WHITE) sets activate_pipe_idx=inc
+        ;                   AND do_swap_just_fired=1. YELLOW sees flag set
+        ;                   → clears do_swap_just_fired, runs no PART B.
+        ;                   Swap frame stays under budget (do_swap itself
+        ;                   is only ~3k T of PART A + PART C work).
+        ;   swap+1 frame  : YELLOW sees do_swap_just_fired=0 and
+        ;                   activate_pipe_idx!=255 → runs do_swap_part_b
+        ;                   (~15k T) and clears activate_pipe_idx to 255.
+        ;                   Non-wrap frames have slack for PART B's cost.
+        ld      a, (do_swap_just_fired)
+        or      a
+        jr      z, .yellow_check_part_b
+        xor     a
+        ld      (do_swap_just_fired), a
+        jr      .post_prep_step
+.yellow_check_part_b:
         ld      a, (activate_pipe_idx)
         cp      255
-        jr      z, .post_prep_step              ; idle frame, nothing to do
+        jr      z, .post_prep_step              ; idle, no PART B
         ld      a, 1
         ld      (sound_heavy_frame), a
-        call    do_swap_part_b                  ; clears activate_pipe_idx back to 255
+        call    do_swap_part_b                  ; clears activate_pipe_idx → 255
 .post_prep_step:
         ; Wrap_pending gated: ULA contention makes always-run too costly to
         ; fit in budget. Non-wrap frames skip the ~14k T apply/restore/clear
@@ -403,6 +411,13 @@ prep_pipe_idx:   db 3                   ; pipe currently parked as the prep colu
 ; wrap_byte_x and patch_pipe_targets so the activating pipe's targets stay
 ; frozen between PART A and PART B.
 activate_pipe_idx: db 255
+; do_swap_just_fired — set to 1 by do_swap (in WHITE). main_loop's YELLOW
+; region clears it WITHOUT running do_swap_part_b on the swap frame itself;
+; the *next* frame's YELLOW sees do_swap_just_fired=0 + activate_pipe_idx!=255
+; → runs do_swap_part_b. This defers the ~15k T PART B work to the next
+; frame (which is non-wrap, has slack) so the swap frame stays under the
+; 70k T-state budget.
+do_swap_just_fired: db 0
 
 ; 16-bit Galois LFSR for randomising gap_y on each pipe wrap. Period 65535.
 rand_state:   dw $ABCD
@@ -2571,11 +2586,14 @@ do_swap:
         add     hl, de
         ld      (hl), c                         ; pipe_state[dep].gap_y = fresh random
 
-        ; Signal PART B pending: activate_pipe_idx = inc. main_loop's
-        ; YELLOW region (same frame, later) runs do_swap_part_b, which
-        ; clears it back to 255.
+        ; Signal PART B pending: activate_pipe_idx = inc (gates
+        ; patch_pipe_targets + wrap_byte_x), do_swap_just_fired = 1
+        ; (defers PART B to NEXT frame's YELLOW — keeps swap frame
+        ; under budget).
         ld      a, (ds_inc)
         ld      (activate_pipe_idx), a
+        ld      a, 1
+        ld      (do_swap_just_fired), a
         ret
 
 ;----------------------------------------------------------------
