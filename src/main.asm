@@ -3923,11 +3923,70 @@ wrap_attrs_combined:
         cp      c
         jp      z, .wac_skip
         ld      a, (iy+0)                       ; A = byte_x
-        cp      2
-        jp      c, .wac_skip                    ; byte_x < 2 → L col underflow
+        or      a
+        jp      z, .wac_skip                    ; byte_x = 0 → not active
         cp      29
         jp      nc, .wac_skip                   ; byte_x > 28 → mask col off-screen
-        ld      c, a                            ; C = byte_x
+
+        ; Pre-compute the 5 cell values for THIS pipe (= same for every
+        ; row of the pipe). Each cell is either its "natural" attr
+        ; (SKY for L/R, PIPE for M1/M2, BUFFER for vacated) or BUFFER if
+        ; the cell's col falls in the buffer band (col < 4 or col >= 28).
+        ; Store into the wac_cell_X SMC slots in the row writer.
+        ld      c, a                            ; C = byte_x (preserved across calls)
+        ; L col = byte_x - 1
+        dec     a
+        cp      4
+        jr      c, .wac_lbuf
+        cp      28
+        jr      nc, .wac_lbuf
+        ld      a, ATTR_SKY
+        jr      .wac_lset
+.wac_lbuf:
+        ld      a, ATTR_BUFFER
+.wac_lset:
+        ld      (wrap_attrs_combined.wac_cell_L_imm), a
+        ; M1 col = byte_x
+        ld      a, c
+        cp      4
+        jr      c, .wac_m1buf
+        cp      28
+        jr      nc, .wac_m1buf
+        ld      a, ATTR_PIPE
+        jr      .wac_m1set
+.wac_m1buf:
+        ld      a, ATTR_BUFFER
+.wac_m1set:
+        ld      (wrap_attrs_combined.wac_cell_M1_imm), a
+        ; M2 col = byte_x + 1
+        ld      a, c
+        inc     a
+        cp      4
+        jr      c, .wac_m2buf
+        cp      28
+        jr      nc, .wac_m2buf
+        ld      a, ATTR_PIPE
+        jr      .wac_m2set
+.wac_m2buf:
+        ld      a, ATTR_BUFFER
+.wac_m2set:
+        ld      (wrap_attrs_combined.wac_cell_M2_imm), a
+        ; R col = byte_x + 2
+        ld      a, c
+        add     a, 2
+        cp      4
+        jr      c, .wac_rbuf
+        cp      28
+        jr      nc, .wac_rbuf
+        ld      a, ATTR_SKY
+        jr      .wac_rset
+.wac_rbuf:
+        ld      a, ATTR_BUFFER
+.wac_rset:
+        ld      (wrap_attrs_combined.wac_cell_R_imm), a
+        ; vacated col = byte_x + 3 — always BUFFER (set once at init,
+        ; never changes; included here for clarity).
+
         ld      a, (iy+1)                       ; A = gap_y
         ld      e, a                            ; E = gap_y
         call    .wac_pipe                       ; paint this pipe
@@ -4005,62 +4064,23 @@ wrap_attrs_combined:
         add     hl, de                          ; HL = L col addr
         pop     bc
 .wac_row_lp:
-        ; Write 5 cells: L M1 M2 R vacated.
-        ; Buffer cols (0..3 and 28..31) MUST stay ATTR_BUFFER ($2D)
-        ; so pipes leaving on either side display as cyan-on-cyan
-        ; (invisible). The L col = byte_x-1, so when byte_x ∈ {2,3,4}
-        ; the L (and possibly M1, M2) cols fall in the left buffer
-        ; band. Likewise for R/vacated near the right buffer band.
-        ; Check each col's position (= L+offset within row) and
-        ; write BUFFER instead of the intended attr when in buffer band.
-        ;
-        ; HL low byte at start of each iter = ATTRS_BASE_LO + row*32 + (byte_x-1).
-        ; The "col" within the row = (HL & $1F) — but ATTRS is at $5800
-        ; (% 32 = 0), so col == L lo nibble bits.
-        ; For brevity we just compute col from (HL-$5800) & $1F when needed.
-        ld      a, l
-        and     $1F                             ; A = current col (= L col on entry)
-        ; cell 0 (L col)
-        cp      4
-        ld      (hl), ATTR_SKY
-        jr      nc, .wac_l_ok
-        ld      (hl), ATTR_BUFFER
-.wac_l_ok:
+        ; Write 5 cells using pre-computed SMC values (set once per pipe
+        ; in the outer loop). Each is `ld (hl), n` where n is patched.
+        ; This is much faster than the per-cell range checks that the
+        ; old version did at every row.
+.wac_cell_L_imm  EQU $+1
+        ld      (hl), 0
         inc     hl
-        ; cell 1 (M1 col)
-        inc     a
-        cp      4
-        jr      c, .wac_m1_buf
-        cp      28
-        jr      nc, .wac_m1_buf
-        ld      (hl), ATTR_PIPE
-        jr      .wac_m1_done
-.wac_m1_buf:
-        ld      (hl), ATTR_BUFFER
-.wac_m1_done:
+.wac_cell_M1_imm EQU $+1
+        ld      (hl), 0
         inc     hl
-        ; cell 2 (M2 col)
-        inc     a
-        cp      4
-        jr      c, .wac_m2_buf
-        cp      28
-        jr      nc, .wac_m2_buf
-        ld      (hl), ATTR_PIPE
-        jr      .wac_m2_done
-.wac_m2_buf:
-        ld      (hl), ATTR_BUFFER
-.wac_m2_done:
+.wac_cell_M2_imm EQU $+1
+        ld      (hl), 0
         inc     hl
-        ; cell 3 (R col)
-        inc     a
-        cp      28
-        ld      (hl), ATTR_SKY
-        jr      c, .wac_r_ok
-        ld      (hl), ATTR_BUFFER
-.wac_r_ok:
+.wac_cell_R_imm  EQU $+1
+        ld      (hl), 0
         inc     hl
-        ; cell 4 (vacated mask col) — always BUFFER
-        ld      (hl), ATTR_BUFFER
+        ld      (hl), ATTR_BUFFER               ; vacated mask — always BUFFER
         ; Advance HL: from byte_x+3 to next row's L col (= byte_x-1).
         ; Delta = +32 (next row) - 4 (back to L col) = +28.
         ld      a, l
