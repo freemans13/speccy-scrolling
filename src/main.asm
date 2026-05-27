@@ -1197,12 +1197,19 @@ finalize_pipe_init:
         jp      finalize_pipe_init_post_list
 
 ;----------------------------------------------------------------
-; finalize_pipe_init_lite — entry point for do_swap_part_b. Same body
-; as finalize_pipe_init (self-repair + cap-edge emit + cap arming +
-; cap target/_next imm patching) but SKIPS cps_build_active_list.
-; The active list is built once at init and never rebuilt.
+; finalize_pipe_init_lite — entry point for do_swap_part_b. Was
+; intended to skip cps_build_active_list under the assumption that the
+; active list contents are gap_y-invariant. They are NOT: a band that's
+; BODY for one gap_y is GAP (JR-SKIP) for another, and only body bands
+; get IX-operand entries in the active list. When a pipe wraps with a
+; new gap_y, bands that are now body but were gap last time get NO
+; entry → patch_pipe_targets skips them → their IX targets never
+; decrement → pipe pushes pixels to stale (often off-screen-right)
+; columns → ghost stripes in the cells the pipe SHOULD have written.
 ;
-; Saves ~3-4 k T per activation vs finalize_pipe_init.
+; Fix: call cps_build_active_list every activation. Costs ~3-4 k T but
+; do_swap_part_b runs once per swap (every ~40 frames) with plenty of
+; per-frame slack — test_overrun confirms 0 missed halts.
 ;----------------------------------------------------------------
 finalize_pipe_init_lite:
         ; Self-repair cap_*_target_imm_addrs (defensive).
@@ -1248,6 +1255,14 @@ finalize_pipe_init_lite:
         ld      (hl), 0
         inc     hl
         ld      (hl), 0
+
+        ; Rebuild active list every activation (was skipped here on the
+        ; broken "list is invariant per pipe" assumption). The list IS
+        ; gap_y-dependent because gap bands have no IX entries; without
+        ; rebuilding, patch_pipe_targets misses bands that changed from
+        ; gap to body, leaving stale IX → ghost stripes. See test_render
+        ; check_ix_targets_match_byte_x for the regression test.
+        call    cps_build_active_list
 
 finalize_pipe_init_post_list:
         ; Patch cap target imms from CAP_TARGET_TABLE.

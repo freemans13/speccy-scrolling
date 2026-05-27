@@ -44,6 +44,13 @@ from refrender import (
 # bird_attr_y address — auto-loaded from build/main.lst
 BIRD_ATTR_Y = 0x8276
 
+# PIPE_PROGRAM layout: 80 bands × 80 bytes, interleaved per pipe.
+# Band index = cell * 4 + pipe (so pipe N's bands are at indices N,
+# N+4, ..., N+76 — one per cell, 20 cells).
+PIPE_PROGRAM = 0xDB00
+BAND_STRIDE  = 80
+NUM_CELLS    = 20
+
 
 def _load_bird_attr_y():
     import re
@@ -93,6 +100,47 @@ def run_to_frame(sim, target_frame_count):
             sim.accept_interrupt(regs, memory, pc_before)
             accepted += 1
     return accepted
+
+
+def check_ix_targets_match_byte_x(memory, pipes, prep):
+    """Each body band of an active pipe must have its SMC `ld ix,addr`
+    operand pointing at the pipe's current byte_x column. If patch_pipe_targets
+    fails to decrement these (e.g. ACTIVE_PIPE_<n> is empty), the pipe's
+    pixels are pushed to a stale column — typically off-screen in the right
+    buffer, leaving the visible cells displaying stale ghost pixels.
+
+    Decode: col = (ix_target_lo & 0x1F) — the SP-hijack push writes 4 bytes
+    at IX-4..IX-1 (cols byte_x-1..byte_x+2), so IX target col == byte_x + 3.
+    """
+    fails = []
+    for pipe_idx, (bx, gy) in enumerate(pipes):
+        if pipe_idx == prep: continue
+        if not (1 <= bx <= 30): continue
+        expected_col = (bx + 3) & 0x1F
+        for cell in range(NUM_CELLS):
+            band_idx = cell * 4 + pipe_idx
+            band_addr = PIPE_PROGRAM + band_idx * BAND_STRIDE
+            b0, b1 = memory[band_addr], memory[band_addr + 1]
+            # JR-SKIP bands ($18 $42) carry no live IX — skip check.
+            if (b0, b1) == (0x18, 0x42):
+                continue
+            # Body / cap-stamped bands start with $DD $21 (ld ix, nn).
+            if (b0, b1) != (0xDD, 0x21):
+                fails.append(("-", "-", b0, "$DD",
+                              f"pipe {pipe_idx} cell {cell}: band at "
+                              f"${band_addr:04X} unexpected opcode "
+                              f"${b0:02X} ${b1:02X}"))
+                continue
+            ix_lo = memory[band_addr + 2]
+            col = ix_lo & 0x1F
+            if col != expected_col:
+                fails.append(("-", "-", col, expected_col,
+                              f"pipe {pipe_idx} (byte_x={bx}) cell {cell} "
+                              f"band ${band_addr:04X}: IX target col {col} "
+                              f"(lo=${ix_lo:02X}) but expected col "
+                              f"{expected_col} — pipe pixels writing to "
+                              f"wrong column → ghost stripes"))
+    return fails
 
 
 def find_ghost_pixels(memory, pipes, prep, bird_rows):
@@ -218,6 +266,12 @@ def check_snapshot(memory):
     for i, (bx, gy) in enumerate(pipes):
         if i == prep: continue
         fails.extend(check_pipe(attrs, i, bx, gy, bird_rows))
+
+    # PIPE_PROGRAM IX-target sync check: each body band of an active
+    # pipe must point at the pipe's current byte_x. A stale IX makes
+    # the pipe push pixels to the wrong column (often off-screen in
+    # the right buffer) leaving stale ghost pixels in the visible cells.
+    fails.extend(check_ix_targets_match_byte_x(memory, pipes, prep))
 
     # Pixel-level ghost check: stale pixels in visible cells outside
     # any current pipe or the bird. These cause "phantom stripes" —
