@@ -241,6 +241,30 @@ main_loop:
         ld      hl, SND_SLICE_NORMAL
 .snd_slice_set:
         ld      (sound_slice_budget), hl
+        ; Wrap-frame attr deferred work — runs HERE in top blanking
+        ; (frame N+1, before raster reaches visible) so the attr writes
+        ; complete before any scanline reads them. Previously this ran
+        ; in BLUE band mid-beam (after WHITE band's wrap_byte_x), which
+        ; meant the raster scanned half the screen with OLD attrs and
+        ; half with NEW → visible "single-frame corruption" on every
+        ; 4th frame (the wrap frame). The wrap_pending flag carries the
+        ; signal from the wrap frame to here on the next frame.
+        ld      a, (wrap_pending)
+        or      a
+        jr      z, .no_wrap_pending_top
+        xor     a
+        ld      (wrap_pending), a
+        ; Order matters: pipes can be ~9-10 cols apart, so pipe A's
+        ; mask col (byte_x_A+3) can coincide with pipe B's M1 col
+        ; (byte_x_B). Run mask FIRST, then restore, then apply LAST so
+        ; apply's GREEN wins over any spurious attr set by another
+        ; pipe's mask/restore for the same col.
+        call    mask_vacated_pipe_attrs         ; first: $2D at byte_x+3 (OLD R)
+        call    restore_leading_pipe_attrs      ; then:  sky $28 at byte_x-1 (NEW L)
+        call    restore_trailing_pipe_attrs     ; then:  sky $28 at byte_x+2 (NEW R)
+        call    apply_pipe_attrs_wrap           ; last:  GREEN at byte_x (NEW M1)
+.no_wrap_pending_top:
+
         ; Phase 2: bird ops run BEFORE PIPE_PROGRAM in top blanking.
         ; All bird writes complete before raster reaches row 0, so the
         ; bird is visible same-frame at every Y with no flicker.
@@ -284,34 +308,9 @@ main_loop:
         ld      (sound_heavy_frame), a
         call    do_swap_part_b                  ; clears activate_pipe_idx → 255
 .post_prep_step:
-        ; BLUE marker delimits the wrap post-prep work (apply attrs,
-        ; restore trailing, clear vacated columns — together ~14 k T on
-        ; wrap frames) from the YELLOW PART B work above. Without this
-        ; split the YELLOW border band visually conflated the two and
-        ; could reach ~21 k T on wrap+swap+1 frames; now YELLOW is
-        ; bounded by do_swap_part_b cost (≤ ~10 k T).
-        PROFILE_OUT 1                   ; BLUE = post_prep wrap work + sfx
-        ; Wrap_pending gated: ULA contention makes always-run too costly to
-        ; fit in budget. Non-wrap frames skip the ~14k T apply/restore/clear
-        ; work. Borders show some flicker between wrap/non-wrap frames but
-        ; the alternative is 25 Hz drops on wrap frames.
-        ld      a, (wrap_pending)
-        or      a
-        jr      z, .no_wrap_pending
-        xor     a
-        ld      (wrap_pending), a
-        ; Order matters: pipes can be ~9-10 cols apart, so pipe A's
-        ; mask col (byte_x_A+3) can coincide with pipe B's M1 col
-        ; (byte_x_B). Run mask FIRST, then restore, then apply LAST so
-        ; apply's GREEN wins over any spurious attr set by another
-        ; pipe's mask/restore for the same col.
-        call    mask_vacated_pipe_attrs         ; first: $2D at byte_x+3 (OLD R)
-        call    restore_leading_pipe_attrs      ; then:  sky $28 at byte_x-1 (NEW L)
-                                                ;        — cleans the trail of stale
-                                                ;        $2D masks left by this and
-                                                ;        prior pipes' wraps
-        call    restore_trailing_pipe_attrs     ; then:  sky $28 at byte_x+2 (NEW R)
-        call    apply_pipe_attrs_wrap           ; last:  GREEN at byte_x (NEW M1)
+        ; BLUE marker — post_prep_step body moved to top of frame
+        ; (next frame's top blanking) to avoid mid-beam attr races.
+        PROFILE_OUT 1                   ; BLUE = sfx-slice region (was wrap attr work)
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
         PROFILE_OUT 0                   ; BLACK = idle before halt
