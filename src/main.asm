@@ -516,15 +516,12 @@ bird_overlap:       ds BIRD_LINES, 0
 ; ink (sprite=1) inside the silhouette, masking the cyan paper.
 bird_attr_y:        db 0
 bird_attr_valid:    db 0
-; Bird sprite is 16 px tall. We always paint TWO char rows (16 px of
-; bird/sky attrs). Position is chosen to maximise sprite coverage:
-; if bird_y_hi is char-aligned, the 2 rows align perfectly with the
-; sprite. Otherwise we snap to whichever pair of consecutive rows
-; contains the most sprite pixels (= top+middle if offset ≤ 4 else
-; middle+bottom). The 1-7 px of sprite that fall outside the paint
-; area show as black ink on sky paper — bird outline visible without
-; the empty yellow rectangle artifact that "always 3 rows" produced.
-bird_attr_save:     ds 6, 0
+; Yellow paper is ONE char cell at col 8, snapped to the char row
+; containing the bird's vertical centre. Cols 7 and 9 stay cyan so the
+; sprite's wing pixels read as black on cyan around the yellow body.
+; This is the original design (in place for ~a month before being
+; briefly broken by an attempted "full coverage" extension).
+bird_attr_save:     db 0, 0, 0          ; saved attrs at cols 7, 8, 9 of bird_attr_y row
 
 ; Bird wing animation — 4 frames cycling 0→1→2→3→0, one phase step every
 ; BIRD_ANIM_RATE frames. bird_sprite_ptr always points at the current
@@ -3428,81 +3425,60 @@ bird_attr_addr:
 ;   col 7 = ATTR_SKY  (wing pixels black on cyan)
 ;   col 8 = ATTR_BIRD (body pixels black on yellow)
 ;   col 9 = ATTR_SKY  (wing pixels black on cyan)
+; paint_bird_attrs: paint ONE char cell of yellow at col 8 of the char
+; row containing the bird's vertical centre. Sprite is centred at col 8
+; so the colour-clash boundary is symmetric (4 px of sprite each side
+; in cols 7 and 9, which keep their cyan sky attr). Sprite pixels in
+; cols 7/9 + cols 8 outside the yellow cell render as black on cyan —
+; the bird silhouette outline.
 paint_bird_attrs:
         ld      a, (bird_y + 1)
-        ld      b, a                    ; B = bird_y_hi
-        and     $F8                     ; snap DOWN to char boundary (top row)
-        ld      c, a                    ; C = top char-row Y
-        ; If sub-offset (B & 7) > 4, bias paint DOWN by one char row
-        ; (= use middle+bottom rows instead of top+middle) — more sprite
-        ; pixels are in the lower half of the spanned area in that case.
-        ld      a, b
-        and     7
-        cp      5
-        jr      c, .pba_no_bias
-        ld      a, c
-        add     a, 8
-        ld      c, a
-.pba_no_bias:
-        ld      a, c
+        add     a, 8                    ; +8 snaps to char row containing bird centre
+        and     $F8
         ld      (bird_attr_y), a
-        push    af                      ; preserve A across the valid-flag store
         ld      a, 1
         ld      (bird_attr_valid), a
-        pop     af                      ; A = bird_attr_y for bird_attr_addr
-
+        ld      a, (bird_attr_y)
         call    bird_attr_addr          ; HL = ATTRS[bird_attr_y, col 8]
-        dec     hl                      ; → col 7
-        ld      ix, bird_attr_save
-        ld      b, 2                    ; ALWAYS 2 rows
-.pba_row:
-        ; save 3 cells (cols 7, 8, 9)
+        ; Save existing attrs at cols 7, 8, 9 (so we can restore whatever
+        ; pipe / mask state was there). 3 bytes saved.
+        dec     hl                      ; HL = col 7
         ld      a, (hl)
-        ld      (ix+0), a
+        ld      (bird_attr_save), a
+        inc     hl                      ; HL = col 8
+        ld      a, (hl)
+        ld      (bird_attr_save + 1), a
+        inc     hl                      ; HL = col 9
+        ld      a, (hl)
+        ld      (bird_attr_save + 2), a
+        ; Write bird-visible attrs: col 7/9 = ATTR_SKY (paper cyan, ink
+        ; black — wings show as black silhouette); col 8 = ATTR_BIRD
+        ; (paper yellow, ink black — body fill + black detail).
+        dec     hl
+        dec     hl                      ; HL = col 7
         ld      (hl), ATTR_SKY
         inc     hl
-        ld      a, (hl)
-        ld      (ix+1), a
         ld      (hl), ATTR_BIRD
         inc     hl
-        ld      a, (hl)
-        ld      (ix+2), a
         ld      (hl), ATTR_SKY
-        ; advance to next char row col 7 (= +32 from col 9 minus 2 = +30)
-        ld      de, 32 - 2
-        add     hl, de
-        ; advance save-slot pointer by 3
-        inc     ix
-        inc     ix
-        inc     ix
-        djnz    .pba_row
         ret
 
-; restore_bird_attrs: write saved 9 attr bytes back (3 char rows × 3 cols).
+; restore_bird_attrs: write saved 3 attr bytes back at bird_attr_y's row.
 restore_bird_attrs:
         ld      a, (bird_attr_valid)
         or      a
         ret     z
         ld      a, (bird_attr_y)
-        call    bird_attr_addr          ; HL = ATTRS[bird_attr_y, col 8]
-        dec     hl                      ; → col 7
-        ld      ix, bird_attr_save
-        ld      b, 2                    ; matches paint
-.rba_row:
-        ld      a, (ix+0)
+        call    bird_attr_addr          ; HL = col 8
+        dec     hl                      ; col 7
+        ld      a, (bird_attr_save)
         ld      (hl), a
-        inc     hl
-        ld      a, (ix+1)
+        inc     hl                      ; col 8
+        ld      a, (bird_attr_save + 1)
         ld      (hl), a
-        inc     hl
-        ld      a, (ix+2)
+        inc     hl                      ; col 9
+        ld      a, (bird_attr_save + 2)
         ld      (hl), a
-        ld      de, 32 - 2
-        add     hl, de
-        inc     ix
-        inc     ix
-        inc     ix
-        djnz    .rba_row
         ret
 
 read_input:
