@@ -2705,12 +2705,16 @@ restore_capedges_to_body:
 ; In:  A = departing pipe index (0..3; NOT prep_pipe_idx).
 ; Clobbers: AF, BC, DE, HL.
 ;----------------------------------------------------------------
+; Self-recycle: the pipe reaching byte_x=1 is deactivated, given a fresh
+; random gap_y, repositioned to byte_x=25, and reactivated — all in one
+; atomic call on the same pipe. The patch-only renderer is synchronous
+; so no prep-pipe buffer slot is needed.
 do_swap:
-        ld      (ds_dep), a                     ; save departing pipe index
+        ld      (ds_dep), a                     ; save recycling pipe index
+        ld      (ds_inc), a                     ; inc == dep (self-recycle)
 
-        ; Capture dep's OLD gap_y for restore_capedges_to_body + clear_old_cap_rows.
-        ld      a, (ds_dep)
-        add     a, a                            ; dep*2
+        ; Capture OLD gap_y for restore_capedges_to_body + clear_old_cap_rows.
+        add     a, a                            ; idx*2
         ld      l, a
         ld      h, 0
         ld      de, pipe_state + 1              ; &pipe_state[0].gap_y
@@ -2718,72 +2722,37 @@ do_swap:
         ld      a, (hl)
         ld      (ds_old_gap_y), a
 
-        ld      a, (prep_pipe_idx)
-        ld      (ds_inc), a                     ; incoming = old prep_pipe_idx
-
-        ; Set incoming pipe's byte_x = 25 in pipe_state. This is the
-        ; right-most fully-visible position (cols 24..27 = L M1 M2 R, all
-        ; in the visible playfield [4..27]). Previously this was 29 (in
-        ; the right buffer band) which made pipes "emerge" gradually
-        ; 1→2→3→4 cells as they scrolled left through cols 28..25,
-        ; producing transient single-frame-looking truncation visible
-        ; for ~4 wraps after each swap.
-        ;
-        ; do_swap_part_b shifts the pipe's IX targets accordingly (from
-        ; byte_x=29 baked position to byte_x=25) and paints M1+M2 attrs
-        ; so the pipe pops in fully formed.
-        ; gap_y left untouched — it was set at the previous deactivation.
-        ld      a, (ds_inc)
-        add     a, a                            ; inc*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state
-        add     hl, de
-        ld      (hl), 25
-
-        ; ── PART A: dep deactivation ──────────────────────────────
+        ; ── PART A: deactivate (using OLD gap_y) ──────────────────
         call    restore_capedges_to_body        ; uses ds_dep, ds_old_gap_y
         ld      a, (ds_dep)
         call    write_jrskip_column             ; one-shot 2-byte stamp per band
         call    clear_old_cap_rows              ; pixel clear OLD cap rows
 
-        ; Paint M1+M2 attrs for the activating pipe at byte_x=25 cols.
-        ; Must be done HERE (PART A, same frame as the swap) — if deferred
-        ; to PART B on the next frame, the intermediate frame shows pipe 2
-        ; with stale attrs at M2 col (= mask trail from prior pipes), so
-        ; pipe appears as a 1-cell green block for 1 frame.
-        ;
-        ; Reads pipe_state[inc].gap_y directly (cps_gap_y isn't set until
-        ; PART B). This paint walks ATTRS memory; doesn't need active list.
-        ld      a, (ds_inc)
-        add     a, a                            ; inc*2
+        ; ── PART C: get fresh gap_y for THIS pipe ─────────────────
+        call    random_gap_y                    ; A = fresh random gap_y
+        ld      c, a                            ; preserve in C
+        ld      a, (ds_dep)
+        add     a, a                            ; idx*2
         ld      l, a
         ld      h, 0
-        ld      de, pipe_state + 1
-        add     hl, de                          ; HL = &pipe_state[inc].gap_y
-        ld      a, (hl)
-        ld      e, a                            ; E = gap_y
-        ld      c, 25                           ; C = byte_x = 25
-        call    paint_pipe_attrs_inner          ; M1+M2 green at cols 25,26 on body+cap rows
-
-        ; ── PART C: prep rotation ─────────────────────────────────
-        ld      a, (ds_dep)
-        ld      (prep_pipe_idx), a              ; departing pipe is now the prep pipe
-        call    random_gap_y                    ; A = fresh random gap_y for dep
-        ld      c, a
-        ld      a, (ds_dep)
-        add     a, a                            ; dep*2
-        ld      l, a
-        ld      h, 0
-        ld      de, pipe_state + 1
+        ld      de, pipe_state
         add     hl, de
-        ld      (hl), c                         ; pipe_state[dep].gap_y = fresh random
+        ld      (hl), 25                        ; pipe_state[idx].byte_x = 25
+        inc     hl
+        ld      (hl), c                         ; pipe_state[idx].gap_y = new
 
-        ; Signal PART B pending: activate_pipe_idx = inc (gates
-        ; patch_pipe_targets + wrap_byte_x), do_swap_just_fired = 1
-        ; (defers PART B to NEXT frame's YELLOW — keeps swap frame
-        ; under budget).
-        ld      a, (ds_inc)
+        ; Paint M1+M2 attrs at byte_x=25 cols with NEW gap_y so pipe
+        ; appears fully formed on the very next render. (Pipe pixels
+        ; won't render until PART B runs next frame — for that 1 frame
+        ; the pipe shows as 2 solid green blocks at cols 25,26.)
+        ld      e, c                            ; E = NEW gap_y
+        ld      c, 25                           ; C = byte_x = 25
+        call    paint_pipe_attrs_inner
+
+        ; PART B is deferred to NEXT frame's YELLOW (do_swap_part_b)
+        ; to keep the recycle frame under the 70k T budget. PART B
+        ; rebuilds PIPE_PROGRAM bands for this pipe with the new gap_y.
+        ld      a, (ds_dep)
         ld      (activate_pipe_idx), a
         ld      a, 1
         ld      (do_swap_just_fired), a
