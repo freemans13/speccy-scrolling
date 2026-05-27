@@ -36,13 +36,42 @@ from runsim import (
 from skoolkit.cmiosimulator import CMIOSimulator as Simulator
 from skoolkit.simutils import REGISTERS, T, IFF
 
-# Memory addresses (must match build/main.lst)
-PIPE_STATE         = 0x81A1
-SCORE              = 0x81B5
-PREP_PIPE_IDX      = 0x81F8
-ACTIVATE_PIPE_IDX  = 0x81F9
-DO_SWAP_JUST_FIRED = 0x81FA
-WRAP_PENDING       = 0x81F6  # — looked up from .lst at runtime if available
+# Memory addresses — auto-loaded from build/main.lst (defaults are last-
+# known-good and will be overridden if the .lst is present). Always
+# regenerate the .lst after any build change:
+#   tools/sjasmplus/sjasmplus --fullpath --lst=build/main.lst src/main.asm
+PIPE_STATE         = 0x81A4
+SCORE              = 0x81B8
+PREP_PIPE_IDX      = 0x81FB
+ACTIVATE_PIPE_IDX  = 0x81FC
+DO_SWAP_JUST_FIRED = 0x81FD
+
+
+def _load_lst_symbols():
+    import re
+    repo_root = Path(__file__).resolve().parent.parent
+    lst_path = repo_root / "build" / "main.lst"
+    if not lst_path.exists():
+        return
+    pat = re.compile(r"^\s*\d+\s+([0-9A-F]{4})\s+[0-9A-F\s]*\s+(\w+):", re.IGNORECASE)
+    name_to_glob = {
+        "pipe_state": "PIPE_STATE",
+        "score": "SCORE",
+        "prep_pipe_idx": "PREP_PIPE_IDX",
+        "activate_pipe_idx": "ACTIVATE_PIPE_IDX",
+        "do_swap_just_fired": "DO_SWAP_JUST_FIRED",
+    }
+    globs = globals()
+    try:
+        for line in lst_path.read_text(errors="ignore").splitlines():
+            m = pat.match(line)
+            if m and m.group(2) in name_to_glob:
+                globs[name_to_glob[m.group(2)]] = int(m.group(1), 16)
+    except OSError:
+        pass
+
+
+_load_lst_symbols()
 
 
 def read_byte(mem, a): return mem[a]

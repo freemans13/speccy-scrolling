@@ -53,9 +53,41 @@ from snadump import load_sna, addr, addr_word, addr_range
 # ── Game constants ────────────────────────────────────────────────────
 NUM_PIPES = 4
 
-PIPE_STATE      = 0x81A1   # 4 × (byte_x, gap_y)
-BIRD_Y          = 0x825D
-PREP_PIPE_IDX   = 0x81F8
+# Symbol addresses are loaded from build/main.lst at import time. If the
+# label moves (any code change reshuffles RAM addresses) the tools auto-
+# adjust. Defaults are last-known-good; will be overwritten if a .lst
+# exists. ALWAYS regenerate the .lst after a build to keep these honest:
+#   tools/sjasmplus/sjasmplus --fullpath --lst=build/main.lst src/main.asm
+PIPE_STATE      = 0x81A4   # 4 × (byte_x, gap_y)
+BIRD_Y          = 0x8260
+PREP_PIPE_IDX   = 0x81FB
+
+
+def _load_lst_symbols():
+    """Override symbol addresses from build/main.lst."""
+    import re
+    repo_root = Path(__file__).resolve().parent.parent
+    lst_path = repo_root / "build" / "main.lst"
+    if not lst_path.exists():
+        return
+    pat = re.compile(r"^\s*\d+\s+([0-9A-F]{4})\s+[0-9A-F\s]*\s+(\w+):", re.IGNORECASE)
+    wanted = {"pipe_state", "bird_y", "prep_pipe_idx"}
+    globs = globals()
+    name_to_glob = {
+        "pipe_state": "PIPE_STATE",
+        "bird_y": "BIRD_Y",
+        "prep_pipe_idx": "PREP_PIPE_IDX",
+    }
+    try:
+        for line in lst_path.read_text(errors="ignore").splitlines():
+            m = pat.match(line)
+            if m and m.group(2) in wanted:
+                globs[name_to_glob[m.group(2)]] = int(m.group(1), 16)
+    except OSError:
+        pass
+
+
+_load_lst_symbols()
 
 ATTR_SKY        = 0x28     # paper cyan, ink black
 ATTR_GROUND     = 0x20     # paper green, ink black

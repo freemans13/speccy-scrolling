@@ -306,13 +306,12 @@ main_loop:
         ; apply's GREEN wins over any spurious attr set by another
         ; pipe's mask/restore for the same col.
         call    mask_vacated_pipe_attrs         ; first: $2D at byte_x+3 (OLD R)
+        call    restore_leading_pipe_attrs      ; then:  sky $28 at byte_x-1 (NEW L)
+                                                ;        — cleans the trail of stale
+                                                ;        $2D masks left by this and
+                                                ;        prior pipes' wraps
         call    restore_trailing_pipe_attrs     ; then:  sky $28 at byte_x+2 (NEW R)
         call    apply_pipe_attrs_wrap           ; last:  GREEN at byte_x (NEW M1)
-        ; (restore_leading_pipe_attrs experiment reverted — was causing
-        ;  pipe_state memory corruption I can't yet isolate. L-col edge
-        ;  dither remains hidden whenever mask from a prior pipe set the
-        ;  col to $2D, making some pipes render as 3-cell strip instead
-        ;  of 4. Investigating separately.)
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
         PROFILE_OUT 0                   ; BLACK = idle before halt
