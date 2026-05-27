@@ -2728,7 +2728,15 @@ do_swap:
         call    write_jrskip_column             ; one-shot 2-byte stamp per band
         call    clear_old_cap_rows              ; pixel clear OLD cap rows
 
-        ; ── PART C: get fresh gap_y for THIS pipe ─────────────────
+        ; ── PART C: get fresh gap_y, reset byte_x to 29 (= far right) ───
+        ; byte_x=29 puts the pipe ENTIRELY in the right buffer band
+        ; (cols 28..31, all ATTR_BUFFER = invisible). As byte_x decreases
+        ; per wrap (29→28→27→26→25), the pipe gradually emerges from
+        ; the right edge: 1 cell visible at byte_x=28, 2 at byte_x=27,
+        ; 3 at byte_x=26, fully visible 4-cell pipe at byte_x=25.
+        ; wrap_attrs_combined's per-cell buffer check handles the
+        ; emergence correctly (cells in cols 28..31 stay BUFFER even
+        ; when the pipe "occupies" them).
         call    random_gap_y                    ; A = fresh random gap_y
         ld      c, a                            ; preserve in C
         ld      a, (ds_dep)
@@ -2737,17 +2745,9 @@ do_swap:
         ld      h, 0
         ld      de, pipe_state
         add     hl, de
-        ld      (hl), 25                        ; pipe_state[idx].byte_x = 25
+        ld      (hl), 29                        ; pipe_state[idx].byte_x = 29
         inc     hl
         ld      (hl), c                         ; pipe_state[idx].gap_y = new
-
-        ; Paint M1+M2 attrs at byte_x=25 cols with NEW gap_y so pipe
-        ; appears fully formed on the very next render. (Pipe pixels
-        ; won't render until PART B runs next frame — for that 1 frame
-        ; the pipe shows as 2 solid green blocks at cols 25,26.)
-        ld      e, c                            ; E = NEW gap_y
-        ld      c, 25                           ; C = byte_x = 25
-        call    paint_pipe_attrs_inner
 
         ; PART B is deferred to NEXT frame's YELLOW (do_swap_part_b)
         ; to keep the recycle frame under the 70k T budget. PART B
@@ -2795,14 +2795,10 @@ do_swap_part_b:
         call    reset_ix_targets_to_29          ; byte_x=29 IX target at +2..+3 (all K)
         call    finalize_pipe_init_lite         ; K_top/K_bot capedges + cap arming + cap target imms + active list rebuild
 
-        ; Shift IX targets from byte_x=29 (baked) to byte_x=25 (= pipe_state).
-        ; cps_build_active_list (inside finalize_pipe_init_lite) populated
-        ; the active list with addresses of every body band's IX-lo byte;
-        ; shift_pipe_targets walks that list and subtracts C=4 from each.
-        ; This must run AFTER finalize_pipe_init_lite (needs the active list).
-        ld      a, (activate_pipe_idx)
-        ld      c, 4                            ; delta: 29 - 25 = 4
-        call    shift_pipe_targets
+        ; IX targets stay at byte_x=29 (baked position) — matches
+        ; pipe_state.byte_x=29 set by do_swap. No shift needed; the
+        ; subsequent same-frame patch_pipe_targets call will decrement
+        ; IX-lo by 1 (= byte_x_NEW IX), aligned with pipe_state.
 
         ld      a, 255
         ld      (activate_pipe_idx), a          ; PART B complete
