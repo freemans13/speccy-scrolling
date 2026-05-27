@@ -258,7 +258,12 @@ main_loop:
         call    update_bird
         call    advance_bird_anim
         call    draw_bird
-        call    paint_bird_attrs
+        ; paint_bird_attrs moved to AFTER wrap_attrs_combined (bottom
+        ; blanking, end of frame) so bird's SKY/BIRD/SKY attrs at cols
+        ; 7-9 win over wrap_attrs_combined's BUFFER mask at the vacated
+        ; col when it falls on bird's cells. Saved attrs reflect post-
+        ; wrap_attrs state so next frame's restore puts back what was
+        ; there before bird overlay — including pipe-applied BUFFERs.
         PROFILE_OUT 3                   ; MAGENTA = PIPE_PROGRAM
         call    frame_update
         PROFILE_OUT 7                   ; WHITE = state prep
@@ -327,6 +332,13 @@ main_loop:
         call    wrap_attrs_combined             ; single-pass writer (~5k T)
         PROFILE_OUT 1                           ; back to BLUE = sfx region
 .no_wrap_pending:
+        ; Bird attrs painted HERE (bottom blanking, after wrap_attrs).
+        ; Runs every frame (not gated by wrap_pending) so bird's
+        ; SKY/BIRD/SKY at cols 7-9 wins over any pipe-applied BUFFER
+        ; at the same cells. Display takes effect on NEXT frame's raster
+        ; reads (which happen in T~14k..~50k while this code's writes
+        ; complete at T~60k of THIS frame → halt → next frame).
+        call    paint_bird_attrs
         call    sfx_slice               ; sound — single slice in the idle tail
         PROFILE_OUT 0                   ; BLACK = idle before halt
         ei
@@ -3856,25 +3868,11 @@ wrap_attrs_combined:
         ld      a, ATTR_BUFFER
 .wac_rset:
         ld      (wrap_attrs_combined.wac_cell_R_imm), a
-        ; vacated col = byte_x + 3 — usually ATTR_BUFFER (masks stale
-        ; pipe pixels from last wrap). EXCEPTION: if vacated col falls
-        ; in the bird's range (cols 7..9), write ATTR_SKY instead, so
-        ; bird paint_bird_attrs's SKY/BIRD/SKY values aren't clobbered
-        ; (was making bird's wing/body pixels render as invisible
-        ; cyan-on-cyan). Stale pipe pixels visible there but acceptable
-        ; trade-off — bird sprite covers the cells anyway.
-        ld      a, c
-        add     a, 3                            ; A = vacated col
-        cp      7
-        jr      c, .wac_vbuf
-        cp      10
-        jr      c, .wac_vsky                    ; col in {7,8,9} → SKY
-.wac_vbuf:
+        ; vacated col = byte_x + 3 — always BUFFER (hides stale pipe
+        ; pixels from prior wraps). When this lands in bird cols 7-9,
+        ; paint_bird_attrs (called LATER in main_loop, after this) writes
+        ; the correct bird/sky attrs over the BUFFER. Bird wins.
         ld      a, ATTR_BUFFER
-        jr      .wac_vset
-.wac_vsky:
-        ld      a, ATTR_SKY
-.wac_vset:
         ld      (wrap_attrs_combined.wac_cell_V_imm), a
 
         ld      a, (iy+1)                       ; A = gap_y
