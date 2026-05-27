@@ -133,19 +133,28 @@ def check_attrs(mem, frame_num):
 
 def check_pixel_residue(mem, frame_num):
     """At cols 7,8,9 (the bird's columns), pixel rows outside [bird_y,
-    bird_y+15] should be 0 (cyan sky) UNLESS a pipe legitimately covers
-    that cell at a body row."""
+    bird_y+15] should be 0 UNLESS:
+      - a pipe legitimately covers that cell (pipe pixels expected), OR
+      - the attr at that cell makes residue invisible (paper == ink, i.e.
+        $2D BUFFER cyan-on-cyan).
+    A non-zero pixel under a $28 SKY (or any ink != paper) attr is the
+    visible bug — black stripes through the bird's column path."""
     fails = []
     bird_y = mem[SYM["bird_y"] + 1]
     bird_top_y = bird_y
     bird_bot_y = bird_y + BIRD_LINES - 1
     for c in (7, 8, 9):
-        for py in range(0, 160):  # 0..159 = sky rows; ground starts at row 20 (px 160)
+        for py in range(0, 160):
             if bird_top_y <= py <= bird_bot_y:
                 continue
             char_row = py >> 3
             if pipe_covers_cell(mem, c, char_row):
                 continue
+            attr = mem[0x5800 + char_row * 32 + c]
+            ink = attr & 7
+            paper = (attr >> 3) & 7
+            if ink == paper:
+                continue  # residue invisible (e.g., $2D BUFFER cyan-on-cyan)
             ccc = (py >> 6) & 0x3
             ppp = py & 0x7
             rrr = (py >> 3) & 0x7
@@ -154,8 +163,9 @@ def check_pixel_residue(mem, frame_num):
             if byte != 0:
                 fails.append(
                     f"frame {frame_num}: col {c} pixel y={py} (row {char_row}) "
-                    f"= ${byte:02X} (bird is at y {bird_top_y}..{bird_bot_y}) "
-                    f"— stale bird pixel residue, vertical stripe")
+                    f"= ${byte:02X} attr=${attr:02X} (bird is at y "
+                    f"{bird_top_y}..{bird_bot_y}) — VISIBLE stale residue, "
+                    f"vertical stripe")
                 if len(fails) >= 5: return fails
     return fails
 

@@ -214,6 +214,7 @@ start:
         call    build_slot_templates    ; populate template store at $C000
         call    init_pipes              ; draws pipes (pixels) — attrs still base
         call    init_bird
+        call    init_bird_col_pixels    ; zero cols 7,8,9 once so first paint exposes no stale residue
         call    apply_pipe_attrs        ; overlay ATTR_PIPE at initial pipe positions
         im      1
         ei
@@ -3590,6 +3591,103 @@ paint_bird_stamp:
         ld      (hl), ATTR_SKY
         inc     hl
         ld      (hl), ATTR_SKY
+        ret
+
+; clean_bird_col_pixels: zero cols 7,8,9 pixel bytes at bird's 3 char
+; rows (top, centre, bot — same rows paint_bird_attrs covers). Called
+; BEFORE draw_bird so the fresh sprite writes over the cleared cells.
+; Without this, leftover pipe pixel residue at cols 7/8/9 from past
+; pipe scrolls renders as visible black stripes whenever paint_bird_attrs
+; forces SKY ($28) over an attr that was $2D BUFFER ($2D hides residue
+; cyan-on-cyan; $28 exposes it black-on-cyan).
+;
+; Uses bird_attr_y (= bird's TOP pixel-y) to index line_table for the
+; first pixel row's screen address; subsequent pixel rows within a char
+; row are +$100 (just `inc h`). 3 char rows × 8 pixel rows × 3 cols
+; = 72 byte writes per frame, ~2.2 k T.
+clean_bird_col_pixels:
+        ; Use CURRENT bird_y (not stale bird_attr_y from previous paint)
+        ; so cleaning matches the rows this frame's paint_bird_attrs is
+        ; about to write — and matches the rows draw_bird is about to
+        ; fill with the sprite.
+        ld      a, (bird_y + 1)
+        and     $F8                     ; snap to char-row pixel-y
+        ld      h, 0
+        ld      l, a
+        add     hl, hl                  ; HL = pixel_y * 2 (line_table is 2 B/entry)
+        ld      de, line_table
+        add     hl, de                  ; HL = &line_table[pixel_y]
+        ld      b, 3                    ; 3 char rows
+.row_lp:
+        push    bc
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        dec     hl                      ; HL stays at line_table[char_row_start]
+        push    hl                      ; save line_table ptr for outer advance
+        ld      a, e
+        add     a, 7
+        ld      e, a
+        jr      nc, .nc_setup
+        inc     d
+.nc_setup:
+        ; DE = pixel addr at col 7. Clean 8 pixel rows × 3 cols.
+        ld      b, 8
+.pix_lp:
+        push    de
+        ex      de, hl                  ; HL = pixel addr col 7
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0                 ; col 8
+        inc     hl
+        ld      (hl), 0                 ; col 9
+        pop     de
+        inc     d                       ; next pixel row (+$100)
+        djnz    .pix_lp
+        pop     hl                      ; restore line_table ptr (at char_row_start)
+        ; Advance line_table ptr by 16 bytes (8 entries = 1 char row)
+        ld      a, l
+        add     a, 16
+        ld      l, a
+        jr      nc, .nc_adv
+        inc     h
+.nc_adv:
+        pop     bc
+        djnz    .row_lp
+        ret
+
+; init_bird_col_pixels: one-time clear at game start. Zero cols 7,8,9
+; pixel bytes at all 192 pixel rows so pre-existing data (e.g. font
+; bits from sjasmplus init, snapshot carry-over) doesn't render as
+; stripes the first time paint_bird_attrs forces SKY over those cells.
+; After init, clean_bird_col_pixels maintains bird's rows each frame.
+init_bird_col_pixels:
+        ; Walks line_table pixel-y-by-pixel-y (192 entries, 2 B each).
+        ; For each pixel y, zero cols 7,8,9.
+        ld      hl, line_table
+        ld      b, 192
+.lp:
+        push    bc
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)
+        inc     hl
+        push    hl                      ; save line_table ptr (already advanced 2 B = 1 entry)
+        ld      a, e
+        add     a, 7
+        ld      e, a
+        jr      nc, .nc
+        inc     d
+.nc:
+        ex      de, hl
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
+        inc     hl
+        ld      (hl), 0
+        pop     hl
+        pop     bc
+        djnz    .lp
         ret
 
 read_input:
