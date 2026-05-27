@@ -270,14 +270,19 @@ main_loop:
         ;                   activate_pipe_idx!=255 → runs do_swap_part_b
         ;                   (~15k T) and clears activate_pipe_idx to 255.
         ;                   Non-wrap frames have slack for PART B's cost.
-        ; PART B is inlined in do_swap PART A. We just need to clear
-        ; activate_pipe_idx back to 255 (do_swap sets it to the inc
-        ; pipe so patch_pipe_targets skips that pipe on the swap frame
-        ; — without that skip, IX would over-decrement by 1 vs
-        ; pipe_state.byte_x). Clearing here in YELLOW (after wrap_byte_x's
-        ; patch but before next frame) opens the gate.
-        ld      a, 255
-        ld      (activate_pipe_idx), a
+        ld      a, (do_swap_just_fired)
+        or      a
+        jr      z, .yellow_check_part_b
+        xor     a
+        ld      (do_swap_just_fired), a
+        jr      .post_prep_step
+.yellow_check_part_b:
+        ld      a, (activate_pipe_idx)
+        cp      255
+        jr      z, .post_prep_step              ; idle, no PART B
+        ld      a, 1
+        ld      (sound_heavy_frame), a
+        call    do_swap_part_b                  ; clears activate_pipe_idx → 255
 .post_prep_step:
         ; BLUE marker delimits the wrap post-prep work (apply attrs,
         ; restore trailing, clear vacated columns — together ~14 k T on
@@ -2728,60 +2733,24 @@ do_swap:
         call    write_jrskip_column             ; one-shot 2-byte stamp per band
         call    clear_old_cap_rows              ; pixel clear OLD cap rows
 
-        ; ── PART B (was deferred to next frame, now inlined) ──────
-        ; Was: activate_pipe_idx = inc + do_swap_just_fired = 1 to defer
-        ; PART B to the next frame, sparing this frame's budget. Net cost
-        ; of PART B is now ~6 k T (was 15 k T before the patch-only
-        ; refactor); inlining lets the pipe render fully on the swap
-        ; frame itself, eliminating the 1-frame transient where the
-        ; pipe showed as 2 solid green blocks (attrs painted but PIPE_
-        ; PROGRAM bands still JR-skipped from prep).
+        ; Paint M1+M2 attrs for the activating pipe at byte_x=25 cols.
+        ; Must be done HERE (PART A, same frame as the swap) — if deferred
+        ; to PART B on the next frame, the intermediate frame shows pipe 2
+        ; with stale attrs at M2 col (= mask trail from prior pipes), so
+        ; pipe appears as a 1-cell green block for 1 frame.
         ;
-        ; Publish cps_* state (inc pipe's gap_y → cps_gap_y, etc.).
+        ; Reads pipe_state[inc].gap_y directly (cps_gap_y isn't set until
+        ; PART B). This paint walks ATTRS memory; doesn't need active list.
         ld      a, (ds_inc)
-        ld      (cps_pipe), a
         add     a, a                            ; inc*2
         ld      l, a
         ld      h, 0
         ld      de, pipe_state + 1
-        add     hl, de
-        ld      a, (hl)                         ; A = inc's gap_y
-        ld      (cps_gap_y), a
-        dec     a
-        ld      (cps_cap_top_row), a            ; gap_y - 1
-        ld      a, (cps_gap_y)
-        add     a, PIPE_GAP
-        ld      (cps_cap_bot_row), a            ; gap_y + PIPE_GAP
-        call    cps_set_k_bounds                ; sets cps_k_top, cps_k_bot
-
-        ld      a, (ds_inc)
-        call    un_jrskip_visible               ; DD 21 at +0..+1 for non-gap K only
-        ld      a, (ds_inc)
-        call    reset_ix_targets_to_29          ; byte_x=29 IX target at +2..+3 (all K)
-        call    finalize_pipe_init_lite         ; K_top/K_bot capedges + cap arming + cap target imms + active list
-
-        ; Shift IX targets from byte_x=29 (baked) to byte_x=25.
-        ld      a, (ds_inc)
-        ld      c, 4                            ; delta: 29 - 25 = 4
-        call    shift_pipe_targets
-
-        ; Set activate_pipe_idx so patch_pipe_targets (called LATER in
-        ; the same frame at the tail of wrap_byte_x) skips this pipe
-        ; — its IX is already at byte_x=25 thanks to the shift; another
-        ; decrement would make it 24 while pipe_state stays at 25.
-        ; YELLOW region clears activate_pipe_idx back to 255 before the
-        ; next frame.
-        ld      a, (ds_inc)
-        ld      (activate_pipe_idx), a
-
-        ; Paint M1+M2 attrs at byte_x=25 cols so the pipe shows as a
-        ; full 4-cell pipe immediately. Without this paint, M2 col
-        ; would inherit whatever stale attr was there ($2D buffer from
-        ; prior mask trail, or $28 sky).
-        ld      a, (cps_gap_y)
-        ld      e, a
+        add     hl, de                          ; HL = &pipe_state[inc].gap_y
+        ld      a, (hl)
+        ld      e, a                            ; E = gap_y
         ld      c, 25                           ; C = byte_x = 25
-        call    paint_pipe_attrs_inner          ; M1+M2 green at cols 25,26
+        call    paint_pipe_attrs_inner          ; M1+M2 green at cols 25,26 on body+cap rows
 
         ; ── PART C: prep rotation ─────────────────────────────────
         ld      a, (ds_dep)
@@ -2796,9 +2765,14 @@ do_swap:
         add     hl, de
         ld      (hl), c                         ; pipe_state[dep].gap_y = fresh random
 
-        ; activate_pipe_idx stays 255 — PART B is no longer deferred,
-        ; so wrap_byte_x sees the inc pipe immediately as a normal
-        ; active pipe (it'll scroll from byte_x=25 on the next wrap).
+        ; Signal PART B pending: activate_pipe_idx = inc (gates
+        ; patch_pipe_targets + wrap_byte_x), do_swap_just_fired = 1
+        ; (defers PART B to NEXT frame's YELLOW — keeps swap frame
+        ; under budget).
+        ld      a, (ds_inc)
+        ld      (activate_pipe_idx), a
+        ld      a, 1
+        ld      (do_swap_just_fired), a
         ret
 
 ;----------------------------------------------------------------
