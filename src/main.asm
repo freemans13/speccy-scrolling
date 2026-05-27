@@ -60,7 +60,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
 ; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
 ; Verified by tools/test_beam_race.py.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 425
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 487
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -273,12 +273,6 @@ main_loop:
         ; pipe pixels at overlapping cells.
         call    clean_bird_col_pixels
         call    draw_bird
-        ; Clear stale ATTR_PIPE ($20) at cols 7,8,9 not covered by any
-        ; current pipe — past pipes leave green attrs that show as visible
-        ; green blocks above/below the bird. Runs every frame (not just
-        ; wrap frames) because stale appears between wraps (do_swap with
-        ; new gap_y can orphan previously-body rows).
-        call    clean_bird_col_attrs
         PROFILE_OUT 7                   ; WHITE = state prep
         call    do_white_work
         PROFILE_OUT 5                   ; CYAN = update_cap_imm_v2
@@ -3706,146 +3700,6 @@ init_bird_col_pixels:
         pop     bc
         djnz    .lp
         ret
-
-; clean_bird_col_attrs: clear stale ATTR_PIPE ($20) cells at cols 7,8,9
-; that no current pipe legitimately covers. Past pipes leave $20 attrs
-; at cells they used to render — when a new pipe activates with a
-; different gap_y, OLD body rows that are now gap (or rows no longer
-; covered because pipe scrolled away) keep their stale $20, rendering
-; as visible green blocks above/below the bird as it flies past.
-;
-; Approach: walk all 20 rows × cols 7,8,9. For each cell with $20 attr,
-; check if any current pipe's M1/M2 at a body row covers it. If not,
-; clear to $2D BUFFER (cyan-on-cyan invisible).
-;
-; Cost: ~3 k T per frame. Called in top blank before paint_bird_attrs
-; so bird's cells get re-painted with SKY/BIRD after this clean.
-clean_bird_col_attrs:
-        ; Pre-compute per-row coverage mask (3 bits: col 7/8/9). For each
-        ; pipe, if it covers any of cols 7,8,9 (bx in 6..9), set bits on
-        ; its body rows. Then walk all rows × 3 cols, clearing $20 cells
-        ; that aren't covered.
-        ;
-        ; Zero coverage table
-        ld      hl, .row_covers
-        xor     a
-        ld      b, 20
-.zero_lp:
-        ld      (hl), a
-        inc     hl
-        djnz    .zero_lp
-
-        ; Per pipe: build col mask, OR into body rows of coverage table
-        ld      iy, pipe_state
-        ld      c, NUM_PIPES
-.pipe_lp:
-        ld      a, (iy+0)               ; bx
-        ld      d, 0                    ; D = col mask
-        cp      6
-        jr      nz, .nb6
-        set     0, d                    ; bx=6 → M2=col 7
-.nb6:
-        cp      7
-        jr      nz, .nb7
-        set     0, d                    ; bx=7 → M1=col 7
-        set     1, d                    ; bx=7 → M2=col 8
-.nb7:
-        cp      8
-        jr      nz, .nb8
-        set     1, d                    ; bx=8 → M1=col 8
-        set     2, d                    ; bx=8 → M2=col 9
-.nb8:
-        cp      9
-        jr      nz, .nb9
-        set     2, d                    ; bx=9 → M1=col 9
-.nb9:
-        ld      a, d
-        or      a
-        jr      z, .next_pipe           ; pipe doesn't cover any of cols 7,8,9
-        ; OR mask into top body rows 0..k_top
-        ld      a, (iy+1)               ; gy
-        dec     a
-        srl     a
-        srl     a
-        srl     a                       ; A = k_top
-        inc     a                       ; row count = k_top + 1
-        ld      b, a
-        ld      hl, .row_covers
-.top_or_lp:
-        ld      a, (hl)
-        or      d
-        ld      (hl), a
-        inc     hl
-        djnz    .top_or_lp
-        ; OR mask into bot body rows k_bot..19
-        ld      a, (iy+1)
-        add     a, 48
-        srl     a
-        srl     a
-        srl     a                       ; A = k_bot
-        ld      hl, .row_covers
-        ld      e, a
-        add     a, l
-        ld      l, a
-        jr      nc, .nca
-        inc     h
-.nca:
-        ld      a, 20
-        sub     e
-        ld      b, a                    ; B = 20 - k_bot
-.bot_or_lp:
-        ld      a, (hl)
-        or      d
-        ld      (hl), a
-        inc     hl
-        djnz    .bot_or_lp
-.next_pipe:
-        inc     iy
-        inc     iy
-        dec     c
-        jr      nz, .pipe_lp
-
-        ; Walk rows × cols, clear $20 cells not covered
-        ld      hl, ATTRS + 7
-        ld      de, .row_covers
-        ld      b, 20
-.clean_lp:
-        ld      a, (de)
-        ld      c, a                    ; C = mask for this row
-        inc     de
-        bit     0, c
-        jr      nz, .skip7
-        ld      a, (hl)
-        cp      $20
-        jr      nz, .skip7
-        ld      (hl), $2D
-.skip7:
-        inc     hl
-        bit     1, c
-        jr      nz, .skip8
-        ld      a, (hl)
-        cp      $20
-        jr      nz, .skip8
-        ld      (hl), $2D
-.skip8:
-        inc     hl
-        bit     2, c
-        jr      nz, .skip9
-        ld      a, (hl)
-        cp      $20
-        jr      nz, .skip9
-        ld      (hl), $2D
-.skip9:
-        ld      a, l
-        add     a, 30
-        ld      l, a
-        jr      nc, .nc_row
-        inc     h
-.nc_row:
-        djnz    .clean_lp
-        ret
-
-.row_covers: ds 20, 0
 
 read_input:
         ld      a, $7F                  ; row B-N-M-Sym-Space
