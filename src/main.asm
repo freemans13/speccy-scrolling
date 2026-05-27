@@ -3856,8 +3856,26 @@ wrap_attrs_combined:
         ld      a, ATTR_BUFFER
 .wac_rset:
         ld      (wrap_attrs_combined.wac_cell_R_imm), a
-        ; vacated col = byte_x + 3 — always BUFFER (set once at init,
-        ; never changes; included here for clarity).
+        ; vacated col = byte_x + 3 — usually ATTR_BUFFER (masks stale
+        ; pipe pixels from last wrap). EXCEPTION: if vacated col falls
+        ; in the bird's range (cols 7..9), write ATTR_SKY instead, so
+        ; bird paint_bird_attrs's SKY/BIRD/SKY values aren't clobbered
+        ; (was making bird's wing/body pixels render as invisible
+        ; cyan-on-cyan). Stale pipe pixels visible there but acceptable
+        ; trade-off — bird sprite covers the cells anyway.
+        ld      a, c
+        add     a, 3                            ; A = vacated col
+        cp      7
+        jr      c, .wac_vbuf
+        cp      10
+        jr      c, .wac_vsky                    ; col in {7,8,9} → SKY
+.wac_vbuf:
+        ld      a, ATTR_BUFFER
+        jr      .wac_vset
+.wac_vsky:
+        ld      a, ATTR_SKY
+.wac_vset:
+        ld      (wrap_attrs_combined.wac_cell_V_imm), a
 
         ld      a, (iy+1)                       ; A = gap_y
         ld      e, a                            ; E = gap_y
@@ -3866,7 +3884,8 @@ wrap_attrs_combined:
         inc     iy
         inc     iy
         pop     bc
-        djnz    .wac_outer
+        dec     b
+        jp      nz, .wac_outer          ; jp instead of djnz — outer loop body grew too large for jr range
         ret
 
 ; Paint one pipe's 5-col strip across body+cap rows.
@@ -3952,7 +3971,8 @@ wrap_attrs_combined:
 .wac_cell_R_imm  EQU $+1
         ld      (hl), 0
         inc     hl
-        ld      (hl), ATTR_BUFFER               ; vacated mask — always BUFFER
+.wac_cell_V_imm  EQU $+1
+        ld      (hl), ATTR_BUFFER               ; vacated mask — BUFFER or SKY (bird cols)
         ; Advance HL: from byte_x+3 to next row's L col (= byte_x-1).
         ; Delta = +32 (next row) - 4 (back to L col) = +28.
         ld      a, l
