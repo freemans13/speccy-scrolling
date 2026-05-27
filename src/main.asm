@@ -56,9 +56,11 @@ SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no 
 WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYAN wrap-vs-non-wrap variance for budget headroom
 
 ; Busy-wait iters to delay wrap_attrs_combined into bottom blanking.
-; Each iter ~26 T. We need to delay ~10 k T (from BLUE band end at
-; ~T=38000 to bottom blanking at T~48000). 10000/26 ≈ 385 iters.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 385
+; Each iter ~26 T. Target: wrap_attrs starts AFTER raster passes char
+; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
+; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
+; Verified by tools/test_beam_race.py.
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 435
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -321,7 +323,9 @@ main_loop:
         ld      a, d
         or      e
         jr      nz, .wbb_lp
+        PROFILE_OUT 4                           ; GREEN = wrap_attrs_combined start (bottom blank)
         call    wrap_attrs_combined             ; single-pass writer (~5k T)
+        PROFILE_OUT 1                           ; back to BLUE = sfx region
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
         PROFILE_OUT 0                   ; BLACK = idle before halt
@@ -4001,16 +4005,62 @@ wrap_attrs_combined:
         add     hl, de                          ; HL = L col addr
         pop     bc
 .wac_row_lp:
-        ; Write 5 cells: $28 $20 $20 $28 $2D
-        ld      (hl), ATTR_SKY                  ; L
+        ; Write 5 cells: L M1 M2 R vacated.
+        ; Buffer cols (0..3 and 28..31) MUST stay ATTR_BUFFER ($2D)
+        ; so pipes leaving on either side display as cyan-on-cyan
+        ; (invisible). The L col = byte_x-1, so when byte_x ∈ {2,3,4}
+        ; the L (and possibly M1, M2) cols fall in the left buffer
+        ; band. Likewise for R/vacated near the right buffer band.
+        ; Check each col's position (= L+offset within row) and
+        ; write BUFFER instead of the intended attr when in buffer band.
+        ;
+        ; HL low byte at start of each iter = ATTRS_BASE_LO + row*32 + (byte_x-1).
+        ; The "col" within the row = (HL & $1F) — but ATTRS is at $5800
+        ; (% 32 = 0), so col == L lo nibble bits.
+        ; For brevity we just compute col from (HL-$5800) & $1F when needed.
+        ld      a, l
+        and     $1F                             ; A = current col (= L col on entry)
+        ; cell 0 (L col)
+        cp      4
+        ld      (hl), ATTR_SKY
+        jr      nc, .wac_l_ok
+        ld      (hl), ATTR_BUFFER
+.wac_l_ok:
         inc     hl
-        ld      (hl), ATTR_PIPE                 ; M1
+        ; cell 1 (M1 col)
+        inc     a
+        cp      4
+        jr      c, .wac_m1_buf
+        cp      28
+        jr      nc, .wac_m1_buf
+        ld      (hl), ATTR_PIPE
+        jr      .wac_m1_done
+.wac_m1_buf:
+        ld      (hl), ATTR_BUFFER
+.wac_m1_done:
         inc     hl
-        ld      (hl), ATTR_PIPE                 ; M2
+        ; cell 2 (M2 col)
+        inc     a
+        cp      4
+        jr      c, .wac_m2_buf
+        cp      28
+        jr      nc, .wac_m2_buf
+        ld      (hl), ATTR_PIPE
+        jr      .wac_m2_done
+.wac_m2_buf:
+        ld      (hl), ATTR_BUFFER
+.wac_m2_done:
         inc     hl
-        ld      (hl), ATTR_SKY                  ; R
+        ; cell 3 (R col)
+        inc     a
+        cp      28
+        ld      (hl), ATTR_SKY
+        jr      c, .wac_r_ok
+        ld      (hl), ATTR_BUFFER
+.wac_r_ok:
         inc     hl
-        ld      (hl), ATTR_BUFFER               ; vacated mask
+        ; cell 4 (vacated mask col) — always BUFFER
+        ld      (hl), ATTR_BUFFER
         ; Advance HL: from byte_x+3 to next row's L col (= byte_x-1).
         ; Delta = +32 (next row) - 4 (back to L col) = +28.
         ld      a, l
