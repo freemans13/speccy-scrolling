@@ -131,6 +131,35 @@ def check_attrs(mem, frame_num):
     return fails
 
 
+def check_stale_pipe_attrs(mem, frame_num):
+    """Cols 7,8,9 cells where attr = $20 ATTR_PIPE but no current pipe's
+    M1/M2 covers that (row, col) at a body row. Renders as visible green
+    block (paper green, ink black, no pixel = solid green cell) above/
+    below the bird as it flies past — the "max-velocity green spots"
+    user-reported bug."""
+    fails = []
+    for r in range(20):
+        for c in (7, 8, 9):
+            attr = mem[0x5800 + r * 32 + c]
+            if attr != 0x20: continue
+            covered = False
+            for i in range(NUM_PIPES):
+                bx = mem[SYM["pipe_state"] + i * 2]
+                gy = mem[SYM["pipe_state"] + i * 2 + 1]
+                if not (1 <= bx <= 30 and 8 <= gy <= 96): continue
+                if not (bx <= c <= bx + 1): continue
+                k_top = (gy - 1) >> 3
+                k_bot = (gy + 48) >> 3
+                if r <= k_top or r >= k_bot:
+                    covered = True; break
+            if not covered:
+                fails.append(
+                    f"frame {frame_num}: row {r} col {c} attr=$20 PIPE "
+                    f"(stale — no current pipe covers) — visible green block")
+                if len(fails) >= 5: return fails
+    return fails
+
+
 def check_pixel_residue(mem, frame_num):
     """At cols 7,8,9 (the bird's columns), pixel rows outside [bird_y,
     bird_y+15] should be 0 UNLESS:
@@ -220,41 +249,54 @@ def main():
                     {'iff': 1 if s.iff1 else 0, 'im': s.im, 'tstates': 0})
     WARMUP = 30
     run_frames(sim, WARMUP)
-    N = 400
-    FLAP_EVERY = 8
-    print(f"test_bird: {N} frames, flap every {FLAP_EVERY}, "
-          f"checking attrs + pixel residue + raster-time attrs")
+    # Velocity scenarios exercise bird through varied dynamics. flap_period=0
+    # → free fall (max downward velocity, ~8 px/frame). flap_period=1 →
+    # continuous flap (sustained upward, max ~2.5 px/frame). Scenarios run
+    # sequentially so the bird state carries over.
+    scenarios = [
+        ("settling (flap every 8f)",       80,  8),
+        ("free fall to max down velocity", 80,  0),
+        ("continuous flap up",             80,  1),
+        ("alternating fast",               80,  2),
+        ("normal play (every 6f)",        100,  6),
+        ("rare flap (every 12f)",         100, 12),
+    ]
+    total_frames = sum(n for _, n, _ in scenarios)
+    print(f"test_bird: {total_frames} frames across {len(scenarios)} velocity scenarios "
+          f"(attrs + stale-PIPE-attrs + pixel-residue + raster-time)")
     first_fail = None
-    for i in range(N):
-        if i % FLAP_EVERY == 0:
-            # Force a flap by writing FLAP_VY to bird_vy directly.
-            sim.memory[SYM["bird_vy"]]     = FLAP_VY & 0xFF
-            sim.memory[SYM["bird_vy"] + 1] = (FLAP_VY >> 8) & 0xFF
-        fr = WARMUP + i + 1
-        # Capture attrs at T = when raster reads bird's centre char row.
-        # Approx capture point: bird_y * 224 + TOP_BLANK_END (pixel y of bird top).
-        bird_y_now = sim.memory[SYM["bird_y"] + 1]
-        capture_t = bird_y_now * SCANLINE_T + TOP_BLANK_END
-        mid_attrs = run_one_frame_with_mid_capture(sim, capture_t)
-        fails = []
-        fails.extend(check_attrs(sim.memory, fr))
-        if not fails:
-            fails.extend(check_pixel_residue(sim.memory, fr))
-        if not fails and mid_attrs is not None:
-            fails.extend(check_raster_time_attrs(mid_attrs, sim.memory, fr))
-        if fails:
-            first_fail = (fr, fails)
+    fr = WARMUP
+    for desc, n_fr, flap_per in scenarios:
+        for i in range(n_fr):
+            if flap_per > 0 and i % flap_per == 0:
+                sim.memory[SYM["bird_vy"]]     = FLAP_VY & 0xFF
+                sim.memory[SYM["bird_vy"] + 1] = (FLAP_VY >> 8) & 0xFF
+            fr += 1
+            bird_y_now = sim.memory[SYM["bird_y"] + 1]
+            capture_t = bird_y_now * SCANLINE_T + TOP_BLANK_END
+            mid_attrs = run_one_frame_with_mid_capture(sim, capture_t)
+            fails = []
+            fails.extend(check_attrs(sim.memory, fr))
+            if not fails:
+                fails.extend(check_stale_pipe_attrs(sim.memory, fr))
+            if not fails:
+                fails.extend(check_pixel_residue(sim.memory, fr))
+            if not fails and mid_attrs is not None:
+                fails.extend(check_raster_time_attrs(mid_attrs, sim.memory, fr))
+            if fails:
+                first_fail = (fr, desc, fails)
+                break
+        if first_fail:
             break
     if first_fail:
-        fr, fails = first_fail
-        print(f"FAIL at frame {fr}:")
+        fr, desc, fails = first_fail
+        print(f"FAIL at frame {fr} (scenario: {desc}):")
         for f in fails:
             print(f"  {f}")
         return 1
     bird_y_hi = sim.memory[SYM["bird_y"] + 1]
-    bird_attr_y = sim.memory[SYM["bird_attr_y"]]
-    print(f"PASS: {N} flapping frames clean "
-          f"(final bird_y={bird_y_hi}, bird_attr_y={bird_attr_y})")
+    print(f"PASS: {total_frames} frames across all velocity scenarios clean "
+          f"(final bird_y={bird_y_hi})")
     return 0
 
 

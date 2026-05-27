@@ -215,6 +215,7 @@ start:
         call    init_pipes              ; draws pipes (pixels) — attrs still base
         call    init_bird
         call    init_bird_col_pixels    ; zero cols 7,8,9 once so first paint exposes no stale residue
+        call    init_bird_col_attrs     ; clear cols 7,8,9 attrs to $2D BUFFER (init state)
         call    apply_pipe_attrs        ; overlay ATTR_PIPE at initial pipe positions
         im      1
         ei
@@ -3477,18 +3478,15 @@ paint_bird_attrs:
         call    .advance_to_next_row_col7
         ; Row 1 (centre): col 7 SKY, col 8 BIRD, col 9 SKY
         ld      a, (hl)
-        ld      (de), a
-        inc     de
+        call    .filter_save
         ld      (hl), ATTR_SKY
         inc     hl
         ld      a, (hl)
-        ld      (de), a
-        inc     de
+        call    .filter_save
         ld      (hl), ATTR_BIRD
         inc     hl
         ld      a, (hl)
-        ld      (de), a
-        inc     de
+        call    .filter_save
         ld      (hl), ATTR_SKY
         call    .advance_to_next_row_col7
         ; Row 2 (bottom): col 7 SKY, col 8 SKY, col 9 SKY
@@ -3496,20 +3494,37 @@ paint_bird_attrs:
         ret
 
 .paint_row_sky_centre:
+        ; col 7
         ld      a, (hl)
-        ld      (de), a
-        inc     de
+        call    .filter_save            ; A = filtered attr, store to (DE)
         ld      (hl), ATTR_SKY
         inc     hl
+        ; col 8 (SKY for non-centre rows)
         ld      a, (hl)
-        ld      (de), a
-        inc     de
+        call    .filter_save
         ld      (hl), ATTR_SKY
         inc     hl
+        ; col 9
         ld      a, (hl)
+        call    .filter_save
+        ld      (hl), ATTR_SKY
+        ret
+
+; .filter_save: store A into (DE), advancing DE. If A == $20 ATTR_PIPE,
+; store $2D ATTR_BUFFER instead. Reason: $20 saved in bird_attr_save
+; propagates through restore_bird_attrs even when no current pipe covers
+; that cell (the pipe that wrote it scrolled past). Treating saved $20
+; as "invisible buffer" instead of "pipe green" stops the stale-green
+; block bug. Loses one frame of pipe attr at cells where bird's paint
+; area overlaps current pipe body — next wrap_attrs writes pipe attrs
+; back; visually negligible.
+.filter_save:
+        cp      ATTR_PIPE
+        jr      nz, .fs_store
+        ld      a, ATTR_BUFFER
+.fs_store:
         ld      (de), a
         inc     de
-        ld      (hl), ATTR_SKY
         ret
 
 .advance_to_next_row_col7:
@@ -3698,6 +3713,24 @@ init_bird_col_pixels:
         ld      (hl), 0
         pop     hl
         pop     bc
+        djnz    .lp
+        ret
+
+; init_bird_col_attrs: one-time init clean of cols 7,8,9 attrs across all
+; 20 rows to $2D BUFFER. Handles any pre-existing $20 PIPE attrs from
+; init state. After this, the per-wrap V-col sweep in wrap_attrs_combined
+; keeps cols 7,8,9 clean of stale $20 incrementally.
+init_bird_col_attrs:
+        ld      hl, ATTRS + 7
+        ld      de, 30
+        ld      b, 20
+.lp:
+        ld      (hl), ATTR_BUFFER
+        inc     hl
+        ld      (hl), ATTR_BUFFER
+        inc     hl
+        ld      (hl), ATTR_BUFFER
+        add     hl, de                  ; advance to next row col 7
         djnz    .lp
         ret
 
@@ -4086,6 +4119,19 @@ wrap_attrs_combined:
         ld      a, (iy+1)                       ; A = gap_y
         ld      e, a                            ; E = gap_y
         call    .wac_pipe                       ; paint this pipe
+        ; If this pipe's V col (= byte_x + 3) lands in bird cols 7,8,9,
+        ; sweep $2D BUFFER across ALL 20 char rows at that col — not just
+        ; this pipe's body rows. This clears stale $20 ATTR_PIPE left at
+        ; gap rows by past pipes with different gap_y. Cheap (~620 T) and
+        ; only runs when V in {7,8,9} (3 wraps per pipe transit). Bird's
+        ; cells at V col are re-painted by paint_bird_stamp post-wrap.
+        ld      a, c                            ; C = byte_x (preserved)
+        add     a, 3                            ; V col
+        cp      7
+        jr      c, .wac_skip
+        cp      10
+        jr      nc, .wac_skip
+        call    .wac_sweep_v_col                ; A = V col
 .wac_skip:
         inc     iy
         inc     iy
@@ -4188,6 +4234,19 @@ wrap_attrs_combined:
         inc     h
 .wac_nc:
         djnz    .wac_row_lp
+        ret
+
+; Sweep $2D BUFFER at col A across all 20 char rows.
+; In: A = col (7, 8, or 9). Clobbers: AF, B, HL, DE.
+.wac_sweep_v_col:
+        ld      h, $58                  ; HL = ATTRS + col (ATTRS=$5800, +A=col)
+        ld      l, a
+        ld      b, 20
+        ld      de, 32
+.svc_lp:
+        ld      (hl), ATTR_BUFFER
+        add     hl, de
+        djnz    .svc_lp
         ret
 
 ;----------------------------------------------------------------
