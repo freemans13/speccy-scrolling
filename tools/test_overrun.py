@@ -80,6 +80,30 @@ def main():
         return 1
 
     n = len(check_frames)
+
+    # ALSO check that RED→BLACK fits within frame budget. The "missed
+    # BLACK" check above misses the case where BLACK IS emitted but
+    # AFTER the frame's halt would have fired (i.e. the loop took
+    # >69888 T-states; the halt at the next loop iteration catches a
+    # *late* interrupt and the game effectively runs <50 Hz for that
+    # frame even though the BLACK marker appeared eventually).
+    budget_overruns = []
+    for fr in check_frames:
+        ev = frames[fr]
+        red_t = next((t for t, c in ev if c == 2), None)
+        black_t = next((t for t, c in reversed(ev) if c == 0), None)
+        if red_t is None or black_t is None:
+            continue
+        used = black_t - red_t
+        if used > FRAME_TSTATES:
+            budget_overruns.append((fr, used))
+    if budget_overruns:
+        print(f"FAIL: {len(budget_overruns)} frames exceeded "
+              f"{FRAME_TSTATES} T budget (RED→BLACK)")
+        for fr, used in budget_overruns[:5]:
+            print(f"  frame {fr}: used {used} T (over by {used-FRAME_TSTATES})")
+        return 1
+
     print(f"PASS: 0 overruns across {n} frames (every frame ended on BLACK)")
 
     # Bonus: report worst-case BLACK arrival within the frame as a
