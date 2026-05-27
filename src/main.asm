@@ -258,12 +258,7 @@ main_loop:
         call    update_bird
         call    advance_bird_anim
         call    draw_bird
-        ; paint_bird_attrs moved to AFTER wrap_attrs_combined (bottom
-        ; blanking, end of frame) so bird's SKY/BIRD/SKY attrs at cols
-        ; 7-9 win over wrap_attrs_combined's BUFFER mask at the vacated
-        ; col when it falls on bird's cells. Saved attrs reflect post-
-        ; wrap_attrs state so next frame's restore puts back what was
-        ; there before bird overlay — including pipe-applied BUFFERs.
+        call    paint_bird_attrs        ; top-blank: paint so raster reads bird attrs THIS frame
         PROFILE_OUT 3                   ; MAGENTA = PIPE_PROGRAM
         call    frame_update
         PROFILE_OUT 7                   ; WHITE = state prep
@@ -332,13 +327,6 @@ main_loop:
         call    wrap_attrs_combined             ; single-pass writer (~5k T)
         PROFILE_OUT 1                           ; back to BLUE = sfx region
 .no_wrap_pending:
-        ; Bird attrs painted HERE (bottom blanking, after wrap_attrs).
-        ; Runs every frame (not gated by wrap_pending) so bird's
-        ; SKY/BIRD/SKY at cols 7-9 wins over any pipe-applied BUFFER
-        ; at the same cells. Display takes effect on NEXT frame's raster
-        ; reads (which happen in T~14k..~50k while this code's writes
-        ; complete at T~60k of THIS frame → halt → next frame).
-        call    paint_bird_attrs
         call    sfx_slice               ; sound — single slice in the idle tail
         PROFILE_OUT 0                   ; BLACK = idle before halt
         ei
