@@ -9,7 +9,7 @@
 ; and per-pipe slot templates are reconfigured.
 ;----------------------------------------------------------------
 
-NUM_PIPES   EQU 4
+NUM_PIPES   EQU 3
 ; Phase 3: only 3 pipes are "active" (rendered + scrolled). Pipe 3 is the
 ; "preparing" pipe — its slot column is dormant (all-NOPs) until Phase 5 swap.
 ; Routines that iterate active pipes use ACTIVE_PIPES, not NUM_PIPES.
@@ -60,7 +60,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
 ; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
 ; Verified by tools/test_beam_race.py.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 435
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 440
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -374,14 +374,12 @@ saved_sp_inner: dw 0                    ; second save slot — inner CALL inside
 ground_iy_save: dw 0
 
 pipe_state:
-        ; 4 pipes. 3 active + 1 preparing.
-        ; The 3 active pipes are spaced evenly across the [1,29] track
-        ; (~9-10 byte_x apart). The recycle scheme (leave at 1, enter at 29)
-        ; preserves this spacing — so even init = even forever.
+        ; 3 pipes. Self-recycle: each pipe reaches byte_x=1, gets a fresh
+        ; random gap_y, and pops back to byte_x=29. Spaced ~9-10 byte_x
+        ; apart at init; the recycle preserves this spacing.
         db 29, 64                       ; pipe 0
         db 19, 40                       ; pipe 1
         db 10, 88                       ; pipe 2
-        db  8, 24                       ; pipe 3 (prep; byte_x set to 29 at init)
 
 ; Scratch words for cap_bot's BC/DE restore. Populated by redraw_pipes_v2 at frame entry.
 body_a_bc:      dw 0
@@ -435,7 +433,12 @@ sfx_chime:
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
 wrap_pending:  db 0                      ; set when a wrap happened this frame
 clear_pending: db 0                      ; set when clear_vacated_columns must run in next frame's vblank
-prep_pipe_idx:   db 3                   ; pipe currently parked as the prep column (init: pipe 3)
+; prep_pipe_idx is a legacy state variable from the 4-pipe prep-swap
+; design. Self-recycle (current design) doesn't use a prep slot, but
+; many routines still check `prep_pipe_idx == c` to skip a pipe. With
+; prep_pipe_idx = 3 (= dead pipe 3), the check always skips pipe 3 and
+; processes pipes 0..2 — the active pipes.
+prep_pipe_idx:   db 3
 ; activate_pipe_idx — set to inc by do_swap (PART B pending signal); cleared
 ; back to 255 by do_swap_part_b in main_loop's YELLOW region. Also gates
 ; wrap_byte_x and patch_pipe_targets so the activating pipe's targets stay
@@ -1942,48 +1945,29 @@ init_pipes:
 .init_no_shift:
         pop     af
         inc     a
-        cp      3                            ; configure only pipes 0..2 (not pipe 3)
+        cp      NUM_PIPES                    ; configure all NUM_PIPES pipes
         jr      nz, .init_cps_lp
 
-        ; Pipe 3 is the "prep" pipe at startup. Its column is held as a
-        ; JR-skip column (cheap no-op) until the first do_swap activates it.
-        ; pipe_state[3].byte_x = 29 — parked off-screen right, invisible.
-        ; pipe_state[3].gap_y is left at its data default (a valid 8..96
-        ; value); do_swap reads it when pipe 3 first activates.
-        ;
-        ; Patch-only renderer (Phase 3): the body bytes at band+4..+51 of
-        ; every band must be valid IX-walk code BEFORE the first activation,
-        ; because do_swap's un_jrskip_column + reset_ix_targets_to_29 +
-        ; finalize_pipe_init patch only band+0..+3 (and the K_top/K_bot
-        ; bands' cap-slot regions). Emit pipe 3 as ALL-body (out-of-range
-        ; K_top/K_bot via cap_row=168 → K=21) so cps_emit_body_bands picks
-        ; .cebb_body for every K and never tries to emit a cap-edge band
-        ; (which would land outside the column).
+        ; Pipe 3 slot in PIPE_PROGRAM still exists physically (the 4-pipe
+        ; band interleave layout is preserved). Emit body code for its
+        ; 20 bands then park them all as JR-skip — pipe 3 is now
+        ; permanently dead but its bands must be valid since PIPE_PROGRAM
+        ; execution flow still walks through them (just skips immediately).
         ld      a, 3
         ld      (cps_pipe), a
         ld      a, 168
-        ld      (cps_cap_top_row), a         ; K_top = 21 (out-of-range)
-        ld      (cps_cap_bot_row), a         ; K_bot = 21 (out-of-range)
-        call    cps_emit_body_bands          ; emit body code for all 20 bands
-
-        ld      a, 29
-        ld      (pipe_state + 3*2), a        ; pipe 3 byte_x = 29
+        ld      (cps_cap_top_row), a
+        ld      (cps_cap_bot_row), a
+        call    cps_emit_body_bands
         ld      a, 3
-        call    write_jrskip_column          ; pipe 3 column = JR-skip (body bytes preserved)
+        call    write_jrskip_column
 
-        ; Defensive: zero-fill ACTIVE_PIPE_3 (224 bytes) so that if do_swap's
-        ; fallback path ever triggers patch_pipe_targets before phase 6 runs,
-        ; any stray decrements hit $0000 in ROM (silent, no corruption).
         ld      hl, ACTIVE_PIPE_3
         ld      de, ACTIVE_PIPE_3 + 1
         ld      (hl), 0
         ld      bc, 223
         ldir
 
-        ; ACTIVE_COUNT_NEW = 3 * 112 = 336 (patch_pipe_targets walks only the 3 active
-        ; pipes at ACTIVE_PIPE_0..PIPE_2; pipe 3 is skipped — its column is all-NOPs
-        ; and decrementing NOP bytes would produce $FF = RST $38, disastrous during
-        ; PIPE_PROGRAM execution. Phase 4/5 will activate pipe 3 properly.)
         ld      hl, 336
         ld      (ACTIVE_COUNT_NEW), hl
 

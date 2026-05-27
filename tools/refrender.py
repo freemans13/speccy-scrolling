@@ -51,7 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from snadump import load_sna, addr, addr_word, addr_range
 
 # ── Game constants ────────────────────────────────────────────────────
-NUM_PIPES = 4
+NUM_PIPES = 3
 
 # Symbol addresses are loaded from build/main.lst at import time. If the
 # label moves (any code change reshuffles RAM addresses) the tools auto-
