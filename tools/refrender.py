@@ -62,9 +62,11 @@ ATTR_GROUND     = 0x20     # paper green, ink black
 ATTR_PIPE       = 0x20     # paper green, ink black (body M1+M2)
 ATTR_BIRD       = 0x70     # bright yellow paper, black ink
 ATTR_BUFFER     = 0x2D     # paper cyan = ink cyan (invisible)
+ATTR_SCOREBOARD = 0x07     # paper black, ink white (rows 21..23)
 
 GROUND_TOP_ROW  = 20       # char row of ground (scan 160..167)
 SCORE_TOP_ROW   = 21       # char row of scoreboard (scan 168..175)
+NUM_SCORE_ROWS  = 3        # rows 21,22,23
 
 BUFFER_COLS_L   = range(0, 4)
 BUFFER_COLS_R   = range(28, 32)
@@ -149,10 +151,19 @@ def build_expected_attrs(state: dict) -> list[int]:
                 if 0 <= col < 32 and col not in BUFFER_COLS_L and col not in BUFFER_COLS_R:
                     attrs[row * 32 + col] = ATTR_PIPE
 
-    # 3. Ground band.
+    # 3. Ground band (row 20) — green inside, buffer at edges.
     for col in range(32):
-        attrs[GROUND_TOP_ROW * 32 + col] = ATTR_GROUND
-    # 4. Scoreboard band stays sky.
+        if col in BUFFER_COLS_L or col in BUFFER_COLS_R:
+            attrs[GROUND_TOP_ROW * 32 + col] = ATTR_BUFFER
+        else:
+            attrs[GROUND_TOP_ROW * 32 + col] = ATTR_GROUND
+    # 4. Scoreboard band (rows 21..23) — paper black, ink white. Buffer at edges.
+    for r in range(SCORE_TOP_ROW, SCORE_TOP_ROW + NUM_SCORE_ROWS):
+        for col in range(32):
+            if col in BUFFER_COLS_L or col in BUFFER_COLS_R:
+                attrs[r * 32 + col] = ATTR_BUFFER
+            else:
+                attrs[r * 32 + col] = ATTR_SCOREBOARD
 
     # 5. Bird cell — col 8, row centred on bird_y_hi+4.
     by_hi = state["bird_y_hi"]
