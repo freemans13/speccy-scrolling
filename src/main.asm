@@ -516,12 +516,15 @@ bird_overlap:       ds BIRD_LINES, 0
 ; ink (sprite=1) inside the silhouette, masking the cyan paper.
 bird_attr_y:        db 0
 bird_attr_valid:    db 0
-; Bird sprite is 16 px tall = 2 full char rows (when y_hi is char-aligned)
-; or 3 partial char rows (when y_hi straddles a boundary). paint_bird_attrs
-; computes how many rows it needs (2 or 3) and stores in bird_attr_rows.
-; restore_bird_attrs uses the same count.
-bird_attr_rows:     db 0
-bird_attr_save:     ds 9, 0
+; Bird sprite is 16 px tall. We always paint TWO char rows (16 px of
+; bird/sky attrs). Position is chosen to maximise sprite coverage:
+; if bird_y_hi is char-aligned, the 2 rows align perfectly with the
+; sprite. Otherwise we snap to whichever pair of consecutive rows
+; contains the most sprite pixels (= top+middle if offset ≤ 4 else
+; middle+bottom). The 1-7 px of sprite that fall outside the paint
+; area show as black ink on sky paper — bird outline visible without
+; the empty yellow rectangle artifact that "always 3 rows" produced.
+bird_attr_save:     ds 6, 0
 
 ; Bird wing animation — 4 frames cycling 0→1→2→3→0, one phase step every
 ; BIRD_ANIM_RATE frames. bird_sprite_ptr always points at the current
@@ -3427,27 +3430,31 @@ bird_attr_addr:
 ;   col 9 = ATTR_SKY  (wing pixels black on cyan)
 paint_bird_attrs:
         ld      a, (bird_y + 1)
-        ld      b, a                    ; B = bird_y_hi (for alignment test)
-        and     $F8                     ; snap to char-row boundary (top of sprite)
-        ld      (bird_attr_y), a
-        ld      a, 1
-        ld      (bird_attr_valid), a
-
-        ; Determine row count: 2 if char-aligned (y_hi % 8 == 0), else 3.
+        ld      b, a                    ; B = bird_y_hi
+        and     $F8                     ; snap DOWN to char boundary (top row)
+        ld      c, a                    ; C = top char-row Y
+        ; If sub-offset (B & 7) > 4, bias paint DOWN by one char row
+        ; (= use middle+bottom rows instead of top+middle) — more sprite
+        ; pixels are in the lower half of the spanned area in that case.
         ld      a, b
         and     7
-        ld      a, 2
-        jr      z, .pba_row_count_set
-        ld      a, 3
-.pba_row_count_set:
-        ld      (bird_attr_rows), a
+        cp      5
+        jr      c, .pba_no_bias
+        ld      a, c
+        add     a, 8
+        ld      c, a
+.pba_no_bias:
+        ld      a, c
+        ld      (bird_attr_y), a
+        push    af                      ; preserve A across the valid-flag store
+        ld      a, 1
+        ld      (bird_attr_valid), a
+        pop     af                      ; A = bird_attr_y for bird_attr_addr
 
-        ld      a, (bird_attr_y)
-        call    bird_attr_addr          ; HL = ATTRS[top row, col 8]
-        dec     hl                      ; → col 7 of top row
+        call    bird_attr_addr          ; HL = ATTRS[bird_attr_y, col 8]
+        dec     hl                      ; → col 7
         ld      ix, bird_attr_save
-        ld      a, (bird_attr_rows)
-        ld      b, a
+        ld      b, 2                    ; ALWAYS 2 rows
 .pba_row:
         ; save 3 cells (cols 7, 8, 9)
         ld      a, (hl)
@@ -3477,11 +3484,10 @@ restore_bird_attrs:
         or      a
         ret     z
         ld      a, (bird_attr_y)
-        call    bird_attr_addr          ; HL = ATTRS[top row, col 8]
-        dec     hl                      ; → col 7 of top row
+        call    bird_attr_addr          ; HL = ATTRS[bird_attr_y, col 8]
+        dec     hl                      ; → col 7
         ld      ix, bird_attr_save
-        ld      a, (bird_attr_rows)
-        ld      b, a
+        ld      b, 2                    ; matches paint
 .rba_row:
         ld      a, (ix+0)
         ld      (hl), a
