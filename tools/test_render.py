@@ -95,6 +95,49 @@ def run_to_frame(sim, target_frame_count):
     return accepted
 
 
+def find_ghost_pixels(memory, pipes, prep, bird_rows):
+    """Return list of (col, row, attr, pixel_byte) for cells that:
+      - are NOT inside any current pipe's body (L..R) at body+cap rows
+      - are NOT in the bird's 3-col band
+      - have an attr where ink != paper (so any pixel byte is visible)
+      - have a non-zero pixel byte
+    These are stale pixels left by prior pipe positions, now visible
+    because the attr was restored to SKY ($28) by restore_leading or
+    restore_trailing without clearing the underlying pixel data."""
+    attrs = memory[0x5800:0x5B00]
+    pixels = memory[0x4000:0x5800]
+    # Cells covered by any current pipe (L M1 M2 R) at body+cap rows.
+    pipe_cells = set()
+    for i, (bx, gy) in enumerate(pipes):
+        if i == prep: continue
+        if not (1 <= bx <= 30 and 8 <= gy <= 96): continue
+        kt, kb = k_top(gy), k_bot(gy)
+        for row in range(GROUND_TOP_ROW):
+            if kt < row < kb: continue
+            for c in (bx-1, bx, bx+1, bx+2):
+                if 0 <= c < 32:
+                    pipe_cells.add((c, row))
+    ghosts = []
+    for cr in range(GROUND_TOP_ROW):
+        for c in range(4, 28):  # skip buffer cols
+            if (c, cr) in pipe_cells: continue
+            if (c in (7, 8, 9)) and (cr in bird_rows): continue
+            attr = attrs[cr * 32 + c]
+            if (attr & 7) == ((attr >> 3) & 7):
+                continue  # ink==paper, invisible regardless
+            for sub in range(8):
+                y = cr * 8 + sub
+                ccc = (y >> 6) & 0x3
+                ppp = y & 0x7
+                rrr = (y >> 3) & 0x7
+                row_addr = (ccc << 11) | (ppp << 8) | (rrr << 5)
+                byte = pixels[row_addr + c]
+                if byte != 0:
+                    ghosts.append((c, cr, attr, byte))
+                    break
+    return ghosts
+
+
 def check_pipe(attrs, pipe_idx, bx, gy, bird_rows):
     """Return list of (col, row, actual, expected, why) failures.
     bird_rows is a set of char rows that the bird's 3-col attr band
@@ -175,6 +218,16 @@ def check_snapshot(memory):
     for i, (bx, gy) in enumerate(pipes):
         if i == prep: continue
         fails.extend(check_pipe(attrs, i, bx, gy, bird_rows))
+
+    # Pixel-level ghost check: stale pixels in visible cells outside
+    # any current pipe or the bird. These cause "phantom stripes" —
+    # see https://… (the bug where restore_leading exposed old pixels).
+    ghosts = find_ghost_pixels(memory, pipes, prep, bird_rows)
+    for c, cr, attr, byte in ghosts:
+        fails.append((c, cr, byte, "00",
+                      f"ghost pixel: visible cell (attr=${attr:02X}) has "
+                      f"stale pixel byte ${byte:02X} — should be sky"))
+
     return fails, summary, bird_attr_row
 
 
