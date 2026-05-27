@@ -285,6 +285,13 @@ def check_snapshot(memory):
     return fails, summary, bird_attr_row
 
 
+# Continuous frame range — run every frame in [LO, HI] through
+# check_snapshot. Catches transient bugs that only appear for a single
+# frame around wrap/swap events (the 4-checkpoint sampler at fixed
+# frames misses these).
+CONTINUOUS_RANGE = (50, 5000)
+
+
 CHECKPOINTS = [
     ("settle (50f)",             50),
     ("post-first-wrap (200f)",   200),
@@ -323,10 +330,48 @@ def main():
                 print(f"      ... and {len(fails) - 20} more")
             total_fails += len(fails)
 
+    # Continuous-frame sweep: run frame-by-frame, check each. This
+    # catches transient bugs (e.g. single-frame ghosts during the
+    # swap+wrap transition) that the 4-checkpoint sampler misses.
+    lo, hi = CONTINUOUS_RANGE
+    if last < lo:
+        run_to_frame(sim, lo - last)
+        last = lo
+    print(f"  continuous sweep: frames {last}..{hi}")
+    transient_fails = 0
+    transient_frames = []
+    sample_fail_detail = None
+    while last < hi:
+        run_to_frame(sim, 1)
+        last += 1
+        memory = bytes(sim.memory[:0x10000])
+        fails, summary, _ = check_snapshot(memory)
+        if fails:
+            transient_fails += len(fails)
+            transient_frames.append(last)
+            if sample_fail_detail is None:
+                sample_fail_detail = (last, summary, fails[:10])
+
+    if transient_frames:
+        first_fr, summary, sample_fails = sample_fail_detail
+        print(f"  FAIL continuous sweep: {len(transient_frames)} frames "
+              f"with fails (total {transient_fails} cells)")
+        print(f"    frames: {transient_frames[:20]}"
+              + (f" ... +{len(transient_frames)-20}" if len(transient_frames) > 20 else ""))
+        print(f"    first failing frame {first_fr}: {' '.join(summary)}")
+        for col, row, actual, expected, why in sample_fails:
+            if col == "-":
+                print(f"      {why}: got {actual}, expected {expected}")
+            else:
+                exp = f"${expected:02X}" if isinstance(expected, int) else expected
+                print(f"      ({col:2},{row:2})  actual=${actual:02X}  "
+                      f"expected={exp}  — {why}")
+        total_fails += transient_fails
+
     if total_fails:
-        print(f"FAIL: {total_fails} cell mismatches across checkpoints")
+        print(f"FAIL: {total_fails} cell mismatches total")
         return 1
-    print("PASS: all checkpoints clean")
+    print("PASS: all checkpoints + continuous sweep clean")
     return 0
 
 
