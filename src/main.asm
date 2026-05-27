@@ -516,11 +516,11 @@ bird_overlap:       ds BIRD_LINES, 0
 ; ink (sprite=1) inside the silhouette, masking the cyan paper.
 bird_attr_y:        db 0
 bird_attr_valid:    db 0
-; Bird sprite is 16 px tall = 2 full char rows (when y is char-aligned)
-; or 3 partial char rows (when y straddles a boundary — the common case
-; due to gravity). We paint bird attrs at THREE char rows so the full
-; sprite shows on yellow/sky paper regardless of alignment. Saved attrs
-; are 9 bytes: 3 cells (cols 7,8,9) × 3 char rows.
+; Bird sprite is 16 px tall = 2 full char rows (when y_hi is char-aligned)
+; or 3 partial char rows (when y_hi straddles a boundary). paint_bird_attrs
+; computes how many rows it needs (2 or 3) and stores in bird_attr_rows.
+; restore_bird_attrs uses the same count.
+bird_attr_rows:     db 0
 bird_attr_save:     ds 9, 0
 
 ; Bird wing animation — 4 frames cycling 0→1→2→3→0, one phase step every
@@ -3427,16 +3427,27 @@ bird_attr_addr:
 ;   col 9 = ATTR_SKY  (wing pixels black on cyan)
 paint_bird_attrs:
         ld      a, (bird_y + 1)
+        ld      b, a                    ; B = bird_y_hi (for alignment test)
         and     $F8                     ; snap to char-row boundary (top of sprite)
         ld      (bird_attr_y), a
         ld      a, 1
         ld      (bird_attr_valid), a
 
+        ; Determine row count: 2 if char-aligned (y_hi % 8 == 0), else 3.
+        ld      a, b
+        and     7
+        ld      a, 2
+        jr      z, .pba_row_count_set
+        ld      a, 3
+.pba_row_count_set:
+        ld      (bird_attr_rows), a
+
         ld      a, (bird_attr_y)
         call    bird_attr_addr          ; HL = ATTRS[top row, col 8]
         dec     hl                      ; → col 7 of top row
         ld      ix, bird_attr_save
-        ld      b, 3                    ; 3 char rows
+        ld      a, (bird_attr_rows)
+        ld      b, a
 .pba_row:
         ; save 3 cells (cols 7, 8, 9)
         ld      a, (hl)
@@ -3469,7 +3480,8 @@ restore_bird_attrs:
         call    bird_attr_addr          ; HL = ATTRS[top row, col 8]
         dec     hl                      ; → col 7 of top row
         ld      ix, bird_attr_save
-        ld      b, 3
+        ld      a, (bird_attr_rows)
+        ld      b, a
 .rba_row:
         ld      a, (ix+0)
         ld      (hl), a
