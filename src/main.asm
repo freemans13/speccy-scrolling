@@ -2707,7 +2707,17 @@ do_swap:
         ld      a, (prep_pipe_idx)
         ld      (ds_inc), a                     ; incoming = old prep_pipe_idx
 
-        ; Set incoming pipe's byte_x = 29 in pipe_state.
+        ; Set incoming pipe's byte_x = 25 in pipe_state. This is the
+        ; right-most fully-visible position (cols 24..27 = L M1 M2 R, all
+        ; in the visible playfield [4..27]). Previously this was 29 (in
+        ; the right buffer band) which made pipes "emerge" gradually
+        ; 1→2→3→4 cells as they scrolled left through cols 28..25,
+        ; producing transient single-frame-looking truncation visible
+        ; for ~4 wraps after each swap.
+        ;
+        ; do_swap_part_b shifts the pipe's IX targets accordingly (from
+        ; byte_x=29 baked position to byte_x=25) and paints M1+M2 attrs
+        ; so the pipe pops in fully formed.
         ; gap_y left untouched — it was set at the previous deactivation.
         ld      a, (ds_inc)
         add     a, a                            ; inc*2
@@ -2715,13 +2725,32 @@ do_swap:
         ld      h, 0
         ld      de, pipe_state
         add     hl, de
-        ld      (hl), 29
+        ld      (hl), 25
 
         ; ── PART A: dep deactivation ──────────────────────────────
         call    restore_capedges_to_body        ; uses ds_dep, ds_old_gap_y
         ld      a, (ds_dep)
         call    write_jrskip_column             ; one-shot 2-byte stamp per band
         call    clear_old_cap_rows              ; pixel clear OLD cap rows
+
+        ; Paint M1+M2 attrs for the activating pipe at byte_x=25 cols.
+        ; Must be done HERE (PART A, same frame as the swap) — if deferred
+        ; to PART B on the next frame, the intermediate frame shows pipe 2
+        ; with stale attrs at M2 col (= mask trail from prior pipes), so
+        ; pipe appears as a 1-cell green block for 1 frame.
+        ;
+        ; Reads pipe_state[inc].gap_y directly (cps_gap_y isn't set until
+        ; PART B). This paint walks ATTRS memory; doesn't need active list.
+        ld      a, (ds_inc)
+        add     a, a                            ; inc*2
+        ld      l, a
+        ld      h, 0
+        ld      de, pipe_state + 1
+        add     hl, de                          ; HL = &pipe_state[inc].gap_y
+        ld      a, (hl)
+        ld      e, a                            ; E = gap_y
+        ld      c, 25                           ; C = byte_x = 25
+        call    paint_pipe_attrs_inner          ; M1+M2 green at cols 25,26 on body+cap rows
 
         ; ── PART C: prep rotation ─────────────────────────────────
         ld      a, (ds_dep)
@@ -2781,7 +2810,16 @@ do_swap_part_b:
         call    un_jrskip_visible               ; DD 21 at +0..+1 for non-gap K only
         ld      a, (activate_pipe_idx)
         call    reset_ix_targets_to_29          ; byte_x=29 IX target at +2..+3 (all K)
-        call    finalize_pipe_init_lite         ; K_top/K_bot capedges + cap arming + cap target imms (skips active list rebuild)
+        call    finalize_pipe_init_lite         ; K_top/K_bot capedges + cap arming + cap target imms + active list rebuild
+
+        ; Shift IX targets from byte_x=29 (baked) to byte_x=25 (= pipe_state).
+        ; cps_build_active_list (inside finalize_pipe_init_lite) populated
+        ; the active list with addresses of every body band's IX-lo byte;
+        ; shift_pipe_targets walks that list and subtracts C=4 from each.
+        ; This must run AFTER finalize_pipe_init_lite (needs the active list).
+        ld      a, (activate_pipe_idx)
+        ld      c, 4                            ; delta: 29 - 25 = 4
+        call    shift_pipe_targets
 
         ld      a, 255
         ld      (activate_pipe_idx), a          ; PART B complete
