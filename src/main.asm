@@ -55,6 +55,11 @@ SND_SLICE_CONFIG  EQU 0                  ; build frames are ~67k already — no 
 ; Tune empirically with tools/snadump.py border R-delta variance.
 WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYAN wrap-vs-non-wrap variance for budget headroom
 
+; Busy-wait iters to delay wrap_attrs_combined into bottom blanking.
+; Each iter ~26 T. We need to delay ~10 k T (from BLUE band end at
+; ~T=38000 to bottom blanking at T~48000). 10000/26 ≈ 385 iters.
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 385
+
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
 ; eligible or skipped (~3920 T per active pipe).
@@ -300,18 +305,23 @@ main_loop:
         jr      z, .no_wrap_pending
         xor     a
         ld      (wrap_pending), a
-        ; Order matters: pipes can be ~9-10 cols apart, so pipe A's
-        ; mask col (byte_x_A+3) can coincide with pipe B's M1 col
-        ; (byte_x_B). Run mask FIRST, then restore, then apply LAST so
-        ; apply's GREEN wins over any spurious attr set by another
-        ; pipe's mask/restore for the same col.
-        call    mask_vacated_pipe_attrs         ; first: $2D at byte_x+3 (OLD R)
-        call    restore_leading_pipe_attrs      ; then:  sky $28 at byte_x-1 (NEW L)
-                                                ;        — cleans the trail of stale
-                                                ;        $2D masks left by this and
-                                                ;        prior pipes' wraps
-        call    restore_trailing_pipe_attrs     ; then:  sky $28 at byte_x+2 (NEW R)
-        call    apply_pipe_attrs_wrap           ; last:  GREEN at byte_x (NEW M1)
+        ; Busy-wait until the raster has passed the last pipe row
+        ; (= line 152 = T~48000 from frame start). Writing pipe attrs
+        ; BEFORE this would race the raster mid-beam → top portion of
+        ; pipes shows stale attrs (user-visible single-frame corruption
+        ; every 4th frame). We delay until bottom blanking, then write
+        ; takes effect on the NEXT frame's display.
+        ;
+        ; Budget: ~13k T idle between current T (~38k after BLUE) and
+        ; target T~48k. Then 5k T for wrap_attrs_combined. Then halt
+        ; at T~70k.
+        ld      de, BUSY_WAIT_TO_BOTTOM_BLANK
+.wbb_lp:
+        dec     de
+        ld      a, d
+        or      e
+        jr      nz, .wbb_lp
+        call    wrap_attrs_combined             ; single-pass writer (~5k T)
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
         PROFILE_OUT 0                   ; BLACK = idle before halt
@@ -3879,6 +3889,137 @@ apply_pipe_attrs_wrap:
         inc     iy
         pop     bc
         djnz    .lp
+        ret
+
+;----------------------------------------------------------------
+; wrap_attrs_combined — single-pass attr writer for all 5 pipe-related
+; cols (L=byte_x-1, M1=byte_x, M2=byte_x+1, R=byte_x+2, vacated=byte_x+3)
+; for each non-prep pipe across body+cap rows. Replaces the 4-pass
+; mask/restore_leading/restore_trailing/apply_pipe_attrs_wrap sequence
+; which costs ~14 k T. This single-pass version costs ~5 k T.
+;
+; Per pipe per row writes:
+;   L  (byte_x-1): ATTR_SKY $28
+;   M1 (byte_x  ): ATTR_PIPE $20
+;   M2 (byte_x+1): ATTR_PIPE $20
+;   R  (byte_x+2): ATTR_SKY $28
+;   +1 (byte_x+3): ATTR_BUFFER $2D (masks OLD R col pixels)
+;
+; In: pipe_state, prep_pipe_idx.   Clobbers: AF, BC, DE, HL, IY.
+;----------------------------------------------------------------
+wrap_attrs_combined:
+        ld      iy, pipe_state
+        ld      b, NUM_PIPES
+.wac_outer:
+        push    bc
+        ld      a, NUM_PIPES
+        sub     b
+        ld      c, a                            ; C = pipe index
+        ld      a, (prep_pipe_idx)
+        cp      c
+        jp      z, .wac_skip
+        ld      a, (iy+0)                       ; A = byte_x
+        cp      2
+        jp      c, .wac_skip                    ; byte_x < 2 → L col underflow
+        cp      29
+        jp      nc, .wac_skip                   ; byte_x > 28 → mask col off-screen
+        ld      c, a                            ; C = byte_x
+        ld      a, (iy+1)                       ; A = gap_y
+        ld      e, a                            ; E = gap_y
+        call    .wac_pipe                       ; paint this pipe
+.wac_skip:
+        inc     iy
+        inc     iy
+        pop     bc
+        djnz    .wac_outer
+        ret
+
+; Paint one pipe's 5-col strip across body+cap rows.
+; In: C = byte_x, E = gap_y.   Clobbers: AF, BC, DE, HL.
+.wac_pipe:
+        push    bc                              ; save byte_x
+        ; Top region: rows 0..K_top (= (gap_y-1)>>3)
+        ld      a, e
+        or      a
+        jr      z, .wac_no_top
+        dec     a
+        srl     a
+        srl     a
+        srl     a
+        inc     a                               ; A = top row count
+        ld      b, a
+        xor     a                               ; A = start row 0
+        push    de
+        call    .wac_rows                       ; paint B rows starting at A
+        pop     de
+.wac_no_top:
+        ; Bot region: rows K_bot..19
+        ld      a, e
+        add     a, PIPE_GAP
+        jr      c, .wac_done
+        add     a, 7
+        jr      c, .wac_done
+        srl     a
+        srl     a
+        srl     a
+        cp      20
+        jr      nc, .wac_done
+        ld      d, a
+        ld      a, 20
+        sub     d
+        ld      b, a                            ; B = bot row count
+        ld      a, d                            ; A = bot start row
+        push    de
+        call    .wac_rows
+        pop     de
+.wac_done:
+        pop     bc                              ; restore byte_x (saved at entry)
+        ret
+
+; In: A = start row, B = row count, byte_x on stack (popped after).
+; Caller already has byte_x in scratch; we re-read from saved stack entry.
+; Simpler: read byte_x from (sp+2) — but Z80 stack indexing is hard.
+; Workaround: caller passes byte_x in C, we preserve C via push/pop locally.
+.wac_rows:
+        ; HL = ATTRS + row*32 + (byte_x - 1)  [L col addr]
+        push    bc                              ; save B (row count) and C (byte_x)
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl
+        add     hl, hl                          ; HL = row * 32
+        ld      de, ATTRS
+        add     hl, de                          ; HL = ATTRS + row*32
+        pop     bc                              ; B = row count, C = byte_x
+        push    bc
+        ld      a, c
+        dec     a                               ; A = byte_x - 1 = L col
+        ld      e, a
+        ld      d, 0
+        add     hl, de                          ; HL = L col addr
+        pop     bc
+.wac_row_lp:
+        ; Write 5 cells: $28 $20 $20 $28 $2D
+        ld      (hl), ATTR_SKY                  ; L
+        inc     hl
+        ld      (hl), ATTR_PIPE                 ; M1
+        inc     hl
+        ld      (hl), ATTR_PIPE                 ; M2
+        inc     hl
+        ld      (hl), ATTR_SKY                  ; R
+        inc     hl
+        ld      (hl), ATTR_BUFFER               ; vacated mask
+        ; Advance HL: from byte_x+3 to next row's L col (= byte_x-1).
+        ; Delta = +32 (next row) - 4 (back to L col) = +28.
+        ld      a, l
+        add     a, 28
+        ld      l, a
+        jr      nc, .wac_nc
+        inc     h
+.wac_nc:
+        djnz    .wac_row_lp
         ret
 
 ;----------------------------------------------------------------
