@@ -262,6 +262,17 @@ main_loop:
         call    paint_bird_attrs        ; top-blank: paint so raster reads bird attrs THIS frame
         PROFILE_OUT 3                   ; MAGENTA = PIPE_PROGRAM
         call    frame_update
+        ; PIPE_PROGRAM body bands write pipe pixel data at L..R cols of
+        ; each active pipe. Cap handlers (k_top/k_bot rows) similarly push
+        ; cap rim bytes. Both can leave pixel data at bird cols (7,8,9) —
+        ; either the current pipe writing M1/M2/R at one of those cols, or
+        ; stale residue from prior pipe positions. paint_bird_attrs forces
+        ; SKY ($28, ink black on cyan paper) at bird's 3 char rows × cols
+        ; 7,8,9 — exposing any non-zero pixel as a visible black stripe.
+        ; Clean bird's cells then re-stamp the sprite so bird wins over
+        ; pipe pixels at overlapping cells.
+        call    clean_bird_col_pixels
+        call    draw_bird
         PROFILE_OUT 7                   ; WHITE = state prep
         call    do_white_work
         PROFILE_OUT 5                   ; CYAN = update_cap_imm_v2
