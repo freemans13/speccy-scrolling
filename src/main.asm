@@ -60,7 +60,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
 ; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
 ; Verified by tools/test_beam_race.py.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 440
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 487
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -2985,10 +2985,10 @@ update_cap_imm_v2:
         ld      a, (hl)
         ld      (cap_R_temp), a         ; R
 
-        ; Write bc/de pairs into cap_top handlers (pipes 0..3 — Phase 5: all 4)
+        ; Write bc/de pairs into cap_top handlers (one per active pipe)
         ld      ix, cap_top_bc_imm_addrs
         ld      iy, cap_top_de_imm_addrs
-        ld      b, 4
+        ld      b, NUM_PIPES
 .top_lp:
         push    bc
         ; BC-imm slot: byte at addr = L, byte at addr+1 = M1
@@ -3015,10 +3015,10 @@ update_cap_imm_v2:
         pop     bc
         djnz    .top_lp
 
-        ; Write bc/de pairs into cap_bot handlers (pipes 0..3 — Phase 5: all 4)
+        ; Write bc/de pairs into cap_bot handlers (one per active pipe)
         ld      ix, cap_bot_bc_imm_addrs
         ld      iy, cap_bot_de_imm_addrs
-        ld      b, 4
+        ld      b, NUM_PIPES
 .bot_lp:
         push    bc
         ld      l, (ix+0)
