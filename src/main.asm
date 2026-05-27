@@ -325,6 +325,12 @@ main_loop:
         jr      nz, .wbb_lp
         PROFILE_OUT 4                           ; GREEN = wrap_attrs_combined start (bottom blank)
         call    wrap_attrs_combined             ; single-pass writer (~5k T)
+        ; Re-stamp the bird's 9 attr cells so any wrap_attrs writes at
+        ; pipe vacated/L/R cols that coincide with cols 7/8/9 don't end
+        ; up as the final attr value. Stamp-only — does NOT update
+        ; bird_attr_y or bird_attr_save (those reflect pre-paint state
+        ; that restore_bird_attrs needs next frame to avoid yellow trail).
+        call    paint_bird_stamp
         PROFILE_OUT 1                           ; back to BLUE = sfx region
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
@@ -521,7 +527,10 @@ bird_attr_valid:    db 0
 ; sprite's wing pixels read as black on cyan around the yellow body.
 ; This is the original design (in place for ~a month before being
 ; briefly broken by an attempted "full coverage" extension).
-bird_attr_save:     db 0, 0, 0          ; saved attrs at cols 7, 8, 9 of bird_attr_y row
+bird_attr_save:     db 0, 0, 0, 0, 0, 0, 0, 0, 0
+                                        ; saved attrs at cols 7, 8, 9 across THREE char rows
+                                        ; the bird sprite may overlap (top, centre, bottom).
+                                        ; Layout: row0(7,8,9) row1(7,8,9) row2(7,8,9).
 
 ; Bird wing animation — 4 frames cycling 0→1→2→3→0, one phase step every
 ; BIRD_ANIM_RATE frames. bird_sprite_ptr always points at the current
@@ -3432,53 +3441,155 @@ bird_attr_addr:
 ; cols 7/9 + cols 8 outside the yellow cell render as black on cyan —
 ; the bird silhouette outline.
 paint_bird_attrs:
+        ; Sprite is 16 px tall starting at bird_y; covers 2 or 3 char rows
+        ; (top_row = bird_y >> 3, bot_row = (bird_y + 15) >> 3). Paint cols
+        ; 7,8,9 across 3 char rows starting at top_row so the full sprite's
+        ; wing pixels render on SKY ($28, paper cyan / ink black) instead
+        ; of inheriting whatever attrs the pipe scroll left behind ($2D
+        ; BUFFER would render wing pixels cyan-on-cyan = invisible).
+        ; The centre row (top_row+1, containing bird_y+8) gets ATTR_BIRD
+        ; ($70 yellow) at col 8 for the body cell. Other col 8 rows get
+        ; SKY so head/tail pixels render as black-on-cyan.
         ld      a, (bird_y + 1)
-        add     a, 8                    ; +8 snaps to char row containing bird centre
-        and     $F8
-        ld      (bird_attr_y), a
+        ld      (bird_attr_y), a        ; store TOP pixel-y (= top_row * 8)
         ld      a, 1
         ld      (bird_attr_valid), a
-        ld      a, (bird_attr_y)
-        call    bird_attr_addr          ; HL = ATTRS[bird_attr_y, col 8]
-        ; Save existing attrs at cols 7, 8, 9 (so we can restore whatever
-        ; pipe / mask state was there). 3 bytes saved.
-        dec     hl                      ; HL = col 7
+        ld      a, (bird_attr_y)        ; A = top_row * 8 (already %F8 since bird_y_hi & 7 stays 0..7, addr calc tolerates)
+        and     $F8                     ; snap to char row boundary
+        call    bird_attr_addr          ; HL = ATTRS[A, col 8] (centre of bird cols)
+        dec     hl                      ; HL = ATTRS[top_row, col 7]
+        ld      de, bird_attr_save
+        ; Row 0 (top): col 7 SKY, col 8 SKY, col 9 SKY
+        call    .paint_row_sky_centre
+        ; Advance HL to row+1 col 7 (delta +29 from col 9 back to col 7)
+        call    .advance_to_next_row_col7
+        ; Row 1 (centre): col 7 SKY, col 8 BIRD, col 9 SKY
         ld      a, (hl)
-        ld      (bird_attr_save), a
-        inc     hl                      ; HL = col 8
-        ld      a, (hl)
-        ld      (bird_attr_save + 1), a
-        inc     hl                      ; HL = col 9
-        ld      a, (hl)
-        ld      (bird_attr_save + 2), a
-        ; Write bird-visible attrs: col 7/9 = ATTR_SKY (paper cyan, ink
-        ; black — wings show as black silhouette); col 8 = ATTR_BIRD
-        ; (paper yellow, ink black — body fill + black detail).
-        dec     hl
-        dec     hl                      ; HL = col 7
+        ld      (de), a
+        inc     de
         ld      (hl), ATTR_SKY
         inc     hl
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
         ld      (hl), ATTR_BIRD
         inc     hl
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        ld      (hl), ATTR_SKY
+        call    .advance_to_next_row_col7
+        ; Row 2 (bottom): col 7 SKY, col 8 SKY, col 9 SKY
+        call    .paint_row_sky_centre
+        ret
+
+.paint_row_sky_centre:
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        ld      (hl), ATTR_SKY
+        inc     hl
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
+        ld      (hl), ATTR_SKY
+        inc     hl
+        ld      a, (hl)
+        ld      (de), a
+        inc     de
         ld      (hl), ATTR_SKY
         ret
 
-; restore_bird_attrs: write saved 3 attr bytes back at bird_attr_y's row.
+.advance_to_next_row_col7:
+        ; HL points at col 9 of current row. Next row's col 7 is +30
+        ; (32-byte row stride minus 2 cols).
+        ld      a, l
+        add     a, 30
+        ld      l, a
+        ret     nc
+        inc     h
+        ret
+
+; restore_bird_attrs: write saved 9 attr bytes back across 3 char rows
+; at cols 7,8,9 starting from bird_attr_y (top row).
 restore_bird_attrs:
         ld      a, (bird_attr_valid)
         or      a
         ret     z
         ld      a, (bird_attr_y)
-        call    bird_attr_addr          ; HL = col 8
-        dec     hl                      ; col 7
-        ld      a, (bird_attr_save)
+        and     $F8
+        call    bird_attr_addr          ; HL = ATTRS[top_row, col 8]
+        dec     hl                      ; HL = ATTRS[top_row, col 7]
+        ld      de, bird_attr_save
+        ld      b, 3                    ; 3 rows
+.row_lp:
+        ld      a, (de)
         ld      (hl), a
+        inc     de
         inc     hl                      ; col 8
-        ld      a, (bird_attr_save + 1)
+        ld      a, (de)
         ld      (hl), a
+        inc     de
         inc     hl                      ; col 9
-        ld      a, (bird_attr_save + 2)
+        ld      a, (de)
         ld      (hl), a
+        inc     de
+        ; Advance HL from col 9 to next row col 7: +30
+        ld      a, l
+        add     a, 30
+        ld      l, a
+        jr      nc, .nc
+        inc     h
+.nc:
+        djnz    .row_lp
+        ret
+
+; paint_bird_stamp: re-stamp the 9 bird cells with the bird attrs.
+; Called AFTER wrap_attrs_combined so wrap_attrs's writes at bird cols
+; (e.g. when a pipe's vacated col coincides with col 7 or 9) don't end
+; up showing as the final attr value. Does NOT update bird_attr_y or
+; bird_attr_save — those reflect the pre-paint state of frame and must
+; be preserved so restore_bird_attrs next frame puts back what was
+; really there (avoids the yellow trail that a save-updating 2nd paint
+; would create).
+paint_bird_stamp:
+        ld      a, (bird_attr_valid)
+        or      a
+        ret     z
+        ld      a, (bird_attr_y)
+        and     $F8
+        call    bird_attr_addr          ; HL = ATTRS[top_row, col 8]
+        dec     hl                      ; HL = ATTRS[top_row, col 7]
+        ; Row 0 (top): SKY / SKY / SKY
+        ld      (hl), ATTR_SKY
+        inc     hl
+        ld      (hl), ATTR_SKY
+        inc     hl
+        ld      (hl), ATTR_SKY
+        ld      a, l
+        add     a, 30
+        ld      l, a
+        jr      nc, .nc1
+        inc     h
+.nc1:
+        ; Row 1 (centre): SKY / BIRD / SKY
+        ld      (hl), ATTR_SKY
+        inc     hl
+        ld      (hl), ATTR_BIRD
+        inc     hl
+        ld      (hl), ATTR_SKY
+        ld      a, l
+        add     a, 30
+        ld      l, a
+        jr      nc, .nc2
+        inc     h
+.nc2:
+        ; Row 2 (bot): SKY / SKY / SKY
+        ld      (hl), ATTR_SKY
+        inc     hl
+        ld      (hl), ATTR_SKY
+        inc     hl
+        ld      (hl), ATTR_SKY
         ret
 
 read_input:
