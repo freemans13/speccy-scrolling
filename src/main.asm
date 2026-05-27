@@ -516,9 +516,12 @@ bird_overlap:       ds BIRD_LINES, 0
 ; ink (sprite=1) inside the silhouette, masking the cyan paper.
 bird_attr_y:        db 0
 bird_attr_valid:    db 0
-bird_attr_save:     db 0, 0, 0          ; saved attrs at cols 7, 8, 9 of bird_attr_y row
-                                        ; (bird now owns 3 cols so the mask_vacated_pipe_attrs
-                                        ; pass can't strip the wings' ink-black sky attr)
+; Bird sprite is 16 px tall = 2 full char rows (when y is char-aligned)
+; or 3 partial char rows (when y straddles a boundary). We paint bird
+; attrs at TWO char rows so the wings + body show on yellow/sky paper
+; across the bird's full vertical extent. Saved attrs are 6 bytes:
+; 3 cells (cols 7,8,9) × 2 char rows (top + bottom).
+bird_attr_save:     db 0, 0, 0, 0, 0, 0
 
 ; Bird wing animation — 4 frames cycling 0→1→2→3→0, one phase step every
 ; BIRD_ANIM_RATE frames. bird_sprite_ptr always points at the current
@@ -3416,60 +3419,77 @@ bird_attr_addr:
         add     hl, de
         ret
 
-; paint_bird_attrs: paint ONE char cell of yellow at col 8 of the char
-; row containing the bird's vertical centre. Sprite is centred at col 8 so
-; the colour-clash boundary is symmetric (4 px of sprite each side in cols
-; 7 and 9, which keep their cyan sky attr).
+; paint_bird_attrs: paint TWO char rows (cols 7,8,9) so the full 16-px
+; bird sprite shows on bird/sky paper instead of pipe-green or buffer.
+; bird_attr_y stores the top char row's pixel-Y. The 2nd char row is
+; bird_attr_y + 8 (the next row down). Layout per row:
+;   col 7 = ATTR_SKY  (wing pixels black on cyan)
+;   col 8 = ATTR_BIRD (body pixels black on yellow)
+;   col 9 = ATTR_SKY  (wing pixels black on cyan)
 paint_bird_attrs:
         ld      a, (bird_y + 1)
-        add     a, 8                    ; +8 snaps to char row containing bird centre
-        and     $F8
+        and     $F8                     ; snap to char-row boundary (top of sprite)
         ld      (bird_attr_y), a
         ld      a, 1
         ld      (bird_attr_valid), a
+
+        ; ── Row 1 (top): save + paint ──
         ld      a, (bird_attr_y)
-        call    bird_attr_addr          ; HL = ATTRS[bird_attr_y, col 8]
-        ; Save existing attrs at cols 7, 8, 9 (so we can restore whatever
-        ; pipe / mask state was there). 3 bytes saved.
-        dec     hl                      ; HL = col 7
+        call    bird_attr_addr          ; HL = ATTRS[top, col 8]
+        dec     hl                      ; col 7
         ld      a, (hl)
         ld      (bird_attr_save), a
-        inc     hl                      ; HL = col 8
+        ld      (hl), ATTR_SKY
+        inc     hl                      ; col 8
         ld      a, (hl)
         ld      (bird_attr_save + 1), a
-        inc     hl                      ; HL = col 9
+        ld      (hl), ATTR_BIRD
+        inc     hl                      ; col 9
         ld      a, (hl)
         ld      (bird_attr_save + 2), a
-        ; Write bird-visible attrs: col 7/9 = ATTR_SKY (paper cyan, ink
-        ; black — wings show as black silhouette); col 8 = ATTR_BIRD
-        ; (paper yellow, ink black — body fill + black detail).
-        ; Without this, mask_vacated_pipe_attrs could leave cols 7/9
-        ; at ATTR_BUFFER ($2D = paper=ink=cyan) so wing pixels become
-        ; invisible.
-        dec     hl
-        dec     hl                      ; HL = col 7
         ld      (hl), ATTR_SKY
-        inc     hl
+
+        ; ── Row 2 (bottom = top + 1 char row = +32 bytes): save + paint ──
+        ld      bc, 32 - 2              ; advance from col 9 to next row col 7
+        add     hl, bc                  ; HL = ATTRS[top+8px, col 7]
+        ld      a, (hl)
+        ld      (bird_attr_save + 3), a
+        ld      (hl), ATTR_SKY
+        inc     hl                      ; col 8
+        ld      a, (hl)
+        ld      (bird_attr_save + 4), a
         ld      (hl), ATTR_BIRD
-        inc     hl
+        inc     hl                      ; col 9
+        ld      a, (hl)
+        ld      (bird_attr_save + 5), a
         ld      (hl), ATTR_SKY
         ret
 
-; restore_bird_attrs: write saved 3 attr bytes back at bird_attr_y's row.
+; restore_bird_attrs: write saved 6 attr bytes back (2 char rows × 3 cols).
 restore_bird_attrs:
         ld      a, (bird_attr_valid)
         or      a
         ret     z
         ld      a, (bird_attr_y)
-        call    bird_attr_addr          ; HL = col 8
+        call    bird_attr_addr          ; HL = ATTRS[top, col 8]
         dec     hl                      ; col 7
         ld      a, (bird_attr_save)
         ld      (hl), a
-        inc     hl                      ; col 8
+        inc     hl
         ld      a, (bird_attr_save + 1)
         ld      (hl), a
-        inc     hl                      ; col 9
+        inc     hl
         ld      a, (bird_attr_save + 2)
+        ld      (hl), a
+        ld      bc, 32 - 2
+        add     hl, bc                  ; advance to next char row col 7
+        ld      a, (bird_attr_save + 3)
+        ld      (hl), a
+        inc     hl
+        ld      a, (bird_attr_save + 4)
+        ld      (hl), a
+        inc     hl
+        ld      a, (bird_attr_save + 5)
         ld      (hl), a
         ret
 
