@@ -31,9 +31,10 @@ SYM = {
     "DIAG_BORDER_LOG":     0xFE00,     # EQU — fixed
     "DIAG_BORDER_LOG_LEN": 512,        # 128 entries × 4 bytes (color, frame_lo, R, pad)
     "PIPE_PROGRAM":        0xDB00,
-    "SLOT_GRID_END":       0xF400,
+    "SLOT_GRID_END":       0xEDC0,
     "BAND_STRIDE":         80,
-    "NUM_BANDS":           80,
+    "NUM_BANDS":           60,
+    "NUM_PIPES":           3,
 }
 
 def _load_lst_symbols():
@@ -338,11 +339,12 @@ def cmd_grid(sna_path: Path) -> None:
     print(f"PIPE_PROGRAM grid at ${base:04X}..${base + n*stride:04X}, "
           f"{n} bands × {stride} B")
     print()
+    num_pipes = SYM["NUM_PIPES"]
     for k in range(n):
         band_addr = base + k * stride
         first = addr_range(data, band_addr, 8)
-        pipe = k % 4
-        cell = k // 4
+        pipe = k % num_pipes
+        cell = k // num_pipes
         hex6 = " ".join(f"{b:02X}" for b in first[:6])
         print(f"  band {k:2d} cell {cell:2d} pipe {pipe}  ${band_addr:04X}: "
               f"{hex6}   {classify_band(first)}")

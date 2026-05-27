@@ -113,7 +113,8 @@ RENDER_SCORE_PAD_ITERS     EQU 1          ; effectively 0 — accept score-frame
 ; screen-row parity = N mod 2. Even band-rows are A; odd are B.
 SLOT_GRID_BASE         EQU $DB00
 BAND_ROWS              EQU 8                          ; rows per char-cell band
-NUM_BANDS              EQU 80                         ; 20 char-cells × 4 pipes
+NUM_BANDS              EQU 60                         ; 20 char-cells × 3 pipes
+PIPE_BAND_STRIDE       EQU NUM_PIPES * BAND_STRIDE    ; same-pipe band-to-band stride
 BAND_ROW_STRIDE        EQU 5                          ; cap/skip row: 5-byte slot (no EXX)
 BAND_IX_PREFIX         EQU 4                          ; body band: ld ix,nn  ($DD $21 lo hi)
 BAND_IXROW_STRIDE      EQU 6                          ; body row: ld sp,ix + 2 push + inc ixh
@@ -146,16 +147,15 @@ SLOT_ADDR_TABLE        EQU $F440       ; Phase 3: 640 entries × 2 B = 1280 B = 
 SLOT_ADDR_TABLE_END    EQU $F940
 
 ; ─── Active list (per-pipe sublists) ─────────────────────────────
-; Phase 3: 4 pipes × 112 entries × 2 B = 896 B total.
-ACTIVE_PIPE_0          EQU $F940       ; (moved up to clear $FC80+ for stack growth)
+; 3 pipes × 112 entries × 2 B = 672 B total.
+ACTIVE_PIPE_0          EQU $F940
 ACTIVE_PIPE_1          EQU ACTIVE_PIPE_0 + 224
 ACTIVE_PIPE_2          EQU ACTIVE_PIPE_1 + 224
-ACTIVE_PIPE_3          EQU ACTIVE_PIPE_2 + 224       ; Phase 3: NEW
-ACTIVE_LIST_END        EQU ACTIVE_PIPE_3 + 224       ; = $FCC0
-ACTIVE_COUNT           EQU 448         ; 4 × 112
+ACTIVE_LIST_END        EQU ACTIVE_PIPE_2 + 224       ; = $FBE0
+ACTIVE_COUNT           EQU 336         ; 3 × 112
 
 ACTIVE_LIST_NEW        EQU ACTIVE_PIPE_0
-ACTIVE_COUNT_NEW       EQU $FCC0       ; 2 B counter (moved with ACTIVE_LIST_END)
+ACTIVE_COUNT_NEW       EQU $FBE0       ; 2 B counter (moved with ACTIVE_LIST_END)
 
 ; ─── Diagnostics ring buffer (border-profiler trace) ─────────────
 ; 256 entries × (color, frame_lo) = 512 bytes at $FE00..$FFFF.
@@ -997,15 +997,17 @@ compute_next_slot:
 
 ;----------------------------------------------------------------
 ; cps_band_base: HL = grid base of band (cps_k, cps_pipe).
-;   = SLOT_GRID_BASE + (cps_k*4 + cps_pipe) * 80
+;   = SLOT_GRID_BASE + (cps_k*NUM_PIPES + cps_pipe) * BAND_STRIDE
+;   = SLOT_GRID_BASE + (cps_k*3 + cps_pipe) * 80
 ; In:  cps_k, cps_pipe (memory).   Clobbers: AF, DE, HL.
 ;----------------------------------------------------------------
 cps_band_base:
         ld      a, (cps_k)
-        add     a, a
-        add     a, a                            ; K*4
+        ld      l, a
+        add     a, a                            ; K*2
+        add     a, l                            ; K*3
         ld      hl, cps_pipe
-        add     a, (hl)                         ; e = K*4 + pipe
+        add     a, (hl)                         ; e = K*3 + pipe
         ld      l, a
         ld      h, 0
         add     hl, hl                          ; e*2
@@ -1163,16 +1165,12 @@ finalize_pipe_init:
         ld      (cap_top_target_imm_addrs + 2), hl
         ld      hl, cap_top_handler_pipe_2_target
         ld      (cap_top_target_imm_addrs + 4), hl
-        ld      hl, cap_top_handler_pipe_3_target
-        ld      (cap_top_target_imm_addrs + 6), hl
         ld      hl, cap_bot_handler_pipe_0_target
         ld      (cap_bot_target_imm_addrs), hl
         ld      hl, cap_bot_handler_pipe_1_target
         ld      (cap_bot_target_imm_addrs + 2), hl
         ld      hl, cap_bot_handler_pipe_2_target
         ld      (cap_bot_target_imm_addrs + 4), hl
-        ld      hl, cap_bot_handler_pipe_3_target
-        ld      (cap_bot_target_imm_addrs + 6), hl
 
         ; Stamp 3-byte cap slots ($C3 lo hi at band+46..+48 for K_top, at
         ; band+4..+6 for K_bot) on top of body bands. Body band layout
@@ -1236,16 +1234,12 @@ finalize_pipe_init_lite:
         ld      (cap_top_target_imm_addrs + 2), hl
         ld      hl, cap_top_handler_pipe_2_target
         ld      (cap_top_target_imm_addrs + 4), hl
-        ld      hl, cap_top_handler_pipe_3_target
-        ld      (cap_top_target_imm_addrs + 6), hl
         ld      hl, cap_bot_handler_pipe_0_target
         ld      (cap_bot_target_imm_addrs), hl
         ld      hl, cap_bot_handler_pipe_1_target
         ld      (cap_bot_target_imm_addrs + 2), hl
         ld      hl, cap_bot_handler_pipe_2_target
         ld      (cap_bot_target_imm_addrs + 4), hl
-        ld      hl, cap_bot_handler_pipe_3_target
-        ld      (cap_bot_target_imm_addrs + 6), hl
 
         ; Stamp 3-byte cap slots on body bands. Same as finalize_pipe_init
         ; above — band already carries body code (init invariant +
@@ -1564,7 +1558,6 @@ cps_sublist_base_table:
         dw      ACTIVE_PIPE_0
         dw      ACTIVE_PIPE_1
         dw      ACTIVE_PIPE_2
-        dw      ACTIVE_PIPE_3           ; Phase 3: prep pipe sublist base
 
 ; Precomputed screen targets for byte_x=29 baseline (recycle byte_x).
 ; targets[row] = line_table[row] + 34 (= byte_x=29 + 5). Populated at init.
@@ -1842,7 +1835,7 @@ build_slot_templates:
 write_jrskip_column:
         call    .jrskip_addr_for_pipe           ; HL = band base (K=0, pipe)
         ld      b, 20
-        ld      de, 4 * BAND_STRIDE             ; +320 → next K, same pipe
+        ld      de, PIPE_BAND_STRIDE             ; +320 → next K, same pipe
 .wjc_band:
         ld      (hl), $18                       ; JR opcode
         inc     hl
@@ -1948,26 +1941,8 @@ init_pipes:
         cp      NUM_PIPES                    ; configure all NUM_PIPES pipes
         jr      nz, .init_cps_lp
 
-        ; Pipe 3 slot in PIPE_PROGRAM still exists physically (the 4-pipe
-        ; band interleave layout is preserved). Emit body code for its
-        ; 20 bands then park them all as JR-skip — pipe 3 is now
-        ; permanently dead but its bands must be valid since PIPE_PROGRAM
-        ; execution flow still walks through them (just skips immediately).
-        ld      a, 3
-        ld      (cps_pipe), a
-        ld      a, 168
-        ld      (cps_cap_top_row), a
-        ld      (cps_cap_bot_row), a
-        call    cps_emit_body_bands
-        ld      a, 3
-        call    write_jrskip_column
-
-        ld      hl, ACTIVE_PIPE_3
-        ld      de, ACTIVE_PIPE_3 + 1
-        ld      (hl), 0
-        ld      bc, 223
-        ldir
-
+        ; Pipe 3 is fully removed. ACTIVE_COUNT_NEW still set as legacy
+        ; (336 = 3 pipes × 112 entries each).
         ld      hl, 336
         ld      (ACTIVE_COUNT_NEW), hl
 
@@ -2191,28 +2166,6 @@ patch_pipe_targets:
         dec     (hl)
         jr      .pt_lp_p2
 .pt_done_p2:
-
-        ; Pipe 3
-        ld      a, (prep_pipe_idx)
-        cp      3
-        jr      z, .pt_done_p3
-        ld      a, (activate_pipe_idx)
-        cp      3
-        jr      z, .pt_done_p3
-        ld      sp, ACTIVE_PIPE_3
-.pt_lp_p3:
-        pop     hl
-        ld      a, h
-        or      l
-        jr      z, .pt_done_p3
-        ld      a, (hl)
-        sub     1
-        ld      (hl), a
-        jr      nc, .pt_lp_p3
-        inc     hl
-        dec     (hl)
-        jr      .pt_lp_p3
-.pt_done_p3:
 
         ld      sp, (saved_sp_inner)
         ret
@@ -2503,7 +2456,7 @@ column_base_for_pipe:
 ;----------------------------------------------------------------
 un_jrskip_visible:
         call    column_base_for_pipe            ; HL = band 0 base
-        ld      de, 4 * BAND_STRIDE             ; +320 → next K, same pipe
+        ld      de, PIPE_BAND_STRIDE             ; +320 → next K, same pipe
         ld      b, 0                            ; B = K counter (0..19)
 .ujv_lp:
         ld      a, (cps_k_top)
@@ -2549,7 +2502,7 @@ reset_ix_targets_to_29:
         push    hl
         pop     ix                              ; IX = dest cursor (band base)
         ld      hl, IX_TARGETS_29               ; HL = 40-byte sequential src
-        ld      de, 4 * BAND_STRIDE             ; DE = +320 stride between bands
+        ld      de, PIPE_BAND_STRIDE             ; DE = +320 stride between bands
         ld      b, 20
 .rixt_K:
         ld      a, (hl)
@@ -2616,7 +2569,7 @@ restore_capedges_to_body:
         push    hl
         push    bc
         ld      a, b                            ; A = K_top
-        call    .rcb_add_k_bands                ; HL += K * (4 * BAND_STRIDE)
+        call    .rcb_add_k_bands                ; HL += K * (PIPE_BAND_STRIDE)
         ld      de, 46
         add     hl, de                          ; HL = K_top band + 46
         ld      (hl), $DD
@@ -2633,7 +2586,7 @@ restore_capedges_to_body:
         ; Body row 0 last 3 bytes at +7..+9 (C5 DD 24) were never
         ; overwritten — still present.
         ld      a, c                            ; A = K_bot
-        call    .rcb_add_k_bands                ; HL += K * (4 * BAND_STRIDE)
+        call    .rcb_add_k_bands                ; HL += K * (PIPE_BAND_STRIDE)
         ld      de, 4
         add     hl, de                          ; HL = K_bot band + 4
         ld      (hl), $DD
@@ -2644,11 +2597,11 @@ restore_capedges_to_body:
         ret
 
 .rcb_add_k_bands:
-        ; HL += A * (4 * BAND_STRIDE).  A=0..19.
+        ; HL += A * (PIPE_BAND_STRIDE).  A=0..19.
         or      a
         ret     z
         push    de
-        ld      de, 4 * BAND_STRIDE
+        ld      de, PIPE_BAND_STRIDE
 .rcb_akb_lp:
         add     hl, de
         dec     a
@@ -2797,7 +2750,6 @@ active_pipe_addrs:
         dw      ACTIVE_PIPE_0
         dw      ACTIVE_PIPE_1
         dw      ACTIVE_PIPE_2
-        dw      ACTIVE_PIPE_3
 
 ;----------------------------------------------------------------
 ; Cap handlers (JP'd to by cap_top / cap_bot slots — never CALLed).
@@ -2862,19 +2814,6 @@ cap_top_handler_pipe_2_bc EQU $+1
 cap_top_handler_pipe_2_next EQU $+1
         jp      $0000
 
-cap_top_handler_pipe_3:                         ; Phase 3
-cap_top_handler_pipe_3_target EQU $+1
-        ld      sp, $0000
-cap_top_handler_pipe_3_de EQU $+1
-        ld      hl, $0000
-        push    hl
-cap_top_handler_pipe_3_bc EQU $+1
-        ld      hl, $0000
-        push    hl
-        ld      hl, (body_b_de)
-cap_top_handler_pipe_3_next EQU $+1
-        jp      $0000
-
 cap_bot_handler_pipe_0:
 cap_bot_handler_pipe_0_target EQU $+1
         ld      sp, $0000
@@ -2917,73 +2856,49 @@ cap_bot_handler_pipe_2_bc EQU $+1
 cap_bot_handler_pipe_2_next EQU $+1
         jp      $0000
 
-cap_bot_handler_pipe_3:                         ; Phase 3
-cap_bot_handler_pipe_3_target EQU $+1
-        ld      sp, $0000
-cap_bot_handler_pipe_3_de EQU $+1
-        ld      hl, $0000
-        push    hl
-cap_bot_handler_pipe_3_bc EQU $+1
-        ld      hl, $0000
-        push    hl
-        ld      hl, (body_b_de)
-        inc     ixh                             ; advance IX from K_bot row-0 → row-1
-cap_bot_handler_pipe_3_next EQU $+1
-        jp      $0000
-
 ; Per-pipe handler address tables for indexed dispatch in configure_pipe_slots.
 cap_top_handler_addrs:
         dw      cap_top_handler_pipe_0
         dw      cap_top_handler_pipe_1
         dw      cap_top_handler_pipe_2
-        dw      cap_top_handler_pipe_3             ; Phase 3
 cap_bot_handler_addrs:
         dw      cap_bot_handler_pipe_0
         dw      cap_bot_handler_pipe_1
         dw      cap_bot_handler_pipe_2
-        dw      cap_bot_handler_pipe_3             ; Phase 3
 
 ; Per-pipe SMC label tables for update_cap_imm_v2 and configure_pipe_slots.
 cap_top_bc_imm_addrs:
         dw      cap_top_handler_pipe_0_bc
         dw      cap_top_handler_pipe_1_bc
         dw      cap_top_handler_pipe_2_bc
-        dw      cap_top_handler_pipe_3_bc          ; Phase 3
 cap_top_de_imm_addrs:
         dw      cap_top_handler_pipe_0_de
         dw      cap_top_handler_pipe_1_de
         dw      cap_top_handler_pipe_2_de
-        dw      cap_top_handler_pipe_3_de          ; Phase 3
 cap_bot_bc_imm_addrs:
         dw      cap_bot_handler_pipe_0_bc
         dw      cap_bot_handler_pipe_1_bc
         dw      cap_bot_handler_pipe_2_bc
-        dw      cap_bot_handler_pipe_3_bc          ; Phase 3
 cap_bot_de_imm_addrs:
         dw      cap_bot_handler_pipe_0_de
         dw      cap_bot_handler_pipe_1_de
         dw      cap_bot_handler_pipe_2_de
-        dw      cap_bot_handler_pipe_3_de          ; Phase 3
 cap_top_target_imm_addrs:
         dw      cap_top_handler_pipe_0_target
         dw      cap_top_handler_pipe_1_target
         dw      cap_top_handler_pipe_2_target
-        dw      cap_top_handler_pipe_3_target      ; Phase 3
 cap_bot_target_imm_addrs:
         dw      cap_bot_handler_pipe_0_target
         dw      cap_bot_handler_pipe_1_target
         dw      cap_bot_handler_pipe_2_target
-        dw      cap_bot_handler_pipe_3_target      ; Phase 3
 cap_top_next_imm_addrs:
         dw      cap_top_handler_pipe_0_next
         dw      cap_top_handler_pipe_1_next
         dw      cap_top_handler_pipe_2_next
-        dw      cap_top_handler_pipe_3_next        ; Phase 3
 cap_bot_next_imm_addrs:
         dw      cap_bot_handler_pipe_0_next
         dw      cap_bot_handler_pipe_1_next
         dw      cap_bot_handler_pipe_2_next
-        dw      cap_bot_handler_pipe_3_next        ; Phase 3
 
 ;----------------------------------------------------------------
 ; redraw_pipes_v2: per-frame entry into the flat code-gen renderer.

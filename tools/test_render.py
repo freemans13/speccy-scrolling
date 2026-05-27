@@ -45,8 +45,8 @@ from refrender import (
 BIRD_ATTR_Y = 0x8276
 
 # PIPE_PROGRAM layout: 80 bands × 80 bytes, interleaved per pipe.
-# Band index = cell * 4 + pipe (so pipe N's bands are at indices N,
-# N+4, ..., N+76 — one per cell, 20 cells).
+# Band index = cell * NUM_PIPES + pipe (3-pipe interleave: pipe N's
+# bands are at indices N, N+3, ..., N+57 — one per cell, 20 cells).
 PIPE_PROGRAM = 0xDB00
 BAND_STRIDE  = 80
 NUM_CELLS    = 20
@@ -118,7 +118,7 @@ def check_ix_targets_match_byte_x(memory, pipes, prep):
         if not (1 <= bx <= 30): continue
         expected_col = (bx + 3) & 0x1F
         for cell in range(NUM_CELLS):
-            band_idx = cell * 4 + pipe_idx
+            band_idx = cell * NUM_PIPES + pipe_idx
             band_addr = PIPE_PROGRAM + band_idx * BAND_STRIDE
             b0, b1 = memory[band_addr], memory[band_addr + 1]
             # JR-SKIP bands ($18 $42) carry no live IX — skip check.
