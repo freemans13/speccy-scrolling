@@ -35,10 +35,11 @@ TEST_FRAMES = 3000  # ~60 s of game time — captures occasional swap+wrap
 
 # Safety budget: worst frame must end MORE than this margin under 69888 T.
 # A frame that lands within MARGIN_T of the budget is flagged as "near
-# miss" — real ULA contention varies frame-to-frame; cutting it that
-# close means some frames will overrun under Fuse even if our simulator
-# shows 0 overruns.
-MARGIN_T = 1500
+# miss" — real ULA contention varies frame-to-frame; the CMIOSimulator
+# matches Fuse closely but not perfectly. Empirically, when sim shows
+# margin < ~2000 T, Fuse occasionally overruns on the slowest frames.
+# 2000 T = ~9 scanlines of headroom.
+MARGIN_T = 2000
 
 COLOR_NAMES = {0: "BLACK", 1: "BLUE", 2: "RED", 3: "MAGENTA",
                4: "GREEN", 5: "CYAN", 6: "YELLOW", 7: "WHITE"}
