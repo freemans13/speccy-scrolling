@@ -173,11 +173,13 @@ def check_one_position(sim, y, ground_baseline):
                              f"= ${byte:02X} attr=${attr:02X} — VISIBLE artifact")
                 if len(fails) >= 6: return fails
 
-    # 6. Ground intact
+    # 6. Ground attrs intact — row 20 cols 4..27 must not be modified by
+    # bird code. (Pixel data in row 20 IS modified by draw_ground each
+    # frame for the scroll effect — only attrs are stable to test.)
     for cc in range(4, 28):
-        if mem[0x5800 + 20 * 32 + cc] != ground_baseline[cc - 4]:
-            fails.append(f"y={y}: ground row 20 col {cc} corrupted "
-                         f"(${mem[0x5800 + 20 * 32 + cc]:02X} vs baseline ${ground_baseline[cc - 4]:02X})")
+        if mem[0x5800 + 20 * 32 + cc] != ground_baseline[0][cc - 4]:
+            fails.append(f"y={y}: ground row 20 col {cc} ATTR ${mem[0x5800 + 20 * 32 + cc]:02X} "
+                         f"!= baseline ${ground_baseline[0][cc - 4]:02X} — bird blanked ground")
             break
 
     return fails
@@ -188,8 +190,14 @@ def main():
     sim = Simulator(mem, make_register_dict(pc, sp, s),
                     {'iff': 1 if s.iff1 else 0, 'im': s.im, 'tstates': 0})
     print("test_bird_sweep: sweeping bird Y=20..144 through every position")
-    run_frames(sim, 60)  # warm-up so attrs/pipes are in normal play state
-    ground_baseline = bytes(sim.memory[0x5800 + 20 * 32 + 4 : 0x5800 + 20 * 32 + 28])
+    # Capture ground baseline IMMEDIATELY after init (before bird has had a
+    # chance to fall and modify ground attrs). Run just 1 frame so init
+    # has executed but bird is still high (y=80, well above ground).
+    run_frames(sim, 1)
+    ground_attrs = bytes(sim.memory[0x5800 + 20 * 32 + 4 : 0x5800 + 20 * 32 + 28])
+    ground_baseline = (ground_attrs,)
+    # Now run a normal warmup so pipes/state settle before sweep starts.
+    run_frames(sim, 60)
 
     # Sweep every Y value the bird can occupy
     total_checks = 0

@@ -3508,16 +3508,23 @@ paint_bird_attrs:
         call    .paint_row_sky_centre
         ret
 .paint_bot_save_only:
-        ; Save current attrs (so restore puts them back) but DON'T write
-        ; SKY — those cells are the ground row, must keep ground attrs.
+        ; Save current attrs RAW (no filter_save) and DON'T write SKY —
+        ; those cells are the ground row. filter_save would replace
+        ; $20 PIPE (legitimate ground attr) with $2D BUFFER, and
+        ; restore_bird_attrs next frame would write $2D back to ground
+        ; = ground blanked under bird at clamp. Save raw so restore is
+        ; a true no-op.
         ld      a, (hl)
-        call    .filter_save
+        ld      (de), a
+        inc     de
         inc     hl
         ld      a, (hl)
-        call    .filter_save
+        ld      (de), a
+        inc     de
         inc     hl
         ld      a, (hl)
-        call    .filter_save
+        ld      (de), a
+        inc     de
         ret
 
 .paint_row_sky_centre:
@@ -3716,6 +3723,11 @@ clean_bird_col_pixels:
         ; so cleaning matches the rows this frame's paint_bird_attrs is
         ; about to write — and matches the rows draw_bird is about to
         ; fill with the sprite.
+        ;
+        ; Clamps cleanup at pixel y=159 (= last sky row). bird at clamp
+        ; y=144 has 3 char rows = pixel y 144..167 — pixel y 160..167 is
+        ; the GROUND BAND (row 20+) and must NEVER be cleaned (else the
+        ; ground stripe appears blanked at cols 7,8,9 under the bird).
         ld      a, (bird_y + 1)
         and     $F8                     ; snap to char-row pixel-y
         ld      h, 0
@@ -3724,6 +3736,9 @@ clean_bird_col_pixels:
         ld      de, line_table
         add     hl, de                  ; HL = &line_table[pixel_y]
         ld      b, 3                    ; 3 char rows
+        ld      a, (bird_y + 1)
+        and     $F8                     ; A = top pixel-y (re-fetch for clamp calc)
+        ld      c, a                    ; C = current pixel-y (advances per row)
 .row_lp:
         push    bc
         ld      e, (hl)
@@ -3737,9 +3752,13 @@ clean_bird_col_pixels:
         jr      nc, .nc_setup
         inc     d
 .nc_setup:
-        ; DE = pixel addr at col 7. Clean 8 pixel rows × 3 cols.
+        ; Clip per-sub-row: if pixel-y >= 160 (ground), skip clean for that row.
         ld      b, 8
 .pix_lp:
+        ; Check: current sub-row's pixel-y in ground band?
+        ld      a, c
+        cp      160
+        jr      nc, .pix_skip           ; pixel-y >= 160 → ground, skip clean
         push    de
         ex      de, hl                  ; HL = pixel addr col 7
         ld      (hl), 0
@@ -3748,7 +3767,9 @@ clean_bird_col_pixels:
         inc     hl
         ld      (hl), 0                 ; col 9
         pop     de
+.pix_skip:
         inc     d                       ; next pixel row (+$100)
+        inc     c                       ; advance pixel-y tracker
         djnz    .pix_lp
         pop     hl                      ; restore line_table ptr (at char_row_start)
         ; Advance line_table ptr by 16 bytes (8 entries = 1 char row)
