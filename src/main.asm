@@ -60,7 +60,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
 ; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
 ; Verified by tools/test_beam_race.py.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 640
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 560
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -259,14 +259,14 @@ main_loop:
         call    read_input
         call    update_bird
         call    advance_bird_anim
-        ; Clean stale pipe pixel residue at cols 7,8,9 across bird's 3
-        ; char rows BEFORE draw_bird. paint_bird_attrs forces SKY ($28,
-        ; ink black on cyan) at bird's cells, so any leftover pipe pixel
-        ; data ($C0 L-edge dither, $03 R-edge, $FF body) would render as
-        ; visible black pixels where the sprite has 0 (sprite mask leaves
-        ; the underlying pixel intact). Cleaning to 0 first means the
-        ; masked-OR draw_bird produces only bird pixels at bird's cells.
-        call    clean_bird_col_pixels
+        ; draw_bird uses masked-OR so bird sprite blends with whatever's
+        ; already in the screen at bird cols (cols 7,8,9). Pipe pixels
+        ; rendered by PIPE_PROGRAM (after this) at bird's char rows OR
+        ; over bird's sprite pixels — wings/outline visible on green pipe
+        ; body. Stale residue at bird cols is cleaned incrementally by
+        ; the V-col pixel sweep in wrap_attrs_combined when a pipe's
+        ; vacated col transits cols 7..9 — no per-frame blanking around
+        ; the bird (which the user reported as crude/jarring).
         call    draw_bird
         call    paint_bird_attrs        ; top-blank: paint so raster reads bird attrs THIS frame
         PROFILE_OUT 3                   ; MAGENTA = PIPE_PROGRAM
@@ -4319,6 +4319,7 @@ wrap_attrs_combined:
 ; wing pixels render cyan-on-cyan = invisible).
 ; In: A = col (7, 8, or 9). Clobbers: AF, B, HL, DE.
 .wac_sweep_v_col:
+        ld      (.svc_col_imm), a       ; SMC: stash V col for pixel sweep
         ld      h, $58                  ; HL = ATTRS + col
         ld      l, a
         ld      a, (bird_attr_y)
@@ -4335,6 +4336,54 @@ wrap_attrs_combined:
         cp      3                       ; row - top_row < 3 ?
         jr      c, .svc_skip            ; yes → skip (bird's row)
         ld      (hl), ATTR_BUFFER
+        ; Also zero pixel data at V col for all 8 pixel rows in this char
+        ; row. Cleans stale pipe pixels left at OLD R col so they don't
+        ; render as black stripes when bird's masked-OR draw_bird OR's
+        ; the sprite onto the cell (cell attr is $2D BUFFER = cyan-on-
+        ; cyan invisible normally, but bird's mask-OR shows pixels as
+        ; black ink IF bird sprite has 0 there).
+        push    bc
+        push    de
+        push    hl
+        ld      a, e                    ; row index
+        add     a, a
+        add     a, a
+        add     a, a                    ; pixel y = row * 8
+        ld      l, a
+        ld      h, 0
+        add     hl, hl                  ; HL = pixel y * 2 (line_table is 2 B/entry)
+        ld      de, line_table
+        add     hl, de                  ; HL = &line_table[pixel y of first sub-row]
+        ld      e, (hl)
+        inc     hl
+        ld      d, (hl)                 ; DE = pixel addr at (pixel y, col 0)
+.svc_col_imm equ $+1
+        ld      a, 0                    ; SMC: V col
+        add     a, e
+        ld      e, a
+        jr      nc, .svc_pix_nc
+        inc     d
+.svc_pix_nc:
+        ex      de, hl                  ; HL = pixel addr (col V, pixel y)
+        xor     a                       ; A = 0 for writes
+        ld      (hl), a                 ; sub-row 0
+        inc     h
+        ld      (hl), a                 ; sub-row 1
+        inc     h
+        ld      (hl), a                 ; sub-row 2
+        inc     h
+        ld      (hl), a                 ; sub-row 3
+        inc     h
+        ld      (hl), a                 ; sub-row 4
+        inc     h
+        ld      (hl), a                 ; sub-row 5
+        inc     h
+        ld      (hl), a                 ; sub-row 6
+        inc     h
+        ld      (hl), a                 ; sub-row 7
+        pop     hl
+        pop     de
+        pop     bc
 .svc_skip:
         ; HL += 32 (next row, same col)
         ld      a, l
