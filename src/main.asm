@@ -60,7 +60,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
 ; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
 ; Verified by tools/test_beam_race.py.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 400
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 380
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -546,6 +546,8 @@ bird_attr_save:     db 0, 0, 0, 0, 0, 0, 0, 0, 0
                                         ; saved attrs at cols 7, 8, 9 across THREE char rows
                                         ; the bird sprite may overlap (top, centre, bottom).
                                         ; Layout: row0(7,8,9) row1(7,8,9) row2(7,8,9).
+row_cover_masks:    db 0, 0, 0          ; per-row 3-bit pipe-coverage masks
+                                        ; (bit 0=col 7, bit 1=col 8, bit 2=col 9)
 
 ; Bird wing animation — 4 frames cycling 0→1→2→3→0, one phase step every
 ; BIRD_ANIM_RATE frames. bird_sprite_ptr always points at the current
@@ -3460,47 +3462,34 @@ paint_bird_attrs:
         ld      (bird_attr_y), a
         ld      a, 1
         ld      (bird_attr_valid), a
+        ; Pre-compute per-row pipe-coverage masks for bird's 3 char rows.
+        ; Each mask is 3 bits: bit 0=col 7, bit 1=col 8, bit 2=col 9.
+        ; Used per-cell during paint to SKIP writing bird attr at cells
+        ; where a pipe currently covers (bird ATTRS stay BEHIND pipe
+        ; everywhere — user direction).
+        call    .compute_row_cover_masks
         ld      a, (bird_attr_y)
         and     $F8
         call    bird_attr_addr
         dec     hl                      ; HL = ATTRS[top_row, col 7]
         ld      de, bird_attr_save
-        ; Row 0 (top) — always save+paint (top_row <= 18 since bird clamps
-        ; at y=144 → top=18; top_row=18 is row 18 still in sky).
-        call    .paint_row_sky_centre
+        ; Row 0 (top) — SKY/SKY/SKY (skip cells where mask bit set)
+        ld      a, (row_cover_masks)
+        ld      c, a
+        call    .paint_sky_row_mask
         call    .advance_to_next_row_col7
-        ; Row 1 (centre) — save+paint with BIRD at col 8 UNLESS a pipe
-        ; currently covers (centre_row, col 8). If pipe covers, skip the
-        ; BIRD write so wrap_attrs' pipe attr (set last frame, will be
-        ; reset this frame's bottom blank) persists — user-requested
-        ; "bird BEHIND pipe in attrs".
-        ld      a, (hl)
-        call    .filter_save
-        ld      (hl), ATTR_SKY
-        inc     hl
-        ld      a, (hl)
-        call    .filter_save
-        ; Check pipe coverage at centre row col 8
-        push    hl
-        push    de
-        call    .pipe_covers_centre_col8
-        pop     de
-        pop     hl
-        jr      z, .skip_bird_body      ; Z=1 means covered → skip BIRD
-        ld      (hl), ATTR_BIRD
-.skip_bird_body:
-        inc     hl
-        ld      a, (hl)
-        call    .filter_save
-        ld      (hl), ATTR_SKY
+        ; Row 1 (centre) — SKY/BIRD/SKY (skip cells where mask bit set)
+        ld      a, (row_cover_masks + 1)
+        ld      c, a
+        call    .paint_centre_row_mask
         call    .advance_to_next_row_col7
-        ; Row 2 (bottom) — SAVE always, but SKIP write if bot row >= 20
-        ; (would overwrite the ground band). top_row + 2 >= 20 means
-        ; top_row >= 18 means bird_attr_y >= 144 (= 18 * 8).
+        ; Row 2 (bot) — skip writes if bot row >= 20 (ground)
         ld      a, (bird_attr_y)
         cp      144
         jr      nc, .paint_bot_save_only
-        call    .paint_row_sky_centre
+        ld      a, (row_cover_masks + 2)
+        ld      c, a
+        call    .paint_sky_row_mask
         ret
 .paint_bot_save_only:
         ; Save current attrs RAW (no filter_save) and DON'T write SKY —
@@ -3522,22 +3511,174 @@ paint_bird_attrs:
         inc     de
         ret
 
-.paint_row_sky_centre:
-        ; col 7
-        ld      a, (hl)
-        call    .filter_save            ; A = filtered attr, store to (DE)
+; Mask-aware paint:
+;   - covered cell (mask bit set): SAVE RAW (preserves pipe attr through
+;     restore cycle), SKIP write.
+;   - non-covered cell: FILTER-SAVE ($20 PIPE → $2D BUFFER, stops stale
+;     pipe-attr propagation), write SKY/BIRD.
+; In: HL = row col 7, DE = save ptr, C = 3-bit cover mask.
+.paint_sky_row_mask:
+        call    .save_filter_or_raw_bit0
+        bit     0, c
+        jr      nz, .psr_skip7
         ld      (hl), ATTR_SKY
+.psr_skip7:
         inc     hl
-        ; col 8 (SKY for non-centre rows)
-        ld      a, (hl)
-        call    .filter_save
+        call    .save_filter_or_raw_bit1
+        bit     1, c
+        jr      nz, .psr_skip8
         ld      (hl), ATTR_SKY
+.psr_skip8:
         inc     hl
-        ; col 9
-        ld      a, (hl)
-        call    .filter_save
+        call    .save_filter_or_raw_bit2
+        bit     2, c
+        jr      nz, .psr_skip9
         ld      (hl), ATTR_SKY
+.psr_skip9:
         ret
+
+; Centre-row variant: col 8 gets ATTR_BIRD (not SKY).
+.paint_centre_row_mask:
+        call    .save_filter_or_raw_bit0
+        bit     0, c
+        jr      nz, .pcr_skip7
+        ld      (hl), ATTR_SKY
+.pcr_skip7:
+        inc     hl
+        call    .save_filter_or_raw_bit1
+        bit     1, c
+        jr      nz, .pcr_skip8
+        ld      (hl), ATTR_BIRD
+.pcr_skip8:
+        inc     hl
+        call    .save_filter_or_raw_bit2
+        bit     2, c
+        jr      nz, .pcr_skip9
+        ld      (hl), ATTR_SKY
+.pcr_skip9:
+        ret
+
+; Save helpers: filter $20→$2D when cell NOT pipe-covered; else save raw.
+.save_filter_or_raw_bit0:
+        ld      a, (hl)
+        bit     0, c
+        jr      nz, .sfr_store
+        cp      ATTR_PIPE
+        jr      nz, .sfr_store
+        ld      a, ATTR_BUFFER
+.sfr_store:
+        ld      (de), a
+        inc     de
+        ret
+
+.save_filter_or_raw_bit1:
+        ld      a, (hl)
+        bit     1, c
+        jr      nz, .sfr_store
+        cp      ATTR_PIPE
+        jr      nz, .sfr_store
+        ld      a, ATTR_BUFFER
+        jr      .sfr_store
+
+.save_filter_or_raw_bit2:
+        ld      a, (hl)
+        bit     2, c
+        jr      nz, .sfr_store
+        cp      ATTR_PIPE
+        jr      nz, .sfr_store
+        ld      a, ATTR_BUFFER
+        jr      .sfr_store
+
+; Compute 3-bit cover mask per bird char row (top, centre, bot).
+; Stored at row_cover_masks[0..2]. Bit 0 = col 7 covered, bit 1 = col 8,
+; bit 2 = col 9. A pipe covers if bx in [4..10] AND row in body of pipe.
+; Coverage cols use lookup table indexed by (bx - 4).
+.compute_row_cover_masks:
+        ; Zero masks
+        xor     a
+        ld      (row_cover_masks), a
+        ld      (row_cover_masks + 1), a
+        ld      (row_cover_masks + 2), a
+        ; Compute top_row
+        ld      a, (bird_attr_y)
+        and     $F8
+        rrca
+        rrca
+        rrca                            ; A = top_row
+        ld      (.crm_top_row), a       ; SMC: store top_row for loop
+        ld      iy, pipe_state
+        ld      b, NUM_PIPES
+.crm_pipe_lp:
+        push    bc
+        ld      a, (iy+0)               ; bx
+        sub     4
+        jr      c, .crm_pipe_skip       ; bx < 4
+        cp      7
+        jr      nc, .crm_pipe_skip      ; bx > 10
+        ; A = bx - 4 (= 0..6) → lookup col mask
+        ld      hl, .crm_col_table
+        add     a, l
+        ld      l, a
+        jr      nc, .crm_nc
+        inc     h
+.crm_nc:
+        ld      a, (hl)                 ; A = col mask (3 bits)
+        ld      c, a                    ; C = pipe's col mask
+        ; Compute k_top, k_bot for this pipe
+        ld      a, (iy+1)               ; gy
+        dec     a
+        srl     a
+        srl     a
+        srl     a                       ; k_top
+        ld      d, a                    ; D = k_top
+        ld      a, (iy+1)
+        add     a, 48
+        srl     a
+        srl     a
+        srl     a
+        dec     a                       ; k_bot - 1 (so row > kbm1 = row >= k_bot)
+        ld      e, a                    ; E = k_bot - 1
+        ; For each of bird's 3 rows, OR col mask if row in body
+.crm_top_row equ $+1
+        ld      a, 0                    ; SMC: A = top_row
+        ld      b, a                    ; B = row index (top, top+1, top+2)
+        ld      hl, row_cover_masks
+        ld      a, 3                    ; 3 rows to check
+.crm_row_lp:
+        push    af
+        ; row B in body of this pipe?
+        ld      a, d                    ; k_top
+        cp      b
+        jr      nc, .crm_in_body        ; k_top >= row → top body
+        ld      a, e                    ; k_bot - 1
+        cp      b
+        jr      c, .crm_in_body         ; k_bot - 1 < row → row >= k_bot → bot body
+        jr      .crm_row_next
+.crm_in_body:
+        ld      a, (hl)
+        or      c                       ; OR pipe's col mask
+        ld      (hl), a
+.crm_row_next:
+        inc     hl
+        inc     b
+        pop     af
+        dec     a
+        jr      nz, .crm_row_lp
+.crm_pipe_skip:
+        inc     iy
+        inc     iy
+        pop     bc
+        djnz    .crm_pipe_lp
+        ret
+
+.crm_col_table:
+        db      %001     ; bx=4: V=col 7
+        db      %011     ; bx=5: R=7, V=8
+        db      %111     ; bx=6: M2=7, R=8, V=9
+        db      %111     ; bx=7: M1=7, M2=8, R=9
+        db      %111     ; bx=8: L=7, M1=8, M2=9
+        db      %110     ; bx=9: L=8, M1=9
+        db      %100     ; bx=10: L=9
 
 ; .filter_save: store A into (DE), advancing DE. If A == $20 ATTR_PIPE,
 ; store $2D ATTR_BUFFER instead. Reason: $20 saved in bird_attr_save
