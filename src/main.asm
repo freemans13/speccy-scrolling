@@ -60,7 +60,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
 ; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
 ; Verified by tools/test_beam_race.py.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 680
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 640
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -3457,43 +3457,63 @@ bird_attr_addr:
 ; cols 7/9 + cols 8 outside the yellow cell render as black on cyan —
 ; the bird silhouette outline.
 paint_bird_attrs:
-        ; Sprite is 16 px tall starting at bird_y; covers 2 or 3 char rows
-        ; (top_row = bird_y >> 3, bot_row = (bird_y + 15) >> 3). Paint cols
-        ; 7,8,9 across 3 char rows starting at top_row so the full sprite's
-        ; wing pixels render on SKY ($28, paper cyan / ink black) instead
-        ; of inheriting whatever attrs the pipe scroll left behind ($2D
-        ; BUFFER would render wing pixels cyan-on-cyan = invisible).
-        ; The centre row (top_row+1, containing bird_y+8) gets ATTR_BIRD
-        ; ($70 yellow) at col 8 for the body cell. Other col 8 rows get
-        ; SKY so head/tail pixels render as black-on-cyan.
         ld      a, (bird_y + 1)
-        ld      (bird_attr_y), a        ; store TOP pixel-y (= top_row * 8)
+        ld      (bird_attr_y), a
         ld      a, 1
         ld      (bird_attr_valid), a
-        ld      a, (bird_attr_y)        ; A = top_row * 8 (already %F8 since bird_y_hi & 7 stays 0..7, addr calc tolerates)
-        and     $F8                     ; snap to char row boundary
-        call    bird_attr_addr          ; HL = ATTRS[A, col 8] (centre of bird cols)
+        ld      a, (bird_attr_y)
+        and     $F8
+        call    bird_attr_addr
         dec     hl                      ; HL = ATTRS[top_row, col 7]
         ld      de, bird_attr_save
-        ; Row 0 (top): col 7 SKY, col 8 SKY, col 9 SKY
+        ; Row 0 (top) — always save+paint (top_row <= 18 since bird clamps
+        ; at y=144 → top=18; top_row=18 is row 18 still in sky).
         call    .paint_row_sky_centre
-        ; Advance HL to row+1 col 7 (delta +29 from col 9 back to col 7)
         call    .advance_to_next_row_col7
-        ; Row 1 (centre): col 7 SKY, col 8 BIRD, col 9 SKY
+        ; Row 1 (centre) — save+paint with BIRD at col 8 UNLESS a pipe
+        ; currently covers (centre_row, col 8). If pipe covers, skip the
+        ; BIRD write so wrap_attrs' pipe attr (set last frame, will be
+        ; reset this frame's bottom blank) persists — user-requested
+        ; "bird BEHIND pipe in attrs".
         ld      a, (hl)
         call    .filter_save
         ld      (hl), ATTR_SKY
         inc     hl
         ld      a, (hl)
         call    .filter_save
+        ; Check pipe coverage at centre row col 8
+        push    hl
+        push    de
+        call    .pipe_covers_centre_col8
+        pop     de
+        pop     hl
+        jr      z, .skip_bird_body      ; Z=1 means covered → skip BIRD
         ld      (hl), ATTR_BIRD
+.skip_bird_body:
         inc     hl
         ld      a, (hl)
         call    .filter_save
         ld      (hl), ATTR_SKY
         call    .advance_to_next_row_col7
-        ; Row 2 (bottom): col 7 SKY, col 8 SKY, col 9 SKY
+        ; Row 2 (bottom) — SAVE always, but SKIP write if bot row >= 20
+        ; (would overwrite the ground band). top_row + 2 >= 20 means
+        ; top_row >= 18 means bird_attr_y >= 144 (= 18 * 8).
+        ld      a, (bird_attr_y)
+        cp      144
+        jr      nc, .paint_bot_save_only
         call    .paint_row_sky_centre
+        ret
+.paint_bot_save_only:
+        ; Save current attrs (so restore puts them back) but DON'T write
+        ; SKY — those cells are the ground row, must keep ground attrs.
+        ld      a, (hl)
+        call    .filter_save
+        inc     hl
+        ld      a, (hl)
+        call    .filter_save
+        inc     hl
+        ld      a, (hl)
+        call    .filter_save
         ret
 
 .paint_row_sky_centre:
@@ -3538,6 +3558,59 @@ paint_bird_attrs:
         ld      l, a
         ret     nc
         inc     h
+        ret
+
+; .pipe_covers_centre_col8: returns Z=1 if any pipe's L..V range (cols
+; bx-1..bx+3) covers col 8 at bird's centre row (= top_row + 1) at a
+; body row of that pipe. Used by paint_bird_attrs to decide whether to
+; write ATTR_BIRD or leave existing pipe attr (bird-behind-pipe).
+; Out: Z=1 if covered, NZ if not. Clobbers: AF, BC, HL, IY.
+.pipe_covers_centre_col8:
+        ld      a, (bird_attr_y)
+        and     $F8
+        rrca
+        rrca
+        rrca
+        inc     a                       ; A = centre_row (top_row + 1)
+        ld      c, a                    ; C = centre row
+        ld      iy, pipe_state
+        ld      b, NUM_PIPES
+.pcc_lp:
+        ld      a, (iy+0)               ; bx
+        ; Any of L..V (bx-1..bx+3) == col 8 NOW (bx in [5..9]) or after
+        ; an imminent wrap (bx-1 → bx in [6..10]). Expand to [5..10] to
+        ; cover both — wrap_byte_x runs AFTER paint, so anticipating the
+        ; new bx avoids "paint BIRD, then wrap_attrs overwrites with
+        ; pipe attr" flicker that raster sees mid-scan.
+        cp      5
+        jr      c, .pcc_next
+        cp      11
+        jr      nc, .pcc_next
+        ; Check body row: row <= k_top (top body) or row >= k_bot (bot body)
+        ld      a, (iy+1)               ; gy
+        dec     a
+        srl     a
+        srl     a
+        srl     a                       ; A = k_top
+        cp      c
+        jr      nc, .pcc_covered        ; row <= k_top
+        ld      a, (iy+1)
+        add     a, 48
+        srl     a
+        srl     a
+        srl     a                       ; A = k_bot
+        dec     a                       ; k_bot - 1
+        cp      c
+        jr      c, .pcc_covered         ; k_bot - 1 < row → row >= k_bot
+.pcc_next:
+        inc     iy
+        inc     iy
+        djnz    .pcc_lp
+        ; not covered → return NZ
+        or      1
+        ret
+.pcc_covered:
+        xor     a                       ; Z=1
         ret
 
 ; restore_bird_attrs: write saved 9 attr bytes back across 3 char rows

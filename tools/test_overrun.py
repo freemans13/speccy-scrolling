@@ -30,7 +30,15 @@ from skoolkit.cmiosimulator import CMIOSimulator as Simulator
 from skoolkit.simutils import REGISTERS, T
 
 FRAME_TSTATES = 69888
-TEST_FRAMES = 1000  # ~20 s of game time
+TEST_FRAMES = 3000  # ~60 s of game time — captures occasional swap+wrap
+                    # coincidences that the 20-s sample misses.
+
+# Safety budget: worst frame must end MORE than this margin under 69888 T.
+# A frame that lands within MARGIN_T of the budget is flagged as "near
+# miss" — real ULA contention varies frame-to-frame; cutting it that
+# close means some frames will overrun under Fuse even if our simulator
+# shows 0 overruns.
+MARGIN_T = 1500
 
 COLOR_NAMES = {0: "BLACK", 1: "BLUE", 2: "RED", 3: "MAGENTA",
                4: "GREEN", 5: "CYAN", 6: "YELLOW", 7: "WHITE"}
@@ -97,7 +105,12 @@ def main():
             worst_idle = used
             worst_fr = fr
     print(f"  worst frame: {worst_fr} used {worst_idle} T from RED→BLACK "
-          f"(budget {FRAME_TSTATES} T)")
+          f"(budget {FRAME_TSTATES} T, margin {FRAME_TSTATES - worst_idle} T)")
+    if FRAME_TSTATES - worst_idle < MARGIN_T:
+        print(f"  WARNING: worst-frame margin < {MARGIN_T} T — real ULA "
+              f"contention variance will likely overrun in Fuse on the "
+              f"slowest frames. Tune busy_wait or trim per-frame work.")
+        return 1
     return 0
 
 

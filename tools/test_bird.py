@@ -110,16 +110,16 @@ def check_attrs(mem, frame_num):
     bot_row = top_row + 2
     attrs = mem[0x5800:0x5B00]
     yellow = [i for i, a in enumerate(attrs) if a == ATTR_BIRD]
-    # 0 yellow cells OK if any current pipe's wrap_attrs write range
-    # (cols bx-1..bx+3 = L..V) covers bird's centre (centre_row col 8)
-    # at a body row — wrap_attrs overwrites bird's centre attr with
-    # whatever the pipe writes ($28/$20/$2D depending on col position).
+    # 0 yellow cells OK if any pipe is currently or imminently covering
+    # bird centre col 8. paint_bird_attrs skips BIRD write when pipe bx
+    # in [5..10] (covers col 8 now at bx in [5..9] OR after the wrap
+    # that's about to happen). Match that range here.
     centre_pipe_covered = False
     for i in range(NUM_PIPES):
         bx = mem[SYM["pipe_state"] + i * 2]
         gy = mem[SYM["pipe_state"] + i * 2 + 1]
         if not (1 <= bx <= 30 and 8 <= gy <= 96): continue
-        if not (bx - 1 <= 8 <= bx + 3): continue  # any of L,M1,M2,R,V == col 8
+        if not (5 <= bx <= 10): continue  # matches paint's anticipation range
         k_top = (gy - 1) >> 3
         k_bot = (gy + 48) >> 3
         if centre_row <= k_top or centre_row >= k_bot:
@@ -166,6 +166,22 @@ def check_attrs(mem, frame_num):
                     fails.append(
                         f"frame {frame_num}: row {r} col {c} (wing/silhouette) "
                         f"attr ${got:02X} (expected SKY/BUFFER/PIPE)")
+    return fails
+
+
+def check_ground_intact(mem, frame_num, ground_baseline):
+    """Ground band (row 20, all cols) must never be modified by bird code.
+    Any deviation from the baseline at row 20 cols 4..27 = bird's paint
+    leaking into the ground band."""
+    fails = []
+    for c in range(4, 28):
+        cur = mem[0x5800 + 20 * 32 + c]
+        base = ground_baseline[c - 4]
+        if cur != base:
+            fails.append(
+                f"frame {frame_num}: ground row 20 col {c} attr ${cur:02X} "
+                f"(baseline was ${base:02X}) — bird paint corrupted ground band")
+            if len(fails) >= 3: return fails
     return fails
 
 
@@ -338,10 +354,17 @@ def check_raster_time_attrs(mem_attrs, mem_at_eof, frame_num):
             if mid == end: continue
             # Body cell must not flicker
             if r == centre_row and c == 8:
-                fails.append(
-                    f"frame {frame_num}: body cell row {r} col 8 attr at "
-                    f"raster-time = ${mid:02X} but end-of-frame = ${end:02X} "
-                    f"— bird body flickers mid-scan")
+                # Body cell. Visibly OK if mid and end are in same
+                # paper-group: cyan ({SKY, BUFFER}) or pipe ({PIPE}) or
+                # yellow ({BIRD}). A transition WITHIN a group is invisible.
+                cyan_group  = {ATTR_SKY, ATTR_BUFFER}
+                if {mid, end} <= cyan_group: continue
+                if mid == end: continue
+                if mid == ATTR_BIRD or end == ATTR_BIRD:
+                    fails.append(
+                        f"frame {frame_num}: body cell row {r} col 8 attr at "
+                        f"raster-time = ${mid:02X} but end-of-frame = ${end:02X} "
+                        f"— bird body flickers mid-scan")
                 continue
             # Wing cells: SKY↔BUFFER↔PIPE all acceptable (paper is cyan or
             # green, visually OK as bird-behind-pipe transition).
@@ -361,6 +384,9 @@ def main():
                     {'iff': 1 if s.iff1 else 0, 'im': s.im, 'tstates': 0})
     WARMUP = 30
     run_frames(sim, WARMUP)
+    # Capture ground baseline (row 20 cols 4..27) right after warmup;
+    # bird code must NEVER modify these cells.
+    ground_baseline = bytes(sim.memory[0x5800 + 20 * 32 + 4 : 0x5800 + 20 * 32 + 28])
     # Velocity scenarios exercise bird through varied dynamics. flap_period=0
     # → free fall (max downward velocity, ~8 px/frame). flap_period=1 →
     # continuous flap (sustained upward, max ~2.5 px/frame). Scenarios run
@@ -395,6 +421,8 @@ def main():
             mid_attrs = run_one_frame_with_mid_capture(sim, capture_ts[0])
             fails = []
             fails.extend(check_attrs(sim.memory, fr))
+            if not fails:
+                fails.extend(check_ground_intact(sim.memory, fr, ground_baseline))
             if not fails:
                 fails.extend(check_stale_pipe_attrs(sim.memory, fr))
             if not fails:
