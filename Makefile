@@ -4,7 +4,7 @@ OUT       := build/main.sna
 LST       := build/main.lst
 PYTHON    := /tmp/emuvenv/bin/python
 
-.PHONY: all run clean test test-render test-overrun test-buffer-cols test-beam-race test-bird test-yellow-band
+.PHONY: all run clean test test-render test-overrun test-buffer-cols test-beam-race test-bird test-yellow-band test-bird-sweep
 
 all: $(OUT)
 
@@ -41,6 +41,12 @@ test-bird: $(OUT)
 
 test-yellow-band: $(OUT)
 	@$(PYTHON) tools/test_yellow_band.py
+
+# test-bird-sweep: comprehensive sweep of bird Y=20..144, checking for
+# artifacts at every position. Standalone — NOT in default `make test`
+# because it surfaces real transient stale-residue bugs not yet fixed.
+test-bird-sweep: $(OUT)
+	@$(PYTHON) tools/test_bird_sweep.py
 
 clean:
 	rm -rf build

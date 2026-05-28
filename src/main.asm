@@ -60,7 +60,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
 ; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
 ; Verified by tools/test_beam_race.py.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 420
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 310
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -259,14 +259,12 @@ main_loop:
         call    read_input
         call    update_bird
         call    advance_bird_anim
-        ; draw_bird uses masked-OR so bird sprite blends with whatever's
-        ; already in the screen at bird cols (cols 7,8,9). Pipe pixels
-        ; rendered by PIPE_PROGRAM (after this) at bird's char rows OR
-        ; over bird's sprite pixels — wings/outline visible on green pipe
-        ; body. Stale residue at bird cols is cleaned incrementally by
-        ; the V-col pixel sweep in wrap_attrs_combined when a pipe's
-        ; vacated col transits cols 7..9 — no per-frame blanking around
-        ; the bird (which the user reported as crude/jarring).
+        ; Pre-clean cols 7,8,9 at bird's 3 char rows so 1st draw_bird
+        ; produces only bird sprite pixels (no stale residue underneath).
+        ; PIPE_PROGRAM (after) re-writes pipe pixels at pipe body cells.
+        ; 2nd draw_bird (after PIPE) OR's bird sprite onto pipe — giving
+        ; the masked-OR look the user requested.
+        call    clean_bird_col_pixels
         call    draw_bird
         call    paint_bird_attrs        ; top-blank: paint so raster reads bird attrs THIS frame
         PROFILE_OUT 3                   ; MAGENTA = PIPE_PROGRAM
