@@ -3624,14 +3624,25 @@ paint_bird_attrs:
         db      %100
 
 ; Per-bx attr table: 3 bytes per bx (cols 7, 8, 9).
-; $FF = this bx doesn't cover this col. Else = expected attr from
-; pipe's perspective (SKY for L/R edge, PIPE for M1/M2 body, BUFFER
-; for V col).
-; Used by .compute_row_cover_attrs to fill row_cover_attrs.
+; $FF = this bx doesn't cover this col → paint writes bird/sky as normal.
+; Else = expected attr from pipe's perspective (SKY for L/R edge,
+; PIPE for M1/M2 body).
+;
+; V col is intentionally MISSING from this table (entries are $FF where
+; V would land on bird cols 7/8/9). Reason: V col attr from wrap_attrs
+; is BUFFER ($2D cyan-on-cyan) to hide residual pipe pixels left from
+; prior wraps — but at bird rows the clean_bird_col_pixels pass has
+; already zeroed cols 7/8/9, so there are no residue pixels to hide.
+; If we write BUFFER at V cells covering bird's centre, the bird body
+; cell renders cyan-on-cyan = INVISIBLE bird. User-observed bug ("when
+; flapping, top rows of top pipes corrupt" — actually bird was
+; disappearing when V col scrolled across bird's centre at high Y).
+; Setting V → $FF makes paint write BIRD/SKY at V cells, so the bird
+; stays visible as the pipe's trailing edge passes.
 .crm_attr_table:
-        db      ATTR_BUFFER, $FF, $FF                   ; bx=4: V=7
-        db      ATTR_SKY, ATTR_BUFFER, $FF              ; bx=5: R=7, V=8
-        db      ATTR_PIPE, ATTR_SKY, ATTR_BUFFER        ; bx=6: M2=7, R=8, V=9
+        db      $FF, $FF, $FF                           ; bx=4: V=7 (uncovered)
+        db      ATTR_SKY, $FF, $FF                      ; bx=5: R=7, V=8 (V uncovered)
+        db      ATTR_PIPE, ATTR_SKY, $FF                ; bx=6: M2=7, R=8, V=9 (V uncov)
         db      ATTR_PIPE, ATTR_PIPE, ATTR_SKY          ; bx=7: M1=7, M2=8, R=9
         db      ATTR_SKY, ATTR_PIPE, ATTR_PIPE          ; bx=8: L=7, M1=8, M2=9
         db      $FF, ATTR_SKY, ATTR_PIPE                ; bx=9: L=8, M1=9
