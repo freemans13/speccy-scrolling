@@ -340,12 +340,13 @@ main_loop:
         jr      nz, .wbb_lp
         PROFILE_OUT 4                           ; GREEN = wrap_attrs_combined start (bottom blank)
         call    wrap_attrs_combined             ; single-pass writer (~5k T)
-        ; Re-stamp the bird's 9 attr cells so any wrap_attrs writes at
-        ; pipe vacated/L/R cols that coincide with cols 7/8/9 don't end
-        ; up as the final attr value. Stamp-only — does NOT update
-        ; bird_attr_y or bird_attr_save (those reflect pre-paint state
-        ; that restore_bird_attrs needs next frame to avoid yellow trail).
-        call    paint_bird_stamp
+        ; paint_bird_stamp removed: was re-applying bird attrs over the
+        ; pipe attrs wrap_attrs just wrote at bird/pipe overlap cells.
+        ; User-requested: bird should be BEHIND pipes in attrs too (cyan
+        ; paper / yellow body should NOT show over a pipe the bird is
+        ; touching). Letting wrap_attrs's pipe attrs persist at overlap
+        ; cells gives the desired visual (pipe is the foreground at
+        ; overlap, bird pixels overdrawn by pipe pixels).
         PROFILE_OUT 1                           ; back to BLUE = sfx region
 .no_wrap_pending:
         call    sfx_slice               ; sound — single slice in the idle tail
@@ -4238,16 +4239,38 @@ wrap_attrs_combined:
         djnz    .wac_row_lp
         ret
 
-; Sweep $2D BUFFER at col A across all 20 char rows.
+; Sweep $2D BUFFER at col A across all 20 char rows EXCEPT bird's 3
+; rows. Skipping bird's rows lets paint_bird_attrs's SKY/BIRD persist
+; at bird's wing cell when V col coincides with bird col (otherwise
+; the sweep would clobber bird's SKY ATTR with BUFFER, making the
+; wing pixels render cyan-on-cyan = invisible).
 ; In: A = col (7, 8, or 9). Clobbers: AF, B, HL, DE.
 .wac_sweep_v_col:
-        ld      h, $58                  ; HL = ATTRS + col (ATTRS=$5800, +A=col)
+        ld      h, $58                  ; HL = ATTRS + col
         ld      l, a
-        ld      b, 20
-        ld      de, 32
+        ld      a, (bird_attr_y)
+        and     $F8
+        rrca
+        rrca
+        rrca                            ; A = bird top_row
+        ld      c, a                    ; C = top_row
+        ld      b, 20                   ; loop count
+        ld      e, 0                    ; E = current row 0..19
 .svc_lp:
+        ld      a, e
+        sub     c
+        cp      3                       ; row - top_row < 3 ?
+        jr      c, .svc_skip            ; yes → skip (bird's row)
         ld      (hl), ATTR_BUFFER
-        add     hl, de
+.svc_skip:
+        ; HL += 32 (next row, same col)
+        ld      a, l
+        add     a, 32
+        ld      l, a
+        jr      nc, .svc_nc
+        inc     h
+.svc_nc:
+        inc     e
         djnz    .svc_lp
         ret
 
