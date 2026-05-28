@@ -229,16 +229,17 @@ def check_pipe(attrs, pipe_idx, bx, gy, bird_rows):
             if is_buffer_col(col): continue
             if in_bird_row and col in bird_cols: continue
             actual = attrs[row * 32 + col]
-            # L/R now use ATTR_PIPE (was ATTR_SKY) so pipe stays
-            # continuously green as it scrolls. $2D BUFFER still wrong.
-            if actual != ATTR_PIPE:
+            # L/R use ATTR_SKY (cyan paper, black ink) so the pipe edge
+            # pixel renders as classic black-on-cyan attribute clash.
+            # $2D BUFFER hides the edge entirely (cyan-on-cyan).
+            if actual != ATTR_SKY:
                 tag = "L" if col == L else "R"
                 if actual == ATTR_BUFFER:
                     why = (f"pipe {pipe_idx} {tag}-cell body = $2D BUFFER "
                            f"→ edge-dither pixels invisible")
                 else:
-                    why = f"pipe {pipe_idx} {tag}-cell body has unexpected attr (expected PIPE)"
-                fails.append((col, row, actual, ATTR_PIPE, why))
+                    why = f"pipe {pipe_idx} {tag}-cell body has unexpected attr (expected SKY)"
+                fails.append((col, row, actual, ATTR_SKY, why))
     return fails
 
 

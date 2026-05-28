@@ -4320,15 +4320,16 @@ wrap_attrs_combined:
         ; the cell's col falls in the buffer band (col < 4 or col >= 28).
         ; Store into the wac_cell_X SMC slots in the row writer.
         ld      c, a                            ; C = byte_x (preserved across calls)
-        ; L col = byte_x - 1: PIPE attr (was SKY) so pipe stays green
-        ; across all body cols as it scrolls past bird — user-requested
-        ; "pipe colour shouldn't change to cyan over bird".
+        ; L col = byte_x - 1: SKY attr (cyan paper + black ink) so the
+        ; pipe's L-edge pixel byte renders as black-on-cyan — classic
+        ; Spectrum attribute-clash pipe edge. ATTR_PIPE here makes the
+        ; pipe look 4-cells wide (solid green slab) which is wrong.
         dec     a
         cp      4
         jr      c, .wac_lbuf
         cp      28
         jr      nc, .wac_lbuf
-        ld      a, ATTR_PIPE
+        ld      a, ATTR_SKY
         jr      .wac_lset
 .wac_lbuf:
         ld      a, ATTR_BUFFER
@@ -4359,15 +4360,15 @@ wrap_attrs_combined:
         ld      a, ATTR_BUFFER
 .wac_m2set:
         ld      (wrap_attrs_combined.wac_cell_M2_imm), a
-        ; R col = byte_x + 2: PIPE attr (was SKY) so pipe stays green
-        ; across all body cols (same reason as L).
+        ; R col = byte_x + 2: SKY attr (same reason as L — pipe edge
+        ; pixel as black-on-cyan, not green slab).
         ld      a, c
         add     a, 2
         cp      4
         jr      c, .wac_rbuf
         cp      28
         jr      nc, .wac_rbuf
-        ld      a, ATTR_PIPE
+        ld      a, ATTR_SKY
         jr      .wac_rset
 .wac_rbuf:
         ld      a, ATTR_BUFFER
