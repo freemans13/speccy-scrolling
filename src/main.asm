@@ -4296,13 +4296,15 @@ wrap_attrs_combined:
         ; the cell's col falls in the buffer band (col < 4 or col >= 28).
         ; Store into the wac_cell_X SMC slots in the row writer.
         ld      c, a                            ; C = byte_x (preserved across calls)
-        ; L col = byte_x - 1
+        ; L col = byte_x - 1: PIPE attr (was SKY) so pipe stays green
+        ; across all body cols as it scrolls past bird — user-requested
+        ; "pipe colour shouldn't change to cyan over bird".
         dec     a
         cp      4
         jr      c, .wac_lbuf
         cp      28
         jr      nc, .wac_lbuf
-        ld      a, ATTR_SKY
+        ld      a, ATTR_PIPE
         jr      .wac_lset
 .wac_lbuf:
         ld      a, ATTR_BUFFER
@@ -4333,24 +4335,38 @@ wrap_attrs_combined:
         ld      a, ATTR_BUFFER
 .wac_m2set:
         ld      (wrap_attrs_combined.wac_cell_M2_imm), a
-        ; R col = byte_x + 2
+        ; R col = byte_x + 2: PIPE attr (was SKY) so pipe stays green
+        ; across all body cols (same reason as L).
         ld      a, c
         add     a, 2
         cp      4
         jr      c, .wac_rbuf
         cp      28
         jr      nc, .wac_rbuf
-        ld      a, ATTR_SKY
+        ld      a, ATTR_PIPE
         jr      .wac_rset
 .wac_rbuf:
         ld      a, ATTR_BUFFER
 .wac_rset:
         ld      (wrap_attrs_combined.wac_cell_R_imm), a
-        ; vacated col = byte_x + 3 — always BUFFER (hides stale pipe
-        ; pixels from prior wraps). When this lands in bird cols 7-9,
-        ; paint_bird_attrs (called LATER in main_loop, after this) writes
-        ; the correct bird/sky attrs over the BUFFER. Bird wins.
+        ; vacated col = byte_x + 3:
+        ;  - if V col is in bird cols (7,8,9): use PIPE attr so the pipe
+        ;    stays continuously green across its body width as it scrolls
+        ;    past the bird. wac_sweep_v_col cleans V col pixel data so
+        ;    no stale dither shows on the green paper.
+        ;  - else: BUFFER (cyan-cyan invisible). Hides stale residue at
+        ;    cols where the pipe just left and no cleanup runs.
+        ld      a, c                            ; C = byte_x
+        add     a, 3                            ; A = V col
+        cp      7
+        jr      c, .wac_vbuf
+        cp      10
+        jr      nc, .wac_vbuf
+        ld      a, ATTR_PIPE                    ; V in bird cols → green
+        jr      .wac_vset
+.wac_vbuf:
         ld      a, ATTR_BUFFER
+.wac_vset:
         ld      (wrap_attrs_combined.wac_cell_V_imm), a
 
         ld      a, (iy+1)                       ; A = gap_y
