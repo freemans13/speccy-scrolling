@@ -60,7 +60,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
 ; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
 ; Verified by tools/test_beam_race.py.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 280
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 400
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -269,17 +269,12 @@ main_loop:
         call    paint_bird_attrs        ; top-blank: paint so raster reads bird attrs THIS frame
         PROFILE_OUT 3                   ; MAGENTA = PIPE_PROGRAM
         call    frame_update
-        ; SECOND draw_bird AFTER PIPE_PROGRAM — bird's masked-OR draw_bird
-        ; now OR's the sprite onto pipe pixels at overlap cells (instead
-        ; of pipe overwriting bird). Pipe pixels still visible through
-        ; bird's "transparent" sprite pixels (where mask=1, sprite=0),
-        ; giving the natural bird-in-front-of-pipe-with-mask look the
-        ; user requested. Timing trade-off: bird-cells raster-read window
-        ; is around T=46-50k for bird at floor; 2nd draw runs at T~30k
-        ; so bird's visible at clamp position. Bird at top of screen
-        ; (rows 0-7) may show 1-frame-behind on overlap as raster reads
-        ; before 2nd draw — acceptable since gameplay is mostly at floor.
-        call    draw_bird
+        ; Bird is drawn ONCE — at top blank, BEFORE PIPE_PROGRAM. Pipes
+        ; overwrite bird pixels at overlap (bird always BEHIND pipe).
+        ; wrap_attrs in the wrap_pending block similarly overrides bird
+        ; attrs at pipe body cells, so bird attrs are also behind pipe
+        ; attrs. Consistent across the entire screen: no raster-timing
+        ; race, no OR semantics.
         PROFILE_OUT 7                   ; WHITE = state prep
         call    do_white_work
         PROFILE_OUT 5                   ; CYAN = update_cap_imm_v2
