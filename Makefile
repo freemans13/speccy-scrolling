@@ -4,7 +4,7 @@ OUT       := build/main.sna
 LST       := build/main.lst
 PYTHON    := /tmp/emuvenv/bin/python
 
-.PHONY: all run clean test test-render test-overrun test-buffer-cols test-beam-race test-bird
+.PHONY: all run clean test test-render test-overrun test-buffer-cols test-beam-race test-bird test-yellow-band
 
 all: $(OUT)
 
@@ -22,7 +22,7 @@ run: $(OUT)
 	open $(OUT)
 
 # Test targets — fast headless checks. Run on every build with `make test`.
-test: test-render test-overrun test-buffer-cols test-beam-race test-bird
+test: test-render test-overrun test-buffer-cols test-beam-race test-bird test-yellow-band
 
 test-render: $(OUT)
 	@$(PYTHON) tools/test_render.py
@@ -38,6 +38,9 @@ test-beam-race: $(OUT)
 
 test-bird: $(OUT)
 	@$(PYTHON) tools/test_bird.py
+
+test-yellow-band: $(OUT)
+	@$(PYTHON) tools/test_yellow_band.py
 
 clean:
 	rm -rf build
