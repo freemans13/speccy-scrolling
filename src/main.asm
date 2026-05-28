@@ -3558,11 +3558,17 @@ paint_bird_attrs:
 .pcr_skip9:
         ret
 
-; Save helpers: filter $20→$2D when cell NOT pipe-covered; else save raw.
+; Save helpers:
+;   - cell pipe-covered (mask bit set): save sentinel $FF — restore_bird_attrs
+;     will SKIP these cells, letting wrap_attrs' pipe attrs persist visible
+;     to the raster (fixes "pipe empty over bird" when restore would
+;     otherwise overwrite pipe attr with stale saved $2D).
+;   - cell NOT covered: filter $20→$2D (stops stale-PIPE-attr propagation)
+;     and save.
 .save_filter_or_raw_bit0:
-        ld      a, (hl)
         bit     0, c
-        jr      nz, .sfr_store
+        jr      nz, .sfr_sentinel
+        ld      a, (hl)
         cp      ATTR_PIPE
         jr      nz, .sfr_store
         ld      a, ATTR_BUFFER
@@ -3570,20 +3576,23 @@ paint_bird_attrs:
         ld      (de), a
         inc     de
         ret
+.sfr_sentinel:
+        ld      a, $FF
+        jr      .sfr_store
 
 .save_filter_or_raw_bit1:
-        ld      a, (hl)
         bit     1, c
-        jr      nz, .sfr_store
+        jr      nz, .sfr_sentinel
+        ld      a, (hl)
         cp      ATTR_PIPE
         jr      nz, .sfr_store
         ld      a, ATTR_BUFFER
         jr      .sfr_store
 
 .save_filter_or_raw_bit2:
-        ld      a, (hl)
         bit     2, c
-        jr      nz, .sfr_store
+        jr      nz, .sfr_sentinel
+        ld      a, (hl)
         cp      ATTR_PIPE
         jr      nz, .sfr_store
         ld      a, ATTR_BUFFER
@@ -3762,6 +3771,12 @@ paint_bird_attrs:
 
 ; restore_bird_attrs: write saved 9 attr bytes back across 3 char rows
 ; at cols 7,8,9 starting from bird_attr_y (top row).
+; Each saved cell is either the real pre-paint attr (write back) OR the
+; sentinel $FF (cell was pipe-covered → paint skipped; wrap_attrs has
+; since stamped the correct pipe attr → SKIP restore so we don't
+; overwrite pipe attr with stale saved value). Without the skip, a
+; covered cell's restore would force $2D BUFFER between wrap frames,
+; making the pipe render invisible (cyan-on-cyan) over the bird.
 restore_bird_attrs:
         ld      a, (bird_attr_valid)
         or      a
@@ -3774,15 +3789,24 @@ restore_bird_attrs:
         ld      b, 3                    ; 3 rows
 .row_lp:
         ld      a, (de)
+        cp      $FF
+        jr      z, .skip_c7
         ld      (hl), a
+.skip_c7:
         inc     de
         inc     hl                      ; col 8
         ld      a, (de)
+        cp      $FF
+        jr      z, .skip_c8
         ld      (hl), a
+.skip_c8:
         inc     de
         inc     hl                      ; col 9
         ld      a, (de)
+        cp      $FF
+        jr      z, .skip_c9
         ld      (hl), a
+.skip_c9:
         inc     de
         ; Advance HL from col 9 to next row col 7: +30
         ld      a, l

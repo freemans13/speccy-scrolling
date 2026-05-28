@@ -94,6 +94,39 @@ def run_frames(sim, n_frames, out_log=None):
                 frame_idx[0] += 1
 
 
+def run_until_idle(sim, max_t=200000):
+    """Run until an OUT($FE), A with A==0 (BLACK = end-of-frame idle marker)
+    is executed, OR max_t T-states elapse. Returns when the BLACK OUT has
+    just completed — frame's full work (restore, PIPE_PROGRAM, wrap_attrs,
+    sfx) is done but the next frame's restore_bird_bg has NOT yet zeroed
+    bird pixel cells. Use this to inspect end-of-frame state matching what
+    the raster sees.
+    """
+    opcodes = sim.opcodes
+    memory = sim.memory
+    regs = sim.registers
+    frame_dur = sim.frame_duration
+    int_active = sim.int_active
+    A_idx = REGISTERS['A']
+    PC_idx = REGISTERS['PC']
+    start_t = regs[T]
+    hit = [False]
+    orig_out = opcodes[0xD3]
+    def wrapped_out():
+        if memory[regs[PC_idx] + 1] == 0xFE and (regs[A_idx] & 0x07) == 0:
+            hit[0] = True
+        orig_out()
+    opcodes[0xD3] = wrapped_out
+    try:
+        while not hit[0] and (regs[T] - start_t) < max_t:
+            pc_before = regs[PC_idx]
+            opcodes[memory[pc_before]]()
+            if regs[IFF] and regs[T] % frame_dur < int_active:
+                sim.accept_interrupt(regs, memory, pc_before)
+    finally:
+        opcodes[0xD3] = orig_out
+
+
 def save_sna(path, mem, regs):
     pc = regs[REGISTERS['PC']]
     sp = regs[REGISTERS['SP']]
