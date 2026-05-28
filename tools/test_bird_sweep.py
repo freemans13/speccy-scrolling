@@ -117,10 +117,24 @@ def check_one_position(sim, y, ground_baseline):
     if sprite_pixel_count < 8:
         fails.append(f"y={y}: only {sprite_pixel_count} non-zero sprite pixels in bird range")
 
-    # 2. Body cell
+    # 2. Body cell — must be one of: BIRD ($70), or any pipe-related attr
+    # ($28 SKY / $2D BUFFER / $20 PIPE) if a pipe could have covered at
+    # paint time. Since wrap_byte_x runs AFTER paint, "could have covered"
+    # = current pipe at bx in [4..10] (post-wrap state allows pre-wrap
+    # bx=5..11 which all could have covered col 8 at paint).
     if 0 <= centre_row < 20:
         got = mem[0x5800 + centre_row * 32 + 8]
-        if pipe_covers_col_at_centre(mem, centre_row):
+        pipe_could_have_covered = False
+        for i in range(NUM_PIPES):
+            bx = mem[SYM["pipe_state"] + i * 2]
+            gy = mem[SYM["pipe_state"] + i * 2 + 1]
+            if not (1 <= bx <= 30 and 8 <= gy <= 96): continue
+            if not (4 <= bx <= 10): continue  # one wider than paint's [5..10]
+            k_top = (gy - 1) >> 3
+            k_bot = (gy + 48) >> 3
+            if centre_row <= k_top or centre_row >= k_bot:
+                pipe_could_have_covered = True; break
+        if pipe_could_have_covered:
             valid = {ATTR_BIRD, ATTR_SKY, ATTR_BUFFER, ATTR_PIPE}
         else:
             valid = {ATTR_BIRD}
