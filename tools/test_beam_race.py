@@ -111,7 +111,12 @@ def main():
         # before wrap_attrs_combined. The ground GREEN happens during
         # frame_update, very early; our wrap GREEN happens after BLUE,
         # WHITE, CYAN, YELLOW, busy-wait → very late.
-        wrap_greens = [g for g in greens if g >= 30000]
+        # The wrap_attrs_combined GREEN (line 314) fires only on wrap frames
+        # AFTER the busy-wait, so it lands deep in the frame (T >= ~45k).
+        # The ground-band GREEN fires inside frame_update at T ~28-30k and
+        # exists every frame. Filter for the late GREEN; if absent this is
+        # a non-wrap frame.
+        wrap_greens = [g for g in greens if g >= 45000]
         if not wrap_greens:
             continue
         wrap_frames += 1

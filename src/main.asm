@@ -60,7 +60,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
 ; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
 ; Verified by tools/test_beam_race.py.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 487
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 680
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -259,21 +259,23 @@ main_loop:
         call    read_input
         call    update_bird
         call    advance_bird_anim
+        ; Clean stale pipe pixel residue at cols 7,8,9 across bird's 3
+        ; char rows BEFORE draw_bird. paint_bird_attrs forces SKY ($28,
+        ; ink black on cyan) at bird's cells, so any leftover pipe pixel
+        ; data ($C0 L-edge dither, $03 R-edge, $FF body) would render as
+        ; visible black pixels where the sprite has 0 (sprite mask leaves
+        ; the underlying pixel intact). Cleaning to 0 first means the
+        ; masked-OR draw_bird produces only bird pixels at bird's cells.
+        call    clean_bird_col_pixels
         call    draw_bird
         call    paint_bird_attrs        ; top-blank: paint so raster reads bird attrs THIS frame
         PROFILE_OUT 3                   ; MAGENTA = PIPE_PROGRAM
         call    frame_update
-        ; PIPE_PROGRAM body bands write pipe pixel data at L..R cols of
-        ; each active pipe. Cap handlers (k_top/k_bot rows) similarly push
-        ; cap rim bytes. Both can leave pixel data at bird cols (7,8,9) —
-        ; either the current pipe writing M1/M2/R at one of those cols, or
-        ; stale residue from prior pipe positions. paint_bird_attrs forces
-        ; SKY ($28, ink black on cyan paper) at bird's 3 char rows × cols
-        ; 7,8,9 — exposing any non-zero pixel as a visible black stripe.
-        ; Clean bird's cells then re-stamp the sprite so bird wins over
-        ; pipe pixels at overlapping cells.
-        call    clean_bird_col_pixels
-        call    draw_bird
+        ; PIPE_PROGRAM overdraws pipe pixels where pipes are at bird cells.
+        ; Consistent layering: bird is ALWAYS behind pipes (no 2nd draw_bird
+        ; that would reverse the layering depending on raster timing — that
+        ; caused bird-in-front at bottom of screen, behind at top, flicker
+        ; in the middle).
         PROFILE_OUT 7                   ; WHITE = state prep
         call    do_white_work
         PROFILE_OUT 5                   ; CYAN = update_cap_imm_v2

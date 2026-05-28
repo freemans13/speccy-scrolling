@@ -81,14 +81,16 @@ _load_syms()
 
 
 def pipe_covers_cell(mem, col, row):
-    """True if any pipe's L..R columns include `col` AND `row` is a body
-    row (not in the pipe's gap)."""
+    """True if any pipe legitimately writes pixel data at (row, col).
+    PIPE_PROGRAM body bands push to cols [bx-1 .. bx+3] = L,M1,M2,R,V at
+    body rows (top: 0..k_top, bot: k_bot..19). The V col write is a side
+    effect of the SP-hijack push pattern — it lands on the vacated col
+    whose attr is $2D BUFFER, so the pixel is invisible cyan-on-cyan."""
     for i in range(NUM_PIPES):
         bx = mem[SYM["pipe_state"] + i * 2]
         gy = mem[SYM["pipe_state"] + i * 2 + 1]
         if not (1 <= bx <= 30 and 8 <= gy <= 96): continue
-        if not (bx - 1 <= col <= bx + 2): continue
-        # row in pipe body: row <= (gy-1)>>3 or row >= (gy+48)>>3
+        if not (bx - 1 <= col <= bx + 3): continue
         k_top = (gy - 1) >> 3
         k_bot = (gy + 48) >> 3
         if row <= k_top or row >= k_bot:
@@ -221,6 +223,65 @@ def run_one_frame_with_mid_capture(sim, capture_t):
             return captured
 
 
+def run_one_frame_with_pixel_capture(sim, capture_ts):
+    """Like run_one_frame_with_mid_capture but captures pixel data at
+    multiple T-state points (sorted). Returns list of pixel-area snapshots
+    (one per capture point that was crossed, indexed by capture_ts order)."""
+    opcodes = sim.opcodes
+    memory = sim.memory
+    regs = sim.registers
+    frame_dur = sim.frame_duration
+    int_active = sim.int_active
+    PC_idx = REGISTERS['PC']
+    captures = [None] * len(capture_ts)
+    cap_idx = 0
+    while True:
+        pc_before = regs[PC_idx]
+        t_before = regs[T] % frame_dur
+        opcodes[memory[pc_before]]()
+        t_after = regs[T] % frame_dur
+        while cap_idx < len(capture_ts) and t_after >= capture_ts[cap_idx] and t_before < capture_ts[cap_idx]:
+            captures[cap_idx] = bytes(memory[0x4000:0x5800])
+            cap_idx += 1
+        if regs[IFF] and t_after < int_active:
+            sim.accept_interrupt(regs, memory, pc_before)
+            return captures
+
+
+def check_pixel_stability(captures, mem_at_eof, frame_num, bird_y_at_capture_start):
+    """Across multiple raster-time pixel captures (top of bird, centre,
+    bot), the pixel data at bird's cols 7,8,9 within bird's row range
+    should be IDENTICAL — no mid-scan writes should disturb bird pixels.
+    Catches "flickers in middle of screen" caused by writes racing the
+    raster across bird's vertical extent."""
+    fails = []
+    bird_top = bird_y_at_capture_start
+    bird_bot = bird_top + BIRD_LINES - 1
+    # All captures should agree at bird's pixel cells (cols 7,8,9, rows
+    # bird_top..bird_bot). Compare each capture to the first non-None.
+    ref = None
+    for cap in captures:
+        if cap is not None: ref = cap; break
+    if ref is None: return fails
+    for cap_idx, cap in enumerate(captures):
+        if cap is None or cap is ref: continue
+        for py in range(bird_top, bird_bot + 1):
+            if py < 0 or py >= 192: continue
+            ccc = (py >> 6) & 3
+            ppp = py & 7
+            rrr = (py >> 3) & 7
+            base = (ccc << 11) | (ppp << 8) | (rrr << 5)
+            for c in (7, 8, 9):
+                offset = base + c
+                if ref[offset] != cap[offset]:
+                    fails.append(
+                        f"frame {frame_num}: capture#{cap_idx} pixel y={py} "
+                        f"col {c} = ${cap[offset]:02X} but ref capture = "
+                        f"${ref[offset]:02X} — write racing raster mid-scan")
+                    if len(fails) >= 3: return fails
+    return fails
+
+
 def check_raster_time_attrs(mem_attrs, mem_at_eof, frame_num):
     """The captured mid-scan attrs MUST match the end-of-frame attrs at
     the bird's 3 char rows, cols 7,8,9. If they differ, paint vs wrap
@@ -273,8 +334,14 @@ def main():
                 sim.memory[SYM["bird_vy"] + 1] = (FLAP_VY >> 8) & 0xFF
             fr += 1
             bird_y_now = sim.memory[SYM["bird_y"] + 1]
-            capture_t = bird_y_now * SCANLINE_T + TOP_BLANK_END
-            mid_attrs = run_one_frame_with_mid_capture(sim, capture_t)
+            # Capture pixel state at the T-state when raster reads bird's
+            # top, centre+8, and bot+15 pixel rows. Plus attrs at top of
+            # bird's char row. Used to detect mid-scan flicker.
+            t_top  = bird_y_now * SCANLINE_T + TOP_BLANK_END
+            t_mid  = (bird_y_now + 8) * SCANLINE_T + TOP_BLANK_END
+            t_bot  = (bird_y_now + 15) * SCANLINE_T + TOP_BLANK_END
+            capture_ts = sorted({t_top, t_mid, t_bot})
+            mid_attrs = run_one_frame_with_mid_capture(sim, capture_ts[0])
             fails = []
             fails.extend(check_attrs(sim.memory, fr))
             if not fails:
