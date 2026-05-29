@@ -4557,18 +4557,15 @@ wrap_attrs_combined:
         push    bc
         push    de
         push    hl
-        ld      a, e                    ; row index
-        add     a, a
-        add     a, a
-        add     a, a                    ; pixel y = row * 8
+        ld      a, e                    ; row index (char row 0..19)
+        add     a, a                    ; row * 2 (band_first_addr is 2 B/entry)
         ld      l, a
         ld      h, 0
-        add     hl, hl                  ; HL = pixel y * 2 (line_table is 2 B/entry)
-        ld      de, line_table
-        add     hl, de                  ; HL = &line_table[pixel y of first sub-row]
+        ld      de, band_first_addr
+        add     hl, de                  ; HL = &band_first_addr[row]
         ld      e, (hl)
         inc     hl
-        ld      d, (hl)                 ; DE = pixel addr at (pixel y, col 0)
+        ld      d, (hl)                 ; DE = line_table[row*8] = char-row pixel base
 .svc_col_imm equ $+1
         ld      a, 0                    ; SMC: V col
         add     a, e
