@@ -75,7 +75,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ;         wrap-frame margin (worst-frame 2021 → 3768 T) and produces a
 ;         byte-identical bird raster-time failure set to 350 (no NEW
 ;         single-frame visual regressions across all 6 velocity scenarios).
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 390
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 440
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -3016,7 +3016,14 @@ redraw_pipes_v2:
 ; Clobbers: AF, BC, DE, HL, IX.
 ;----------------------------------------------------------------
 update_cap_imm_v2:
-        ; Cache L, M1, M2, R from cap_rounded_bitmap[phase*4]
+        ; The 6 cap-handler bc-slots and 6 de-slots are at fixed compile-time
+        ; addresses, and all 3 pipes get the SAME phase bytes — so this is a
+        ; branchless unrolled write of two register pairs, no IX/IY table walk,
+        ; no cap_*_temp round-trip, no djnz. ~1673 T → ~350 T (constant).
+        ;
+        ; cap_rounded_bitmap[phase*4] = [L, M1, M2, R].
+        ; bc-slot layout: addr=L, addr+1=M1 → BC = M1<<8 | L  (ld (nn),bc = C,B)
+        ; de-slot layout: addr=M2, addr+1=R → DE = R<<8 | M2
         ld      hl, cap_rounded_bitmap
         ld      a, (phase)
         add     a, a
@@ -3024,74 +3031,27 @@ update_cap_imm_v2:
         ld      e, a
         ld      d, 0
         add     hl, de                  ; HL → cap_rounded_bitmap[phase*4]
-        ld      a, (hl)
-        ld      (cap_L_temp), a         ; L
+        ld      c, (hl)                 ; C = L
         inc     hl
-        ld      a, (hl)
-        ld      (cap_M1_temp), a        ; M1
+        ld      b, (hl)                 ; B = M1   → BC = M1<<8 | L
         inc     hl
-        ld      a, (hl)
-        ld      (cap_M2_temp), a        ; M2
+        ld      e, (hl)                 ; E = M2
         inc     hl
-        ld      a, (hl)
-        ld      (cap_R_temp), a         ; R
-
-        ; Write bc/de pairs into cap_top handlers (one per active pipe)
-        ld      ix, cap_top_bc_imm_addrs
-        ld      iy, cap_top_de_imm_addrs
-        ld      b, NUM_PIPES
-.top_lp:
-        push    bc
-        ; BC-imm slot: byte at addr = L, byte at addr+1 = M1
-        ld      l, (ix+0)
-        ld      h, (ix+1)
-        ld      a, (cap_L_temp)
-        ld      (hl), a
-        inc     hl
-        ld      a, (cap_M1_temp)
-        ld      (hl), a
-        ; DE-imm slot: byte at addr = M2, byte at addr+1 = R
-        ld      l, (iy+0)
-        ld      h, (iy+1)
-        ld      a, (cap_M2_temp)
-        ld      (hl), a
-        inc     hl
-        ld      a, (cap_R_temp)
-        ld      (hl), a
-        ; Advance table pointers by 2
-        inc     ix
-        inc     ix
-        inc     iy
-        inc     iy
-        pop     bc
-        djnz    .top_lp
-
-        ; Write bc/de pairs into cap_bot handlers (one per active pipe)
-        ld      ix, cap_bot_bc_imm_addrs
-        ld      iy, cap_bot_de_imm_addrs
-        ld      b, NUM_PIPES
-.bot_lp:
-        push    bc
-        ld      l, (ix+0)
-        ld      h, (ix+1)
-        ld      a, (cap_L_temp)
-        ld      (hl), a
-        inc     hl
-        ld      a, (cap_M1_temp)
-        ld      (hl), a
-        ld      l, (iy+0)
-        ld      h, (iy+1)
-        ld      a, (cap_M2_temp)
-        ld      (hl), a
-        inc     hl
-        ld      a, (cap_R_temp)
-        ld      (hl), a
-        inc     ix
-        inc     ix
-        inc     iy
-        inc     iy
-        pop     bc
-        djnz    .bot_lp
+        ld      d, (hl)                 ; D = R    → DE = R<<8 | M2
+        ; bc-slots (L, M1) — cap_top + cap_bot for all 3 pipes
+        ld      (cap_top_handler_pipe_0_bc), bc
+        ld      (cap_top_handler_pipe_1_bc), bc
+        ld      (cap_top_handler_pipe_2_bc), bc
+        ld      (cap_bot_handler_pipe_0_bc), bc
+        ld      (cap_bot_handler_pipe_1_bc), bc
+        ld      (cap_bot_handler_pipe_2_bc), bc
+        ; de-slots (M2, R)
+        ld      (cap_top_handler_pipe_0_de), de
+        ld      (cap_top_handler_pipe_1_de), de
+        ld      (cap_top_handler_pipe_2_de), de
+        ld      (cap_bot_handler_pipe_0_de), de
+        ld      (cap_bot_handler_pipe_1_de), de
+        ld      (cap_bot_handler_pipe_2_de), de
         ret
 
 ;----------------------------------------------------------------
