@@ -4569,30 +4569,23 @@ wrap_attrs_combined:
         pop     bc                              ; restore byte_x (saved at entry)
         ret
 
-; In: A = start row, B = row count, byte_x on stack (popped after).
-; Caller already has byte_x in scratch; we re-read from saved stack entry.
-; Simpler: read byte_x from (sp+2) — but Z80 stack indexing is hard.
-; Workaround: caller passes byte_x in C, we preserve C via push/pop locally.
+; In: A = start row, B = row count, C = byte_x.  Out: HL = L-col attr addr.
+; No push/pop here: the setup touches only A/D/E/H/L (never B or C). The
+; caller (.wac_pipe) reloads B before each call and keeps byte_x live in C
+; across both the top- and bot-region calls, so neither needs preserving.
+; The row→base address (ATTRS + row*32) comes from the page-aligned
+; attr_row_addr LUT, replacing the old `add hl,hl ×5` + ATTRS add (~166 T
+; setup → ~45 T).
 .wac_rows:
-        ; HL = ATTRS + row*32 + (byte_x - 1)  [L col addr]
-        push    bc                              ; save B (row count) and C (byte_x)
-        ld      h, 0
+        add     a, a                            ; A = row * 2 (word index)
         ld      l, a
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl
-        add     hl, hl                          ; HL = row * 32
-        ld      de, ATTRS
-        add     hl, de                          ; HL = ATTRS + row*32
-        pop     bc                              ; B = row count, C = byte_x
-        push    bc
-        ld      a, c
-        dec     a                               ; A = byte_x - 1 = L col
-        ld      e, a
-        ld      d, 0
-        add     hl, de                          ; HL = L col addr
-        pop     bc
+        ld      h, attr_row_addr >> 8           ; HL → &attr_row_addr[row] (table is page-aligned)
+        ld      a, (hl)                         ; A = lo(ATTRS + row*32)
+        inc     l
+        ld      h, (hl)                         ; H = hi(ATTRS + row*32)
+        add     a, c                            ; + byte_x
+        dec     a                               ; + byte_x - 1 = L col; lo ≤ 224+27 = 251 so no carry
+        ld      l, a                            ; HL = L-col attr address
 .wac_row_lp:
         ; Write 5 cells using pre-computed SMC values (set once per pipe
         ; in the outer loop). Each is `ld (hl), n` where n is patched.
@@ -5365,6 +5358,20 @@ Y = 0
         DUP 192
         dw $4000 + ((Y & 7) << 8) + ((Y & $38) << 2) + ((Y & $C0) << 5)
 Y = Y + 1
+        EDUP
+
+; attr_row_addr[row] = ATTRS + row*32 for rows 0..19 (the playfield char
+; rows wrap_attrs_combined paints). Page-aligned so .wac_rows can index it
+; with a single `ld l, row*2` (no carry handling) and read the word base
+; address in ~17 T instead of `add hl,hl ×5` + ATTRS add. Low byte of each
+; entry is (row*32)&$FF ∈ {0,32,..,224}, so adding byte_x-1 (≤27) in
+; .wac_rows never crosses a page boundary.
+        ALIGN 256
+attr_row_addr:
+ARY = 0
+        DUP 20
+        dw ATTRS + ARY * 32
+ARY = ARY + 1
         EDUP
 
         ; ─── Zero the diagnostics ring at build time ────────────
