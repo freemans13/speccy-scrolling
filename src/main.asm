@@ -75,7 +75,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ;         wrap-frame margin (worst-frame 2021 → 3768 T) and produces a
 ;         byte-identical bird raster-time failure set to 350 (no NEW
 ;         single-frame visual regressions across all 6 velocity scenarios).
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 290
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 390
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -269,17 +269,18 @@ main_loop:
         ; All bird writes complete before raster reaches row 0, so the
         ; bird is visible same-frame at every Y with no flicker.
         ; PIPE_PROGRAM still has ~8 k T head start over the raster.
-        call    restore_bird_bg
         call    restore_bird_attrs
         call    read_input
         call    update_bird
         call    advance_bird_anim
-        ; Pre-clean cols 7,8,9 at bird's 3 char rows so 1st draw_bird
-        ; produces only bird sprite pixels (no stale residue underneath).
-        ; PIPE_PROGRAM (after) re-writes pipe pixels at pipe body cells.
-        ; 2nd draw_bird (after PIPE) OR's bird sprite onto pipe — giving
-        ; the masked-OR look the user requested.
-        call    clean_bird_col_pixels
+        ; clear_bird_pixels zeroes cols 7,8,9 over the UNION of the bird's
+        ; previous and current char-row blocks — erasing last frame's trail
+        ; AND prepping this frame's rows in one pass (replaces the old
+        ; restore_bird_bg + clean_bird_col_pixels). The bird is drawn behind
+        ; the pipes (draw_bird first, PIPE_PROGRAM paints over), so there is
+        ; nothing on screen to preserve: draw_bird is a plain sprite blit,
+        ; not a masked OR.
+        call    clear_bird_pixels
         call    draw_bird
         call    paint_bird_attrs        ; top-blank: paint so raster reads bird attrs THIS frame
         PROFILE_OUT 3                   ; MAGENTA = PIPE_PROGRAM
@@ -3999,69 +4000,98 @@ paint_bird_stamp:
 ; first pixel row's screen address; subsequent pixel rows within a char
 ; row are +$100 (just `inc h`). 3 char rows × 8 pixel rows × 3 cols
 ; = 72 byte writes per frame, ~2.2 k T.
-clean_bird_col_pixels:
-        ; Use CURRENT bird_y (not stale bird_attr_y from previous paint)
-        ; so cleaning matches the rows this frame's paint_bird_attrs is
-        ; about to write — and matches the rows draw_bird is about to
-        ; fill with the sprite.
-        ;
-        ; Clamps cleanup at pixel y=159 (= last sky row). bird at clamp
-        ; y=144 has 3 char rows = pixel y 144..167 — pixel y 160..167 is
-        ; the GROUND BAND (row 20+) and must NEVER be cleaned (else the
-        ; ground stripe appears blanked at cols 7,8,9 under the bird).
+; clear_bird_pixels — zero cols 7,8,9 pixels across the UNION of the bird's
+; PREVIOUS char-row block (bird_old_y) and its CURRENT block (bird_y), in one
+; pass. Replaces restore_bird_bg (erase last frame's trail) + the old
+; clean_bird_col_pixels (prep current rows). draw_bird is now a plain blit
+; that fully defines its own 16 sprite lines, so this clear only has to cover
+; the trail and the char-row slop.
+;
+; low  = min(old_char_top, new_char_top); rows = 3 + |old-new|/8 (both char-
+; aligned, so the diff is a multiple of 8 → 3 or 4 rows for normal movement).
+; Ground-clipped: a char row whose start pixel-y >= 160 is never touched (it's
+; the ground band; clearing it would blank the ground stripe under the bird).
+; CONSTANT-TIME by construction: always processes a FIXED 5-char-row window
+; [new_char_top-8 .. new_char_top+32]. Movement is <= 8 px/frame, so this
+; window always covers BOTH the previous and current 3-row bird blocks (the
+; previous block sits at new_char_top +/- one char row) — no need to read
+; bird_old_y. The bird is drawn behind the pipes (plain blit, then PIPE_PROGRAM
+; paints over), so clearing a spare sky row above/below is harmless.
+;
+; Why fixed 5 rows: wrap_attrs_combined is deferred by a fixed busy-wait that
+; assumes a CONSTANT amount of pre-wrap work. A variable row count here (3-5,
+; depending on movement) shifted wrap_attrs' start by ~500 T and raced the
+; raster on ~100 wrap frames. Every slot runs the same 8-sub-row loop; rows
+; outside the screen (char_top >= 160, which also catches the wrapped
+; "above-screen" case) switch the loop to a harmless read via a branchless
+; SMC opcode patch, so the routine costs the same T every frame.
+clear_bird_pixels:
         ld      a, (bird_y + 1)
-        and     $F8                     ; snap to char-row pixel-y
-        ld      h, 0
+        and     $F8
+        sub     8                       ; window opens one char row above the bird
+        jr      nc, .start_ok
+        xor     a                       ; clamp to top of screen (bird at y=0)
+.start_ok:
+        ld      c, a                    ; C = char_top (start), advances +8 per slot
         ld      l, a
-        add     hl, hl                  ; HL = pixel_y * 2 (line_table is 2 B/entry)
+        ld      h, 0
+        add     hl, hl                  ; *2 (line_table is 2 B/entry)
         ld      de, line_table
-        add     hl, de                  ; HL = &line_table[pixel_y]
-        ld      b, 3                    ; 3 char rows
-        ld      a, (bird_y + 1)
-        and     $F8                     ; A = top pixel-y (re-fetch for clamp calc)
-        ld      c, a                    ; C = current pixel-y (advances per row)
-.row_lp:
-        push    bc
+        add     hl, de                  ; HL = &line_table[start char_top]
+        ld      b, 5                    ; FIXED 5 slots → constant time
+.slot_lp:
+        push    bc                      ; save slot counter + char_top
+        ; col-7 pixel address for this row (computed every slot)
         ld      e, (hl)
         inc     hl
         ld      d, (hl)
-        dec     hl                      ; HL stays at line_table[char_row_start]
-        push    hl                      ; save line_table ptr for outer advance
+        dec     hl                      ; HL stays at line_table[char_top]
+        push    hl                      ; save line_table ptr
         ld      a, e
-        add     a, 7
-        ld      e, a
-        jr      nc, .nc_setup
-        inc     d
-.nc_setup:
-        ; Clip per-sub-row: if pixel-y >= 160 (ground), skip clean for that row.
-        ld      b, 8
-.pix_lp:
-        ; Check: current sub-row's pixel-y in ground band?
+        add     a, 7                    ; col 7 within the line
+        ld      l, a
+        ld      a, d
+        adc     a, 0
+        ld      h, a                    ; HL = col-7 pixel address
+        ; Branchless write/read decision (constant time): char_top < 160 →
+        ; real screen row → write ($77 = ld (hl),a); else (ground band, or the
+        ; wrapped above-screen value >= 248) → harmless read pad ($7E = ld a,(hl)).
         ld      a, c
         cp      160
-        jr      nc, .pix_skip           ; pixel-y >= 160 → ground, skip clean
-        push    de
-        ex      de, hl                  ; HL = pixel addr col 7
-        ld      (hl), 0
-        inc     hl
-        ld      (hl), 0                 ; col 8
-        inc     hl
-        ld      (hl), 0                 ; col 9
-        pop     de
-.pix_skip:
-        inc     d                       ; next pixel row (+$100)
-        inc     c                       ; advance pixel-y tracker
-        djnz    .pix_lp
-        pop     hl                      ; restore line_table ptr (at char_row_start)
-        ; Advance line_table ptr by 16 bytes (8 entries = 1 char row)
+        sbc     a, a                    ; $FF if char_top<160 else $00
+        and     $77 ^ $7E               ; $09 or $00
+        xor     $7E                     ; → $77 (write) or $7E (read)
+        ld      (.op0), a
+        ld      (.op1), a
+        ld      (.op2), a
+        ld      b, 8                    ; 8 sub-rows
+        xor     a                       ; clear value (ignored by the read opcode)
+.sub_lp:
+.op0    equ     $
+        ld      (hl), a                 ; col 7  (SMC: $77 write / $7E read)
+        inc     l
+.op1    equ     $
+        ld      (hl), a                 ; col 8
+        inc     l
+.op2    equ     $
+        ld      (hl), a                 ; col 9
+        inc     h                       ; next sub-row (+256)
+        dec     l
+        dec     l                       ; back to col 7
+        djnz    .sub_lp
+        pop     hl                      ; line_table ptr
         ld      a, l
-        add     a, 16
+        add     a, 16                   ; advance 1 char row (8 entries)
         ld      l, a
         jr      nc, .nc_adv
         inc     h
 .nc_adv:
-        pop     bc
-        djnz    .row_lp
+        pop     bc                      ; slot counter + char_top
+        ld      a, c
+        add     a, 8                    ; next char_top
+        ld      c, a
+        dec     b
+        jr      nz, .slot_lp
         ret
 
 ; init_bird_col_pixels: one-time clear at game start. Zero cols 7,8,9
@@ -4186,35 +4216,26 @@ draw_bird:
         ld      a, l
         or      7                       ; bits 0..2 → col 7 (sprite starts here)
         ld      l, a
-        ; col 7
+        ; Plain blit: the bird is drawn behind the pipes onto cells
+        ; clear_bird_pixels just zeroed, so there's nothing to preserve —
+        ; write the sprite byte directly (no AND mask / OR). The sprite data
+        ; is still stored 6 B/row [mask,sprite per cell]; the mask bytes
+        ; (offsets 0,2,4) are now dead — we step past them with inc de and
+        ; read only the sprite bytes (offsets 1,3,5).
+        inc     de                      ; → sprite_c7
         ld      a, (de)
-        and     (hl)
-        ld      c, a
-        inc     de
+        ld      (hl), a                 ; col 7
+        inc     de                      ; → mask_c8
+        inc     l                       ; → col 8
+        inc     de                      ; → sprite_c8
         ld      a, (de)
-        or      c
         ld      (hl), a
-        inc     de
-        inc     hl                      ; → col 8
-        ; col 8
+        inc     de                      ; → mask_c9
+        inc     l                       ; → col 9
+        inc     de                      ; → sprite_c9
         ld      a, (de)
-        and     (hl)
-        ld      c, a
-        inc     de
-        ld      a, (de)
-        or      c
         ld      (hl), a
-        inc     de
-        inc     hl                      ; → col 9
-        ; col 9
-        ld      a, (de)
-        and     (hl)
-        ld      c, a
-        inc     de
-        ld      a, (de)
-        or      c
-        ld      (hl), a
-        inc     de
+        inc     de                      ; → next row (mask_c7)
         djnz    .lp
         ld      sp, (saved_sp)
         ret
@@ -4288,35 +4309,8 @@ compute_bird_overlap:
         djnz    .pipe_lp
         ret
 
-restore_bird_bg:
-        ld      a, (bird_old_y_valid)
-        or      a
-        ret     z
-
-        ld      a, (bird_old_y)
-        ld      h, 0
-        ld      l, a
-        add     hl, hl
-        ld      de, line_table
-        add     hl, de
-        ld      (saved_sp), sp
-        ld      sp, hl
-        ld      b, BIRD_LINES
-        ; Clear all 3 bird cells (cols 7, 8, 9). Pipes will re-stamp on the
-        ; following frame at any col they still cover.
-.lp:
-        pop     hl
-        ld      a, l
-        or      7                       ; → col 7
-        ld      l, a
-        ld      (hl), 0
-        inc     hl                      ; → col 8
-        ld      (hl), 0
-        inc     hl                      ; → col 9
-        ld      (hl), 0
-        djnz    .lp
-        ld      sp, (saved_sp)
-        ret
+; (restore_bird_bg removed — its job, erasing the previous frame's bird
+; footprint, is now folded into clear_bird_pixels' union clear.)
 
 ;----------------------------------------------------------------
 ; Cap routines
