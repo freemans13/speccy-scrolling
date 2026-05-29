@@ -58,9 +58,24 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ; Busy-wait iters to delay wrap_attrs_combined into bottom blanking.
 ; Each iter ~26 T. Target: wrap_attrs starts AFTER raster passes char
 ; row 19's attr read window (scanline 153 + ULA fetch margin → T~49008).
-; BLUE marker is at ~T=38000; need ~11000 T delay. 11000/26 ≈ 425 iters.
-; Verified by tools/test_beam_race.py.
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 350
+; BLUE marker is at ~T=38000; need ~11000 T delay.
+;
+; The writer (~9.8k T, mostly bottom-of-display rows) must stay BEHIND the
+; raster (top-to-bottom writer vs top-to-bottom beam) so a pipe's attr cell
+; is never half-updated mid-display. Starting LATER than necessary only
+; wastes idle, so we want the latest start still fully behind the beam past
+; the last pipe attr row. 350 overshot that by ~13 scanlines (~3 k T of
+; pure idle).
+;
+; Empirically tuned (busy-wait sweep, tools/test_beam_race.py, and a
+; non-bailing full-sweep variant of tools/test_bird.py):
+;   260 → races the raster (24 wrap frames fail beam_race)
+;   280 → safe floor (beam_race passes)
+;   290 → chosen: ~30-iter buffer above the cliff. Reclaims ~1.7 k T of
+;         wrap-frame margin (worst-frame 2021 → 3768 T) and produces a
+;         byte-identical bird raster-time failure set to 350 (no NEW
+;         single-frame visual regressions across all 6 velocity scenarios).
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 290
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -4583,18 +4598,26 @@ wrap_attrs_combined:
         ; in the outer loop). Each is `ld (hl), n` where n is patched.
         ; This is much faster than the per-cell range checks that the
         ; old version did at every row.
+        ;
+        ; Inter-cell advance uses `inc l` (4 T) not `inc hl` (6 T). Safe:
+        ; Lcol = ATTRS + row*32 + (byte_x-1), so its low byte is
+        ; (row*32 + byte_x-1) & $FF. row*32 mod 256 ∈ {0,32,..,224} and
+        ; byte_x-1 ≤ 27, so the max low byte is 224+27 = 251; the 5-cell
+        ; run spans low..low+4 = 251..255 → never crosses a page boundary
+        ; within a row. The +32 stride to the next row IS handled with the
+        ; full ld a,l / add / carry path below.
 .wac_cell_L_imm  EQU $+1
         ld      (hl), 0
-        inc     hl
+        inc     l
 .wac_cell_M1_imm EQU $+1
         ld      (hl), 0
-        inc     hl
+        inc     l
 .wac_cell_M2_imm EQU $+1
         ld      (hl), 0
-        inc     hl
+        inc     l
 .wac_cell_R_imm  EQU $+1
         ld      (hl), 0
-        inc     hl
+        inc     l
 .wac_cell_V_imm  EQU $+1
         ld      (hl), ATTR_BUFFER               ; vacated mask — BUFFER or SKY (bird cols)
         ; Advance HL: from byte_x+3 to next row's L col (= byte_x-1).
