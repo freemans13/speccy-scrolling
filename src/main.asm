@@ -4379,65 +4379,27 @@ wrap_attrs_combined:
         ; the cell's col falls in the buffer band (col < 4 or col >= 28).
         ; Store into the wac_cell_X SMC slots in the row writer.
         ld      c, a                            ; C = byte_x (preserved across calls)
-        ; L col = byte_x - 1: SKY attr (cyan paper + black ink) so the
-        ; pipe's L-edge pixel byte renders as black-on-cyan — classic
-        ; Spectrum attribute-clash pipe edge. ATTR_PIPE here makes the
-        ; pipe look 4-cells wide (solid green slab) which is wrong.
-        dec     a
-        cp      4
-        jr      c, .wac_lbuf
-        cp      28
-        jr      nc, .wac_lbuf
-        ld      a, ATTR_SKY
-        jr      .wac_lset
-.wac_lbuf:
-        ld      a, ATTR_BUFFER
-.wac_lset:
+        ; The 4 cell attrs (L=byte_x-1, M1=byte_x, M2=byte_x+1, R=byte_x+2 →
+        ; SKY/PIPE/BUFFER) depend only on byte_x, so they come from the
+        ; precomputed wac_cell_lut[byte_x*4] instead of four cp/jr range chains.
+        add     a, a
+        add     a, a                            ; A = byte_x * 4
+        ld      l, a
+        ld      h, wac_cell_lut >> 8            ; table page-aligned → no carry
+        ld      a, (hl)                         ; L attr
         ld      (wrap_attrs_combined.wac_cell_L_imm), a
-        ; M1 col = byte_x
-        ld      a, c
-        cp      4
-        jr      c, .wac_m1buf
-        cp      28
-        jr      nc, .wac_m1buf
-        ld      a, ATTR_PIPE
-        jr      .wac_m1set
-.wac_m1buf:
-        ld      a, ATTR_BUFFER
-.wac_m1set:
+        inc     l
+        ld      a, (hl)                         ; M1 attr
         ld      (wrap_attrs_combined.wac_cell_M1_imm), a
-        ; M2 col = byte_x + 1
-        ld      a, c
-        inc     a
-        cp      4
-        jr      c, .wac_m2buf
-        cp      28
-        jr      nc, .wac_m2buf
-        ld      a, ATTR_PIPE
-        jr      .wac_m2set
-.wac_m2buf:
-        ld      a, ATTR_BUFFER
-.wac_m2set:
+        inc     l
+        ld      a, (hl)                         ; M2 attr
         ld      (wrap_attrs_combined.wac_cell_M2_imm), a
-        ; R col = byte_x + 2: SKY attr (same reason as L — pipe edge
-        ; pixel as black-on-cyan, not green slab).
-        ld      a, c
-        add     a, 2
-        cp      4
-        jr      c, .wac_rbuf
-        cp      28
-        jr      nc, .wac_rbuf
-        ld      a, ATTR_SKY
-        jr      .wac_rset
-.wac_rbuf:
-        ld      a, ATTR_BUFFER
-.wac_rset:
+        inc     l
+        ld      a, (hl)                         ; R attr
         ld      (wrap_attrs_combined.wac_cell_R_imm), a
-        ; vacated col = byte_x + 3 — always BUFFER (cyan-cyan invisible).
-        ; PIPE_PROGRAM doesn't write pixel data at V col, so making this
-        ; PIPE green just shows a solid green block (no body texture) —
-        ; user reports as "empty pipe". BUFFER keeps the V col invisible
-        ; (the pipe cleanly ends at R col, no orphaned green block).
+        ; vacated col = byte_x + 3 — always BUFFER (cyan-cyan invisible). The
+        ; pipe cleanly ends at R col; PIPE here would show an orphaned green
+        ; block (no body texture) where PIPE_PROGRAM writes no pixels.
         ld      a, ATTR_BUFFER
         ld      (wrap_attrs_combined.wac_cell_V_imm), a
 
@@ -5321,6 +5283,38 @@ GY = 160
         DUP 8
         dw ($4000 + ((GY & 7) << 8) + ((GY & $38) << 2) + ((GY & $C0) << 5)) + 28
 GY = GY + 1
+        EDUP
+
+; wac_cell_lut[byte_x*4 + {0:L,1:M1,2:M2,3:R}] — the attr wrap_attrs_combined
+; writes into each pipe's L/M1/M2/R cell, precomputed at assembly time. The
+; rule (col in [4,28) → SKY for L/R, PIPE for M1/M2; else BUFFER) is constant in
+; byte_x, so the per-pipe range-check chain becomes a 4-byte table read. Cols:
+; L=byte_x-1, M1=byte_x, M2=byte_x+1, R=byte_x+2. Page-aligned for ld l,byte_x*4.
+        ALIGN 256
+wac_cell_lut:
+WBX = 0
+        DUP 32
+        IF (WBX - 1) >= 4 && (WBX - 1) < 28
+        db ATTR_SKY
+        ELSE
+        db ATTR_BUFFER
+        ENDIF
+        IF WBX >= 4 && WBX < 28
+        db ATTR_PIPE
+        ELSE
+        db ATTR_BUFFER
+        ENDIF
+        IF (WBX + 1) >= 4 && (WBX + 1) < 28
+        db ATTR_PIPE
+        ELSE
+        db ATTR_BUFFER
+        ENDIF
+        IF (WBX + 2) >= 4 && (WBX + 2) < 28
+        db ATTR_SKY
+        ELSE
+        db ATTR_BUFFER
+        ENDIF
+WBX = WBX + 1
         EDUP
 
         ; ─── Zero the diagnostics ring at build time ────────────
