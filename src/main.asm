@@ -75,7 +75,7 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ;         wrap-frame margin (worst-frame 2021 → 3768 T) and produces a
 ;         byte-identical bird raster-time failure set to 350 (no NEW
 ;         single-frame visual regressions across all 6 velocity scenarios).
-BUSY_WAIT_TO_BOTTOM_BLANK   EQU 440
+BUSY_WAIT_TO_BOTTOM_BLANK   EQU 485
 
 ; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
 ; 20-band clear loop so all 4 pipes contribute identical T-states whether
@@ -2075,52 +2075,37 @@ advance_phase:
 ;----------------------------------------------------------------
 draw_ground:
         ld      (saved_sp), sp
-        ; IY = ground_tiles + (phase mod 8) * 8
+        ; IX walks the 8 phase tile bytes ground_tiles[phase*8 + 0..7]; for the
+        ; 8 ground lines 160..167, (line mod 8) = 0..7, so the per-line fill byte
+        ; is just this sequential walk (no per-line (D mod 8) recompute).
         ld      a, (phase)
         and     7
         add     a, a
         add     a, a
         add     a, a                    ; A = phase * 8
-        ld      iy, ground_tiles
         ld      c, a
         ld      b, 0
-        add     iy, bc
-        ld      (ground_iy_save), iy    ; cache IY base — avoid push iy in loop
-        ld      d, GROUND_TOP           ; D = current Y
+        ld      ix, ground_tiles
+        add     ix, bc                  ; IX → ground_tiles[phase*8]
+        ; DE walks the precomputed SP targets (line_table[160+i]+28). No per-line
+        ; line_table lookup / push-pop juggle any more.
+        ld      de, ground_sp_table
 .line_lp:
         ; CRITICAL: reset SP to caller stack BEFORE any push. After the SP
-        ; hijack in iter N, SP sits in screen RAM at line_addr_N; an unsafe
-        ; push iy/push bc would write into screen pixel memory.
+        ; hijack in iter N, SP sits in screen RAM at line_addr_N.
         ld      sp, (saved_sp)
-        ; Tile byte for line D = (IY + (D mod 8))
-        ld      a, d
-        and     7
-        ld      c, a
-        ld      b, 0
-        ld      hl, (ground_iy_save)
-        add     hl, bc
-        ld      a, (hl)
+        ld      a, (ix+0)               ; tile fill byte for this line
+        inc     ix
         ld      b, a
         ld      c, a                    ; BC = fill byte (both halves)
-        ; Compute HL = line_table[D] + 28 (= end of col 27 = last visible col).
-        ; Ground fills cols 4-27 (24 bytes); buffer cols 0-3 and 28-31 hidden
-        ; by buffer attr ($2D), so we skip writing them entirely → fewer pushes.
-        ld      a, d
-        ld      h, 0
+        ld      a, (de)
+        inc     de
         ld      l, a
-        add     hl, hl                  ; HL = D*2
-        push    bc                      ; safe: SP at caller stack
-        ld      bc, line_table
-        add     hl, bc
-        ld      c, (hl)
-        inc     hl
-        ld      h, (hl)
-        ld      l, c                    ; HL = line addr
-        ld      bc, 28
-        add     hl, bc                  ; HL = line addr + 28
-        pop     bc
+        ld      a, (de)
+        inc     de
+        ld      h, a                    ; HL = line_table[line]+28 (= end of col 27)
         ld      sp, hl
-        ; Push BC 12 times = fill 24 bytes (cols 4..27)
+        ; Push BC 12 times = fill 24 bytes (cols 4..27), written high→low
         push    bc
         push    bc
         push    bc
@@ -2133,10 +2118,9 @@ draw_ground:
         push    bc
         push    bc
         push    bc
-        inc     d
-        ld      a, d
-        cp      SCORE_TOP               ; only 8 lines (160..167); 168+ = scoreboard
-        jr      c, .line_lp
+        ld      a, e
+        cp      (ground_sp_table + 16) & $FF    ; walked all 8 entries?
+        jr      nz, .line_lp
         ld      sp, (saved_sp)
         ret
 
@@ -5326,6 +5310,17 @@ ARY = 0
         DUP 20
         dw ATTRS + ARY * 32
 ARY = ARY + 1
+        EDUP
+
+; ground_sp_table[i] = screen address of ground line (160+i) + 28 = the SP
+; target draw_ground hijacks to (12 push bc = 24 bytes = cols 4..27, written
+; high→low). Computed at assembly time (same interleaved formula as line_table)
+; so draw_ground needs no per-line line_table lookup and no runtime init.
+ground_sp_table:
+GY = 160
+        DUP 8
+        dw ($4000 + ((GY & 7) << 8) + ((GY & $38) << 2) + ((GY & $C0) << 5)) + 28
+GY = GY + 1
         EDUP
 
         ; ─── Zero the diagnostics ring at build time ────────────
