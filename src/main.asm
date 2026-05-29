@@ -77,12 +77,6 @@ WBX_PAD_ITERS     EQU 1                   ; effectively 0 — accept WHITE→CYA
 ;         single-frame visual regressions across all 6 velocity scenarios).
 BUSY_WAIT_TO_BOTTOM_BLANK   EQU 485
 
-; clear_vacated_columns per-pipe pad — matches the cost of one pipe's
-; 20-band clear loop so all 4 pipes contribute identical T-states whether
-; eligible or skipped (~3920 T per active pipe).
-CVC_PIPE_PAD_ITERS         EQU 1          ; effectively 0 — accept skip variance to free wrap-frame budget for contention
-; (JRSKIP_IDLE_PAD_ITERS removed — write_jrskip_step is gone now that
-; JR-skip stamping is fast enough to do all 20 bands in do_swap.)
 ; apply_pipe_attrs_wrap + restore_trailing_pipe_attrs edge-skip pads —
 ; match the paint cost (~500 T) so per-pipe edge skips (byte_x near 0
 ; or 28) don't shift BLACK position. Prep pipe still uses cheap skip.
@@ -242,10 +236,9 @@ main_loop:
         ld      (diag_frame_counter), a
         di
         PROFILE_OUT 2                   ; RED = top blanking
-        ; Wrap-frame screen/attr work (apply_pipe_attrs_wrap +
-        ; restore_trailing_pipe_attrs + clear_vacated_columns) runs at the
-        ; END of the wrap frame (after prep_step, in bottom blanking) — see
-        ; that block below. Doing it in vblank ate too much top-blank budget,
+        ; Wrap-frame attr work (wrap_attrs_combined) runs at the
+        ; END of the wrap frame (in bottom blanking) — see that block below.
+        ; Doing it in vblank ate too much top-blank budget,
         ; pushing the grid past row 0 and producing top-row pixel/attr
         ; misalignment on the wrap-pending frame.
         xor     a
@@ -469,7 +462,6 @@ sfx_chime:
 
 scroll_extra: db 0                      ; mod-5 counter for 1.2 px/frame avg
 wrap_pending:  db 0                      ; set when a wrap happened this frame
-clear_pending: db 0                      ; set when clear_vacated_columns must run in next frame's vblank
 ; prep_pipe_idx is a legacy state variable from the 4-pipe prep-swap
 ; design. Self-recycle (current design) doesn't use a prep slot, but
 ; many routines still check `prep_pipe_idx == c` to skip a pipe. With
@@ -1658,8 +1650,8 @@ init_screen_target_table:
         inc     de
         djnz    .istt_lp
         ; Stage 6: populate band_first_addr[20] = line_table[8K] for K=0..19.
-        ; clear_vacated_columns walks this table — saves ~6 k T per wrap by
-        ; eliminating the per-band line_table recompute (~150 T → ~50 T).
+        ; The wrap_attrs_combined V-col sweep walks this table to avoid a
+        ; per-row line_table recompute (~79 T → ~60 T per swept row).
         ld      hl, line_table
         ld      de, band_first_addr
         ld      b, 20
@@ -2213,8 +2205,9 @@ patch_pipe_targets:
 ; Tail-call patch_pipe_targets to decrement every active body slot's screen
 ; target by ROW_OFFSET (= 1) so they walk to the next column.
 ;
-; Stage 3: column clearing is done by clear_vacated_columns (also called
-; here) — the per-slot trailing-zero pair has been removed.
+; The vacated column needs no pixel clear: wrap_attrs_combined sets its attr
+; to BUFFER ($2D, cyan-on-cyan) so any stale pixels render invisible, and
+; do_swap's write_jrskip_column blanks the departing pipe's whole column.
 ;----------------------------------------------------------------
 wrap_byte_x:
         ld      iy, pipe_state
@@ -2261,22 +2254,6 @@ wrap_byte_x:
         ret
 
 ;----------------------------------------------------------------
-; clear_vacated_columns: for each active (non-prep, non-activating) pipe,
-; zero the screen column it just scrolled out of, all 160 rows. Replaces
-; the per-slot trailing-zero pair that used to clear it every frame.
-;
-; Vacated col (Stage 3, 2-push slot): byte_x_NEW + 3 = byte_x_OLD + 2 (R col).
-; byte_x is already decremented by wrap_byte_x at this point.
-;
-; Per band (8 rows): compute screen address (line_table[8K] + col), then 8
-; `ld (hl), a ; inc h` writes (high byte of screen addr stride = +256 per
-; pixel-row inside a char cell — same trick as the renderer's `inc ixh`).
-; Between bands the high byte / low byte both change, so per-band reload.
-;
-; Cost (rough): ~118 T per band × 20 bands × 3 pipes ≈ 7.2 k T per wrap frame.
-; Clobbers: AF, BC, DE, HL, IY.
-;----------------------------------------------------------------
-;----------------------------------------------------------------
 ; clear_old_cap_rows: at swap time, zero the dep pipe's OLD cap_top_row
 ; and OLD cap_bot_row across all visible cols (4..27). These rows had
 ; cap pixels written every frame while dep was active; when dep becomes
@@ -2317,142 +2294,6 @@ clear_old_cap_rows:
         djnz    .cpr_lp
         ret
 
-clear_vacated_columns:
-        ld      iy, pipe_state
-        ld      b, NUM_PIPES
-.cvc_outer:
-        push    bc
-        ld      a, NUM_PIPES
-        sub     b
-        ld      c, a                            ; C = pipe index 0..3
-        ld      a, (prep_pipe_idx)
-        cp      c
-        jp      z, .cvc_skip                    ; prep pipe ALWAYS skipped — cheap skip (no pad). jp because grew past jr range.
-        ld      a, (activate_pipe_idx)
-        cp      c
-        jp      z, .cvc_pad_skip                ; occasionally skipped → pad to keep T constant
-        ; vacated_col = byte_x + 3
-        ld      a, (iy+0)
-        add     a, 3
-        cp      32                              ; off-screen (col 32+) — pad to keep T constant
-        jp      nc, .cvc_pad_skip
-        cp      4                               ; in buffer cols 0..3 — pad to keep T constant
-        jp      c, .cvc_pad_skip
-        ld      (cvc_col), a
-        jr      .cvc_do_work
-.cvc_pad_skip:
-        ; Pipe not eligible for clear; busy-wait the equivalent T-states so
-        ; every frame's per-pipe slot costs the same → constant BLACK position.
-        ld      de, CVC_PIPE_PAD_ITERS
-.cvc_pad_lp:
-        dec     de
-        ld      a, d
-        or      e
-        jr      nz, .cvc_pad_lp
-        jp      .cvc_skip
-.cvc_do_work:
-        ; Stage 6 (v2): skip the gap region (bands K_top+1..K_bot-1) entirely.
-        ; Those bands hold the pipe's central gap → all-sky pixels, so clearing
-        ; them is wasted work. For typical gap_y=48, K_top=5, K_bot=12, gap = 6
-        ; bands → saves ~1 k T per pipe × 3 = ~3 k T per wrap.
-        push    bc                              ; save outer NUM_PIPES counter
-        push    iy                              ; CRITICAL: save outer IY (= pipe_state cursor) so .cvc_skip's inc iy operates on the right register
-        ; Compute K_top, K_bot from this pipe's gap_y (= iy+1 at entry, still valid).
-        ld      a, (iy+1)
-        dec     a
-        rrca
-        rrca
-        rrca
-        and     $1F
-        ld      (cvc_k_top), a                  ; K_top = (gap_y - 1) >> 3
-        ld      a, (iy+1)
-        add     a, PIPE_GAP
-        rrca
-        rrca
-        rrca
-        and     $1F
-        ld      (cvc_k_bot), a                  ; K_bot = (gap_y + PIPE_GAP) >> 3
-        ld      iy, band_first_addr
-        ; ── Top region: bands 0..K_top inclusive ─────────────────────────
-        ld      a, (cvc_k_top)
-        inc     a                               ; band count = K_top + 1
-        ld      b, a
-.cvc_top:
-        ld      l, (iy+0)
-        ld      h, (iy+1)
-        ld      a, (cvc_col)
-        add     a, l
-        ld      l, a
-        jr      nc, .cvc_top_nc
-        inc     h
-.cvc_top_nc:
-        xor     a
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a
-        inc     iy
-        inc     iy
-        djnz    .cvc_top
-        ; ── Skip the gap: advance IY by (K_bot - K_top - 1) × 2 bytes ────
-        ld      a, (cvc_k_bot)
-        ld      hl, cvc_k_top
-        sub     (hl)
-        dec     a                               ; A = gap bands (e.g. K_bot=12, K_top=5 → 6)
-        add     a, a                            ; × 2 bytes per band entry
-        push    iy
-        pop     hl
-        add     a, l
-        ld      l, a
-        jr      nc, .cvc_gap_nc
-        inc     h
-.cvc_gap_nc:
-        push    hl
-        pop     iy
-        ; ── Bottom region: bands K_bot..19 inclusive ─────────────────────
-        ld      a, 20
-        ld      hl, cvc_k_bot
-        sub     (hl)                            ; band count = 20 - K_bot
-        ld      b, a
-.cvc_bot:
-        ld      l, (iy+0)
-        ld      h, (iy+1)
-        ld      a, (cvc_col)
-        add     a, l
-        ld      l, a
-        jr      nc, .cvc_bot_nc
-        inc     h
-.cvc_bot_nc:
-        xor     a
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a : inc h
-        ld      (hl), a
-        inc     iy
-        inc     iy
-        djnz    .cvc_bot
-        pop     iy                              ; restore outer IY (pipe_state cursor)
-        pop     bc                              ; restore outer NUM_PIPES counter
-.cvc_skip:
-        inc     iy
-        inc     iy
-        pop     bc
-        dec     b
-        jp      nz, .cvc_outer                  ; jp because djnz out of range after gap-skip work expanded the loop body
-        ret
-
-cvc_col:        db 0
-cvc_k:          db 0
-cvc_k_top:      db 0
-cvc_k_bot:      db 0
 
 ;----------------------------------------------------------------
 ; column_base_for_pipe: HL = address of band 0 for pipe A in PIPE_PROGRAM.
